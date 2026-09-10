@@ -5,18 +5,31 @@ min_usd: 100000
 
 db_path: data/contracts.db
 export_dir: reports
+log_dir: logs
 
 # Как часто перепроверять уже просканированные контракты (секунды)
 recheck_interval_sec: 86400
 
-# Параллельность
-rpc_concurrency: 8
-balance_concurrency: 12
-block_batch_size: 15          # сколько блоков тянуть за раз (eth_getBlockByNumber)
-receipt_batch_size: 40
+# Параллельность. На публичных RPC лучше не задирать.
+rpc_concurrency: 4
+balance_concurrency: 6
+block_batch_size: 8
+receipt_batch_size: 20
 price_batch_size: 40
 http_timeout_sec: 40
-max_retries: 5
+max_retries: 8
+
+# Rate limit / паузы
+cooldown_min_sec: 5
+cooldown_max_sec: 900          # 15 минут максимум сна одной ноды
+all_down_sleep_sec: 30         # если все RPC сети в кулдауне
+adaptive_batch: true           # резать размер батча при лимитах, потом отращивать
+
+# Автономный режим
+heartbeat_sec: 600             # статус в лог и logs/status.txt
+export_every_sec: 300          # живые xlsx перезаписываются
+daily_snapshot: true           # раз в сутки копия в reports/archive/
+task_restart_sec: 20           # если воркер сети упал — поднять снова
 
 # Индексатор + чекер балансов работают одновременно
 run_indexer: true
@@ -34,7 +47,7 @@ chains:
     llama_chain: ethereum
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 14000001          # поменяй вручную
+    start_block: 19000000          # поменяй вручную
     logs_max_range: 2000
     explorer: https://etherscan.io/address/
     rpc:
@@ -49,7 +62,7 @@ chains:
     llama_chain: bsc
     native_symbol: BNB
     native_coingecko: binancecoin
-    start_block: 30000014
+    start_block: 35000000
     logs_max_range: 2000
     explorer: https://bscscan.com/address/
     rpc:
@@ -64,7 +77,7 @@ chains:
     llama_chain: polygon
     native_symbol: POL
     native_coingecko: polygon-ecosystem-token
-    start_block: 39999999
+    start_block: 50000000
     logs_max_range: 2000
     explorer: https://polygonscan.com/address/
     rpc:
@@ -79,7 +92,7 @@ chains:
     llama_chain: polygon_zkevm
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 1007259
+    start_block: 10000000
     logs_max_range: 1000
     explorer: https://zkevm.polygonscan.com/address/
     rpc:
@@ -93,7 +106,7 @@ chains:
     llama_chain: era
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 20013454
+    start_block: 30000000
     logs_max_range: 1000
     explorer: https://explorer.zksync.io/address/
     rpc:
