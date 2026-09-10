@@ -1,0 +1,131 @@
+# Порог в USD. Контракты с total_usd >= min_usd -> qualifying.xlsx
+# 0 < total_usd < min_usd -> below_threshold.xlsx
+# total_usd == 0 в Excel не попадают.
+min_usd: 100000
+
+db_path: data/contracts.db
+export_dir: reports
+
+# Как часто перепроверять уже просканированные контракты (секунды)
+recheck_interval_sec: 86400
+
+# Параллельность
+rpc_concurrency: 8
+balance_concurrency: 12
+block_batch_size: 15          # сколько блоков тянуть за раз (eth_getBlockByNumber)
+receipt_batch_size: 40
+price_batch_size: 40
+http_timeout_sec: 40
+max_retries: 5
+
+# Индексатор + чекер балансов работают одновременно
+run_indexer: true
+run_balance_checker: true
+
+# Искать ERC-20 Transfer в тех же блоках и запоминать токены,
+# которые реально приходили на уже известные контракты
+discover_tokens_from_transfers: true
+
+chains:
+  ethereum:
+    enabled: true
+    chain_id: 1
+    display_name: Ethereum
+    llama_chain: ethereum
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 14000001          # поменяй вручную
+    logs_max_range: 2000
+    explorer: https://etherscan.io/address/
+    rpc:
+      - https://eth.llamarpc.com
+      - https://ethereum.publicnode.com
+      - https://rpc.ankr.com/eth
+
+  bsc:
+    enabled: true
+    chain_id: 56
+    display_name: BNB Smart Chain
+    llama_chain: bsc
+    native_symbol: BNB
+    native_coingecko: binancecoin
+    start_block: 30000014
+    logs_max_range: 2000
+    explorer: https://bscscan.com/address/
+    rpc:
+      - https://bsc-dataseed.binance.org
+      - https://bsc.publicnode.com
+      - https://rpc.ankr.com/bsc
+
+  polygon:
+    enabled: true
+    chain_id: 137
+    display_name: Polygon
+    llama_chain: polygon
+    native_symbol: POL
+    native_coingecko: polygon-ecosystem-token
+    start_block: 39999999
+    logs_max_range: 2000
+    explorer: https://polygonscan.com/address/
+    rpc:
+      - https://polygon-rpc.com
+      - https://polygon.llamarpc.com
+      - https://rpc.ankr.com/polygon
+
+  zk:
+    enabled: true
+    chain_id: 1101
+    display_name: Polygon zkEVM
+    llama_chain: polygon_zkevm
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 1007259
+    logs_max_range: 1000
+    explorer: https://zkevm.polygonscan.com/address/
+    rpc:
+      - https://zkevm-rpc.com
+      - https://polygon-zkevm.drpc.org
+
+  zksync:
+    enabled: true
+    chain_id: 324
+    display_name: ZKsync Era
+    llama_chain: era
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 20013454
+    logs_max_range: 1000
+    explorer: https://explorer.zksync.io/address/
+    rpc:
+      - https://mainnet.era.zksync.io
+      - https://zksync.drpc.org
+
+  robinhood:
+    enabled: true
+    chain_id: 4663
+    display_name: Robinhood Chain
+    llama_chain: robinhood
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 1
+    logs_max_range: 500
+    explorer: https://robinhoodchain.blockscout.com/address/
+    rpc:
+      - https://rpc.mainnet.chain.robinhood.com
+      - https://rpc-robinhood.blockmachine.io
+      - https://robinhood.drpc.org
+
+  hyperliquid:
+    enabled: true
+    chain_id: 999
+    display_name: Hyperliquid HyperEVM
+    llama_chain: hyperliquid
+    native_symbol: HYPE
+    native_coingecko: hyperliquid
+    start_block: 1
+    # Официальный RPC: eth_getLogs максимум 50 блоков; eth_call/getBalance — только latest
+    logs_max_range: 50
+    explorer: https://purrsec.com/address/
+    rpc:
+      - https://rpc.hyperliquid.xyz/evm
+      - https://hyperliquid.drpc.org
