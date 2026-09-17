@@ -1,0 +1,42 @@
+# Telegram monitoring and Docker deployment
+
+The production stack is defined in `docker-compose.yml` and contains four isolated services:
+
+- `scanner` writes heartbeat and minute aggregates to `data/monitoring.db`;
+- `telegram-bot` reads monitoring data and reports, but receives no RPC secrets;
+- `docker-proxy` exposes the container API required for the fixed, labelled scanner target;
+- `node-exporter` exposes host metrics only on the internal Compose network.
+
+Required `.env` values:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=replace_me
+TELEGRAM_CHAT_IDS=123456789
+MIN_USD=500000
+SCANNER_MEMORY_LIMIT=4g
+```
+
+On Linux, protect the file and start the stack:
+
+```bash
+chmod 600 .env
+docker compose up -d --build
+docker compose ps
+```
+
+The bot sends a report every six hours by default. The interval is persisted in
+`monitoring.db` and can be changed with `/schedule`. Lifecycle and load-profile
+changes require a 60-second inline confirmation. Telegram never accepts shell
+commands, RPC URLs or arbitrary scanner arguments.
+
+Available commands: `/status`, `/report`, `/networks`, `/resources`, `/errors`,
+`/files`, `/file`, `/schedule`, `/load`, `/start`, `/stop`, `/restart`, `/pause`,
+`/resume`, `/export`, `/backup`, `/history`, `/help`.
+
+The scanner reads the persisted `low`, `normal` or `high` profile on startup.
+Pause is cooperative: no new block range or address starts while current SQLite
+transactions finish. SIGTERM has a 35-second Compose grace period and performs a
+final export. Online SQLite backups are created daily; the newest seven are kept.
+
+Before server deployment, rotate every RPC/API key that has ever been pasted into
+a chat or terminal transcript. Keep `.env` out of Git and set its mode to `600`.

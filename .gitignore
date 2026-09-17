@@ -1,0 +1,13 @@
+.env
+.DS_Store
+.venv/
+.runtime_deps/
+__pycache__/
+.pytest_cache/
+.test_tmp/
+.test-tmp/
+*.pyc
+data/*.db*
+logs/
+reports/
+backups/

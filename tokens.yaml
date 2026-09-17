@@ -70,3 +70,85 @@ hyperliquid:
   - { symbol: USDT0, address: "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb", decimals: 6 }
   - { symbol: USDC, address: "0xb88339CB7199b1E3dEcaDDeb8e5ABcCF7BD5767D", decimals: 6 }
   - { symbol: UBTC, address: "0x9FDBdA0BE9e5D65C65D2A9A32900C87B5292c70e", decimals: 8 }
+
+arbitrum:
+  - { symbol: WETH, address: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", decimals: 18 }
+  - { symbol: USDC, address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6 }
+  - { symbol: USDCe, address: "0xFF970A61A04b1cA14834A43f5de4533eBDDB5CC8", decimals: 6 }
+  - { symbol: USDT, address: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", decimals: 6 }
+  - { symbol: DAI, address: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", decimals: 18 }
+  - { symbol: WBTC, address: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", decimals: 8 }
+  - { symbol: ARB, address: "0x912CE59144191C1204E64559FE8253a0e49E6548", decimals: 18 }
+
+optimism:
+  - { symbol: WETH, address: "0x4200000000000000000000000000000000000006", decimals: 18 }
+  - { symbol: USDC, address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", decimals: 6 }
+  - { symbol: USDCe, address: "0x7F5c764cBc14f9669B88837ca1490cCa17c31607", decimals: 6 }
+  - { symbol: USDT, address: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58", decimals: 6 }
+  - { symbol: DAI, address: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", decimals: 18 }
+  - { symbol: WBTC, address: "0x68f180fcCe6836688e9084f035309E29Bf0A2095", decimals: 8 }
+  - { symbol: OP, address: "0x4200000000000000000000000000000000000042", decimals: 18 }
+
+base:
+  - { symbol: WETH, address: "0x4200000000000000000000000000000000000006", decimals: 18 }
+  - { symbol: USDC, address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6 }
+  - { symbol: USDbC, address: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", decimals: 6 }
+  - { symbol: DAI, address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", decimals: 18 }
+  - { symbol: cbBTC, address: "0xcbB7C0000aB88B473b1f5AFD9ef808440eed33BF", decimals: 8 }
+
+linea:
+  - { symbol: WETH, address: "0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f", decimals: 18 }
+  - { symbol: USDC, address: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff", decimals: 6 }
+  - { symbol: USDT, address: "0xA219439258ca9da29E9Cc4cE5596924745e12B93", decimals: 6 }
+  - { symbol: DAI, address: "0x4AF15ec2A0BD43Db75dd04E62FAA3B8EF36b00d5", decimals: 18 }
+  - { symbol: WBTC, address: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4", decimals: 8 }
+
+scroll:
+  - { symbol: WETH, address: "0x5300000000000000000000000000000000000004", decimals: 18 }
+  - { symbol: USDT, address: "0xf55BEC9cafDbE8730f096Aa55dad6D22d44099Df", decimals: 6 }
+  - { symbol: WBTC, address: "0x3C1BCa5a656e69edCD0D4E36BEbb3FcDAcA60Cf1", decimals: 8 }
+
+mantle:
+  - { symbol: WMNT, address: "0x78c1b0C915c4faa5fFfa6Cabf0219DA63d7f4cb8", decimals: 18 }
+  - { symbol: WETH, address: "0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111", decimals: 18 }
+  - { symbol: USDT, address: "0x201EBa5CC46D216Ce6DC03F6a759e8E766e956aE", decimals: 6 }
+  - { symbol: USDC, address: "0x09Bc4E0D864854c6aFB6eb9A9cdf58AC190D0dF9", decimals: 6 }
+  - { symbol: mETH, address: "0xcDA86A272531e8640cD7F1a92c01839911B90bb0", decimals: 18 }
+
+blast:
+  - { symbol: WETH, address: "0x4300000000000000000000000000000000000004", decimals: 18 }
+  - { symbol: USDB, address: "0x4300000000000000000000000000000000000003", decimals: 18 }
+
+celo:
+  - { symbol: WCELO, address: "0x471EcE3750Da237f93B8E339c536989b8978a438", decimals: 18 }
+  - { symbol: cUSD, address: "0x765DE816845861e75A25fCA122bb6898B8B1282a", decimals: 18 }
+  - { symbol: USDC, address: "0xcebA9300f2b948710d2653dd7B07f33A8B32118C", decimals: 6 }
+
+gnosis:
+  - { symbol: WXDAI, address: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", decimals: 18 }
+  - { symbol: USDC, address: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83", decimals: 6 }
+  - { symbol: USDT, address: "0x4ECaBa5870353805a9F068101A40E0f32ed605C6", decimals: 6 }
+  - { symbol: WETH, address: "0x6A023CcD1ff6F2045C3309768eAd9E68F978f6e1", decimals: 18 }
+  - { symbol: WBTC, address: "0x8e5bBbb09Ed1ebdE8674Cda39A0c169401db4252", decimals: 8 }
+  - { symbol: GNO, address: "0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb", decimals: 18 }
+
+cronos:
+  - { symbol: WCRO, address: "0x5C7F8A570d578ED84E63fdFA7b1eE72dEae1AE23", decimals: 18 }
+  - { symbol: USDC, address: "0xc21223249CA28397B4B6541dfFaEcC539BfF0c59", decimals: 6 }
+  - { symbol: USDT, address: "0x66e428c3f67a68878562e79A0234c1F83c208770", decimals: 6 }
+  - { symbol: WETH, address: "0xe44Fd7fCb2b1581822D0c862B68222998a0c299a", decimals: 18 }
+  - { symbol: WBTC, address: "0x062E66477Faf219F25D27dCED647BF57C3107d52", decimals: 8 }
+
+kava:
+  - { symbol: WKAVA, address: "0xc86c7C0EFbd6A49B35EDee1e7701B0E9a21F7A2d", decimals: 18 }
+  - { symbol: axlUSDC, address: "0xEB466342C4d449BC9f53A865D5Cb90586f405215", decimals: 6 }
+  - { symbol: axlUSDT, address: "0x919C1c267BC06a7039e03fcc2eF738525769109c", decimals: 6 }
+
+metis:
+  - { symbol: USDC, address: "0xEA32A96608495e54156Ae48931A7c20f0dcc1a21", decimals: 6 }
+  - { symbol: USDT, address: "0xbb06DCA3AE6887fFabF931640f67Cab3e3a16F4d", decimals: 6 }
+  - { symbol: WETH, address: "0x420000000000000000000000000000000000000A", decimals: 18 }
+
+harmony:
+  - { symbol: WONE, address: "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a", decimals: 18 }
+  - { symbol: 1USDC, address: "0x985458e523dB3b8B82847A7dB3E1c22c7Ef71E3E", decimals: 6 }

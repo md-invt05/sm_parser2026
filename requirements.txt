@@ -3,3 +3,5 @@ pyyaml>=6.0
 openpyxl>=3.1.2
 python-dotenv>=1.0.1
 tenacity>=8.2.3
+python-telegram-bot>=21.10,<23
+tzdata>=2024.1

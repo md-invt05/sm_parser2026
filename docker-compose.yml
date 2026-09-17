@@ -1,0 +1,121 @@
+services:
+  scanner:
+    build: .
+    container_name: evm-scanner
+    command: ["python", "scan_defi.py", "--min-usd", "${MIN_USD:-500000}"]
+    restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: ${SCANNER_MEMORY_LIMIT:-4g}
+    labels:
+      evm-parser.controlled: "true"
+    environment:
+      SCANNER_LOAD_PROFILE: ${SCANNER_LOAD_PROFILE:-}
+      DRPC_FALLBACK_KEYS: ${DRPC_FALLBACK_KEYS:-}
+      ETHEREUM_RPC: ${ETHEREUM_RPC:-}
+      BSC_RPC: ${BSC_RPC:-}
+      POLYGON_RPC: ${POLYGON_RPC:-}
+      ARBITRUM_RPC: ${ARBITRUM_RPC:-}
+      OPTIMISM_RPC: ${OPTIMISM_RPC:-}
+      BASE_RPC: ${BASE_RPC:-}
+      ZK_RPC: ${ZK_RPC:-}
+      ZKSYNC_RPC: ${ZKSYNC_RPC:-}
+      ROBINHOOD_RPC: ${ROBINHOOD_RPC:-}
+      HYPERLIQUID_RPC: ${HYPERLIQUID_RPC:-}
+      LINEA_RPC: ${LINEA_RPC:-}
+      SCROLL_RPC: ${SCROLL_RPC:-}
+      MANTLE_RPC: ${MANTLE_RPC:-}
+      BLAST_RPC: ${BLAST_RPC:-}
+      CELO_RPC: ${CELO_RPC:-}
+      GNOSIS_RPC: ${GNOSIS_RPC:-}
+      CRONOS_RPC: ${CRONOS_RPC:-}
+      KAVA_RPC: ${KAVA_RPC:-}
+      METIS_RPC: ${METIS_RPC:-}
+      HARMONY_RPC: ${HARMONY_RPC:-}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./backups:/app/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3,time; c=sqlite3.connect('/app/data/monitoring.db'); r=c.execute('select heartbeat_at from runtime_state where id=1').fetchone(); assert r and time.time()-__import__('datetime').datetime.fromisoformat(r[0]).timestamp()<150"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+  telegram-bot:
+    build: .
+    container_name: evm-telegram-bot
+    command: ["python", "telegram_bot.py"]
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS:?set TELEGRAM_CHAT_IDS in .env}
+      TELEGRAM_TIMEZONE: ${TELEGRAM_TIMEZONE:-Europe/Moscow}
+      DOCKER_PROXY_URL: http://docker-proxy:2375
+      NODE_EXPORTER_URL: http://node-exporter:9100
+      SCANNER_CONTAINER_NAME: evm-scanner
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports:ro
+      - ./backups:/app/backups:ro
+    depends_on:
+      - docker-proxy
+      - node-exporter
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sqlite3; os.kill(1,0); sqlite3.connect('/app/data/monitoring.db').execute('select 1').fetchone()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+  docker-proxy:
+    build: .
+    container_name: evm-docker-proxy
+    command: ["python", "docker_guard.py"]
+    restart: unless-stopped
+    environment:
+      SCANNER_CONTAINER_NAME: evm-scanner
+      DOCKER_SOCKET: /var/run/docker.sock
+      PORT: 2375
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      default:
+        aliases: [docker-proxy]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',2375),5); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "3"}
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    container_name: evm-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro,rslave
+    healthcheck:
+      test: ["CMD", "/bin/node_exporter", "--version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "3"}

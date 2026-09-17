@@ -1,43 +1,53 @@
-# Порог в USD. Контракты с total_usd >= min_usd -> qualifying.xlsx
-# 0 < total_usd < min_usd -> below_threshold.xlsx
-# total_usd == 0 в Excel не попадают.
+# Contract address threshold across every supported EVM network.
 min_usd: 100000
 
 db_path: data/contracts.db
+monitoring_db_path: data/monitoring.db
 export_dir: reports
 log_dir: logs
-
-# Как часто перепроверять уже просканированные контракты (секунды)
 recheck_interval_sec: 86400
 
-# Параллельность. На публичных RPC лучше не задирать.
-rpc_concurrency: 4
-balance_concurrency: 6
+# Conservative defaults for public, best-effort RPC endpoints.
+global_rpc_concurrency: 12
+rpc_concurrency: 2
+balance_concurrency: 8
+# Parallel network scans shared by all balance addresses; HTTP still uses 12/2 limits.
+balance_chain_concurrency: 12
+balance_chain_timeout_sec: 20
+balance_address_timeout_sec: 60
+balance_retry_sec: 300
+# Supplemental estimates only for incomplete/slow RPC scans; their own serial queue.
+rabby_fallback: true
+rabby_request_interval_sec: 3
+rabby_timeout_sec: 12
+# Assumed possible deviation of the API estimate from reality, not a guaranteed bound.
+rabby_uncertainty: 0.10
 block_batch_size: 8
 receipt_batch_size: 20
 price_batch_size: 40
 http_timeout_sec: 40
 max_retries: 8
-
-# Rate limit / паузы
 cooldown_min_sec: 5
-cooldown_max_sec: 900          # 15 минут максимум сна одной ноды
-all_down_sleep_sec: 30         # если все RPC сети в кулдауне
-adaptive_batch: true           # резать размер батча при лимитах, потом отращивать
+cooldown_max_sec: 900
+all_down_sleep_sec: 30
+adaptive_batch: true
 
-# Автономный режим
-heartbeat_sec: 600             # статус в лог и logs/status.txt
-export_every_sec: 300          # живые xlsx перезаписываются
-daily_snapshot: true           # раз в сутки копия в reports/archive/
-task_restart_sec: 20           # если воркер сети упал — поднять снова
-
-# Индексатор + чекер балансов работают одновременно
+# Structured heartbeat for monitoring.db and Telegram bot.
+heartbeat_sec: 60
+export_every_sec: 300
+daily_snapshot: true
+task_restart_sec: 20
 run_indexer: true
 run_balance_checker: true
-
-# Искать ERC-20 Transfer в тех же блоках и запоминать токены,
-# которые реально приходили на уже известные контракты
 discover_tokens_from_transfers: true
+# Discover unique top-level transaction recipients that currently have EVM bytecode.
+discover_tx_to_contracts: true
+# Empty-code recipients are not checked again during fast backfills until this expires.
+code_cache_ttl_sec: 86400
+
+# Discovery runs here by default. --chains overrides this list only; balance coverage
+# still checks every enabled network below.
+default_chains: [ethereum, bsc, polygon, arbitrum, optimism, base]
 
 chains:
   ethereum:
@@ -47,13 +57,14 @@ chains:
     llama_chain: ethereum
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 19000000          # поменяй вручную
-    logs_max_range: 2000
+    start_block: 25760000
+    confirmations: 20
+    logs_max_range: 1000
     explorer: https://etherscan.io/address/
     rpc:
-      - https://eth.llamarpc.com
-      - https://ethereum.publicnode.com
-      - https://rpc.ankr.com/eth
+      - https://ethereum-rpc.publicnode.com
+      - https://public.1rpc.io/eth
+      - https://rpc.mevblocker.io
 
   bsc:
     enabled: true
@@ -62,13 +73,14 @@ chains:
     llama_chain: bsc
     native_symbol: BNB
     native_coingecko: binancecoin
-    start_block: 35000000
-    logs_max_range: 2000
+    start_block: 118400000
+    confirmations: 20
+    logs_max_range: 1000
     explorer: https://bscscan.com/address/
     rpc:
-      - https://bsc-dataseed.binance.org
-      - https://bsc.publicnode.com
-      - https://rpc.ankr.com/bsc
+      - https://bsc-dataseed.bnbchain.org
+      - https://bsc.drpc.org
+      - https://bsc.meowrpc.com
 
   polygon:
     enabled: true
@@ -77,13 +89,62 @@ chains:
     llama_chain: polygon
     native_symbol: POL
     native_coingecko: polygon-ecosystem-token
-    start_block: 50000000
-    logs_max_range: 2000
+    start_block: 92500000
+    confirmations: 128
+    logs_max_range: 1000
     explorer: https://polygonscan.com/address/
     rpc:
-      - https://polygon-rpc.com
-      - https://polygon.llamarpc.com
-      - https://rpc.ankr.com/polygon
+      - https://polygon-bor-rpc.publicnode.com
+      - https://polygon.drpc.org
+      - https://public.1rpc.io/matic
+
+  arbitrum:
+    enabled: true
+    chain_id: 42161
+    display_name: Arbitrum One
+    llama_chain: arbitrum
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 494800000
+    confirmations: 64
+    logs_max_range: 1000
+    explorer: https://arbiscan.io/address/
+    rpc:
+      - https://arb1.arbitrum.io/rpc
+      - https://arbitrum-one-rpc.publicnode.com
+      - https://public.1rpc.io/arb
+
+  optimism:
+    enabled: true
+    chain_id: 10
+    display_name: Optimism
+    llama_chain: optimism
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 155600000
+    confirmations: 64
+    logs_max_range: 1000
+    explorer: https://optimistic.etherscan.io/address/
+    rpc:
+      - https://mainnet.optimism.io
+      - https://optimism-rpc.publicnode.com
+      - https://1rpc.io/op
+
+  base:
+    enabled: true
+    chain_id: 8453
+    display_name: Base
+    llama_chain: base
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 50000000
+    confirmations: 64
+    logs_max_range: 1000
+    explorer: https://basescan.org/address/
+    rpc:
+      - https://mainnet.base.org
+      - https://base-rpc.publicnode.com
+      - https://public.1rpc.io/base
 
   zk:
     enabled: true
@@ -92,8 +153,9 @@ chains:
     llama_chain: polygon_zkevm
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 10000000
-    logs_max_range: 1000
+    start_block: 32100000
+    confirmations: 64
+    logs_max_range: 500
     explorer: https://zkevm.polygonscan.com/address/
     rpc:
       - https://zkevm-rpc.com
@@ -106,12 +168,14 @@ chains:
     llama_chain: era
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 30000000
-    logs_max_range: 1000
+    start_block: 71580000
+    confirmations: 64
+    logs_max_range: 500
     explorer: https://explorer.zksync.io/address/
     rpc:
       - https://mainnet.era.zksync.io
       - https://zksync.drpc.org
+      - https://public.1rpc.io/zksync2-era
 
   robinhood:
     enabled: true
@@ -120,7 +184,8 @@ chains:
     llama_chain: robinhood
     native_symbol: ETH
     native_coingecko: ethereum
-    start_block: 1
+    start_block: 36600000
+    confirmations: 64
     logs_max_range: 500
     explorer: https://robinhoodchain.blockscout.com/address/
     rpc:
@@ -135,10 +200,170 @@ chains:
     llama_chain: hyperliquid
     native_symbol: HYPE
     native_coingecko: hyperliquid
-    start_block: 1
-    # Официальный RPC: eth_getLogs максимум 50 блоков; eth_call/getBalance — только latest
+    start_block: 43180000
+    confirmations: 20
     logs_max_range: 50
     explorer: https://purrsec.com/address/
     rpc:
       - https://rpc.hyperliquid.xyz/evm
       - https://hyperliquid.drpc.org
+
+  linea:
+    enabled: true
+    chain_id: 59144
+    display_name: Linea
+    llama_chain: linea
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 30700000
+    confirmations: 64
+    logs_max_range: 500
+    explorer: https://lineascan.build/address/
+    rpc:
+      - https://rpc.linea.build
+      - https://linea-rpc.publicnode.com
+      - https://linea.drpc.org
+
+  scroll:
+    enabled: true
+    chain_id: 534352
+    display_name: Scroll
+    llama_chain: scroll
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 34150000
+    confirmations: 64
+    logs_max_range: 500
+    explorer: https://scrollscan.com/address/
+    rpc:
+      - https://rpc.scroll.io
+      - https://scroll-rpc.publicnode.com
+      - https://scroll.drpc.org
+
+  mantle:
+    enabled: true
+    chain_id: 5000
+    display_name: Mantle
+    llama_chain: mantle
+    native_symbol: MNT
+    native_coingecko: mantle
+    start_block: 99300000
+    confirmations: 64
+    logs_max_range: 500
+    explorer: https://mantlescan.xyz/address/
+    rpc:
+      - https://rpc.mantle.xyz
+      - https://mantle-rpc.publicnode.com
+      - https://mantle.drpc.org
+
+  blast:
+    enabled: true
+    chain_id: 81457
+    display_name: Blast
+    llama_chain: blast
+    native_symbol: ETH
+    native_coingecko: ethereum
+    start_block: 39000000
+    confirmations: 64
+    logs_max_range: 500
+    explorer: https://blastscan.io/address/
+    rpc:
+      - https://rpc.blast.io
+      - https://blast-rpc.publicnode.com
+      - https://blast.drpc.org
+
+  celo:
+    enabled: true
+    chain_id: 42220
+    display_name: Celo
+    llama_chain: celo
+    native_symbol: CELO
+    native_coingecko: celo
+    start_block: 74900000
+    confirmations: 20
+    logs_max_range: 1000
+    explorer: https://celoscan.io/address/
+    rpc:
+      - https://forno.celo.org
+      - https://celo-rpc.publicnode.com
+      - https://celo.drpc.org
+
+  gnosis:
+    enabled: true
+    chain_id: 100
+    display_name: Gnosis
+    llama_chain: xdai
+    native_symbol: xDAI
+    native_coingecko: dai
+    start_block: 47730000
+    confirmations: 20
+    logs_max_range: 1000
+    explorer: https://gnosisscan.io/address/
+    rpc:
+      - https://rpc.gnosis.gateway.fm
+      - https://rpc.gnosischain.com
+      - https://gnosis-rpc.publicnode.com
+
+  cronos:
+    enabled: true
+    chain_id: 25
+    display_name: Cronos
+    llama_chain: cronos
+    native_symbol: CRO
+    native_coingecko: crypto-com-chain
+    start_block: 93450000
+    confirmations: 20
+    logs_max_range: 1000
+    explorer: https://cronoscan.com/address/
+    rpc:
+      - https://evm.cronos.org
+      - https://cronos-evm-rpc.publicnode.com
+      - https://cronos.drpc.org
+
+  kava:
+    enabled: true
+    chain_id: 2222
+    display_name: Kava EVM
+    llama_chain: kava
+    native_symbol: KAVA
+    native_coingecko: kava
+    start_block: 22140000
+    confirmations: 20
+    logs_max_range: 1000
+    explorer: https://kavascan.com/address/
+    rpc:
+      - https://evm.kava-rpc.com
+      - https://evm.kava.io
+      - https://kava-evm-rpc.publicnode.com
+
+  metis:
+    enabled: true
+    chain_id: 1088
+    display_name: Metis Andromeda
+    llama_chain: metis
+    native_symbol: METIS
+    native_coingecko: metis-token
+    start_block: 21850000
+    confirmations: 64
+    logs_max_range: 500
+    explorer: https://andromeda-explorer.metis.io/address/
+    rpc:
+      - https://andromeda.metis.io/?owner=1088
+      - https://metis-rpc.publicnode.com
+      - https://metis.drpc.org
+
+  harmony:
+    enabled: true
+    chain_id: 1666600000
+    display_name: Harmony shard 0
+    llama_chain: harmony
+    native_symbol: ONE
+    native_coingecko: harmony
+    start_block: 92320000
+    confirmations: 20
+    logs_max_range: 500
+    explorer: https://explorer.harmony.one/address/
+    rpc:
+      - https://api.harmony.one
+      - https://api.s0.t.hmny.io
+      - https://1rpc.io/one

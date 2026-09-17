@@ -1,0 +1,13 @@
+.git
+.venv
+.runtime_deps
+__pycache__
+.pytest_cache
+.env
+data
+logs
+reports
+backups
+*.zip
+*.xlsx
+*.db
