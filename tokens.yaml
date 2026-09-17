@@ -63,7 +63,9 @@ zksync:
   - { symbol: WBTC, address: "0xBBeB516fb02a01611cBBE0453Fe3c580D7281011", decimals: 8 }
 
 robinhood:
-  - { symbol: WETH, address: "0x4200000000000000000000000000000000000006", decimals: 18 }
+  # Canonical contracts from docs.robinhood.com/chain/contracts.
+  - { symbol: WETH, address: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73", decimals: 18 }
+  - { symbol: USDG, address: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", decimals: 6 }
 
 hyperliquid:
   - { symbol: WHYPE, address: "0x5555555555555555555555555555555555555555", decimals: 18 }

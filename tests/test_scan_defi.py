@@ -16,13 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ConfigAndDatabaseTests(unittest.TestCase):
-    def test_config_has_exact_supported_networks_and_core_default(self):
+    def test_config_has_exact_supported_networks_and_all_network_default(self):
         cfg = scan_defi.load_config(ROOT / "config.yaml")
         self.assertEqual(20, len(cfg.chains))
-        self.assertEqual(
-            ["ethereum", "bsc", "polygon", "arbitrum", "optimism", "base"],
-            cfg.default_chains,
-        )
+        self.assertEqual(list(cfg.chains), cfg.default_chains)
         excluded = {
             "aurora", "moonbeam", "moonriver", "evmos", "coredao", "songbird", "flare", "pulse"
         }

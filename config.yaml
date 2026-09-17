@@ -45,9 +45,9 @@ discover_tx_to_contracts: true
 # Empty-code recipients are not checked again during fast backfills until this expires.
 code_cache_ttl_sec: 86400
 
-# Discovery runs here by default. --chains overrides this list only; balance coverage
-# still checks every enabled network below.
-default_chains: [ethereum, bsc, polygon, arbitrum, optimism, base]
+# Discovery runs on every enabled network by default. --chains can narrow this list;
+# balance coverage still checks every enabled network below.
+default_chains: [ethereum, bsc, polygon, arbitrum, optimism, base, zk, zksync, robinhood, hyperliquid, linea, scroll, mantle, blast, celo, gnosis, cronos, kava, metis, harmony]
 
 chains:
   ethereum:

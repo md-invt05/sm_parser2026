@@ -22,7 +22,8 @@ Deployment and Telegram monitoring: [MONITORING.md](MONITORING.md).
 
 ## Сети
 
-По умолчанию деплои ищутся в core-сетях: Ethereum, BSC, Polygon, Arbitrum One, Optimism и Base.
+По умолчанию discovery идёт во всех 20 включённых EVM-сетях. Для ограничения поиска
+используйте `--chains`, например `--chains ethereum,arbitrum,base`.
 
 Через `--chains` можно выбрать любую из 20 сетей: `ethereum`, `bsc`, `polygon`, `arbitrum`, `optimism`, `base`, `zk`, `zksync`, `robinhood`, `hyperliquid`, `linea`, `scroll`, `mantle`, `blast`, `celo`, `gnosis`, `cronos`, `kava`, `metis`, `harmony`.
 
@@ -45,7 +46,7 @@ cp env.example .env
 
 ## Запуск
 
-Обычный непрерывный режим с core-сетями:
+Обычный непрерывный режим со всеми включёнными сетями:
 
 ```bash
 python scan_defi.py
