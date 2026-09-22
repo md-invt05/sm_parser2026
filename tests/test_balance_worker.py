@@ -63,7 +63,11 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
         pool = AsyncMock()
         pool.call.side_effect = call
-        cfg = replace(self.cfg, balance_chain_timeout_sec=3, balance_address_timeout_sec=4)
+        cfg = replace(
+            self.cfg, balance_concurrency=8,
+            balance_chain_concurrency=8,
+            balance_chain_timeout_sec=3, balance_address_timeout_sec=4,
+        )
         job = asyncio.create_task(s.check_multichain_balances(
             self.db, self.chains, {"ethereum": pool}, AsyncMock(), cfg, 100000,
             asyncio.Event(), once=True,
@@ -138,7 +142,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         prices = AsyncMock()
         prices.fetch.return_value = {s.llama_key(self.chains["ethereum"]): 2}
         row, tokens = await s.scan_address_chain(
-            self.db, self.chains["ethereum"], pool, prices, ADDRESS, asyncio.Semaphore(1), 0.03,
+            self.db, self.chains["ethereum"], pool, prices, self.cfg,
+            ADDRESS, asyncio.Semaphore(1), 0.03,
         )
         self.assertEqual((1, "partial", 6), (row["has_code"], row["status"], row["total_usd"]))
         self.assertEqual("3000000000000000000", str(tokens[0]["raw_amount"]))
@@ -154,7 +159,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         async with pool:
             pool.endpoints[0].cooldown_until = time.time() + 900
             row, _ = await s.scan_address_chain(
-                self.db, self.chains["ethereum"], pool, AsyncMock(), ADDRESS, asyncio.Semaphore(1), 0.1,
+                self.db, self.chains["ethereum"], pool, AsyncMock(), self.cfg,
+                ADDRESS, asyncio.Semaphore(1), 0.1,
             )
             self.assertEqual("cooldown", row["note"])
             self.assertEqual([], requests)
@@ -184,9 +190,12 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incomplete_retries_after_five_minutes_not_24_hours(self):
         add_address(self.db)
-        self.db.save_address_scan(ADDRESS, "incomplete", 0, 0, 1, [missing_row()], [])
-        self.assertEqual([], self.db.pending_addresses(86400, retry_sec=300))
-        self.assertEqual([ADDRESS], self.db.pending_addresses(86400, retry_sec=300, as_of=time.time()+301))
+        self.db.save_address_chain_state(ADDRESS, missing_row(), [], 100000)
+        self.assertEqual([], self.db.pending_addresses(86400, retry_sec=600))
+        self.assertEqual(
+            [ADDRESS],
+            self.db.pending_addresses(86400, retry_sec=600, as_of=time.time() + 601),
+        )
 
 
 class RabbyTests(unittest.IsolatedAsyncioTestCase):
@@ -263,13 +272,14 @@ class RabbyTests(unittest.IsolatedAsyncioTestCase):
         fake.disabled = False
         fake.cooldown_until = 0
         fake.snapshot.return_value = ({"chain_list": [
-            {"community_id": 1, "id": "eth", "usd_value": 120000}]}, [])
+            {"community_id": 1, "id": "eth", "usd_value": 600000}]}, [])
         done = asyncio.Event()
         done.set()
         try:
             with patch.object(s, "RabbyClient", return_value=fake):
                 await s.rabby_fallback_loop(db, {"ethereum": self.chains["ethereum"]},
-                                           self.cfg, asyncio.Event(), done, True)
+                                           replace(self.cfg, rabby_token_discovery_after_sec=0),
+                                           asyncio.Event(), done, True)
             self.assertEqual(1, fake.snapshot.await_count)
             estimate = db.rabby_estimate(ADDRESS)
             self.assertEqual("estimated_above", estimate["status"])
@@ -285,7 +295,7 @@ class RabbyTests(unittest.IsolatedAsyncioTestCase):
                 header = [c.value for c in wb.active[1]]
                 result = dict(zip(header, [c.value for c in wb.active[2]]))
                 self.assertEqual(0, result["Total USD"])
-                self.assertEqual(120000, result["Rabby estimate USD"])
+                self.assertEqual(600000, result["Rabby estimate USD"])
                 wb.close()
         finally:
             db.close()

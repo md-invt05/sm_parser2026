@@ -4,7 +4,7 @@ services:
     container_name: evm-scanner
     command: ["python", "scan_defi.py", "--min-usd", "${MIN_USD:-500000}"]
     restart: unless-stopped
-    stop_grace_period: 35s
+    stop_grace_period: 5m
     mem_limit: ${SCANNER_MEMORY_LIMIT:-4g}
     labels:
       evm-parser.controlled: "true"
@@ -31,6 +31,8 @@ services:
       KAVA_RPC: ${KAVA_RPC:-}
       METIS_RPC: ${METIS_RPC:-}
       HARMONY_RPC: ${HARMONY_RPC:-}
+      BLOCKBERRY_API_KEY: ${BLOCKBERRY_API_KEY:-}
+      SUI_RPC: ${SUI_RPC:-}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

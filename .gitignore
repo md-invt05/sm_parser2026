@@ -4,8 +4,13 @@
 .runtime_deps/
 __pycache__/
 .pytest_cache/
+.pytest-tmp-*/
+pytest-cache-files-*/
 .test_tmp/
 .test-tmp/
+.coverage
+coverage.xml
+htmlcov/
 *.pyc
 data/*.db*
 logs/

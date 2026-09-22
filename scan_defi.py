@@ -15,24 +15,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import multiprocessing
 import os
 import random
+import shutil
 import signal
 import sqlite3
 import threading
 import time
 import traceback
 from contextvars import ContextVar
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 import yaml
@@ -42,6 +47,14 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from monitoring import LOAD_PROFILES, MonitorStore, percentile
+from sui_support import (
+    BlockberryClient,
+    SuiConfig,
+    SuiStore,
+    export_sui_xlsx,
+    sui_balance_loop,
+    sui_discovery_loop,
+)
 
 load_dotenv()
 
@@ -123,6 +136,7 @@ class ChainCfg:
     logs_max_range: int
     explorer: str
     rpc: list[str]
+    lifecycle: str = "active"
 
 
 @dataclass
@@ -146,6 +160,7 @@ class AppCfg:
     rabby_uncertainty: float
     block_batch_size: int
     receipt_batch_size: int
+    eth_call_batch_size: int
     price_batch_size: int
     http_timeout_sec: int
     max_retries: int
@@ -162,8 +177,12 @@ class AppCfg:
     discover_tokens_from_transfers: bool
     discover_tx_to_contracts: bool
     code_cache_ttl_sec: int
+    native_anomaly_usd: float
+    rabby_token_discovery_after_sec: int
+    valuation_policies: list[dict[str, Any]]
     default_chains: list[str]
     chains: dict[str, ChainCfg]
+    sui: dict[str, Any]
 
 
 def _env_rpcs(chain_key: str) -> list[str]:
@@ -221,6 +240,7 @@ def load_config(path: Path) -> AppCfg:
             logs_max_range=int(c.get("logs_max_range") or 500),
             explorer=c.get("explorer", ""),
             rpc=rpcs,
+            lifecycle=str(c.get("lifecycle", "active")),
         )
     return AppCfg(
         min_usd=float(raw["min_usd"]),
@@ -242,6 +262,7 @@ def load_config(path: Path) -> AppCfg:
         rabby_uncertainty=uncertainty,
         block_batch_size=int(raw.get("block_batch_size", 8)),
         receipt_batch_size=int(raw.get("receipt_batch_size", 20)),
+        eth_call_batch_size=int(raw.get("eth_call_batch_size", 10)),
         price_batch_size=int(raw.get("price_batch_size", 40)),
         http_timeout_sec=int(raw.get("http_timeout_sec", 40)),
         max_retries=int(raw.get("max_retries", 8)),
@@ -258,10 +279,16 @@ def load_config(path: Path) -> AppCfg:
         discover_tokens_from_transfers=bool(raw.get("discover_tokens_from_transfers", True)),
         discover_tx_to_contracts=bool(raw.get("discover_tx_to_contracts", True)),
         code_cache_ttl_sec=max(1, int(raw.get("code_cache_ttl_sec", 86400))),
+        native_anomaly_usd=max(0.0, float(raw.get("native_anomaly_usd", 100_000_000))),
+        rabby_token_discovery_after_sec=max(
+            60, int(raw.get("rabby_token_discovery_after_sec", 900))
+        ),
+        valuation_policies=list(raw.get("valuation_policies") or []),
         default_chains=list(raw.get("default_chains") or [
             key for key, chain in chains.items() if chain.enabled
         ]),
         chains=chains,
+        sui=dict(raw.get("sui") or {}),
     )
 
 
@@ -478,16 +505,123 @@ CREATE INDEX IF NOT EXISTS idx_contract_discoveries_address
     ON contract_discoveries(address, chain);
 CREATE INDEX IF NOT EXISTS idx_contract_code_cache_checked
     ON contract_code_cache(chain, checked_at);
+
+CREATE TABLE IF NOT EXISTS chain_cursors (
+    chain            TEXT NOT NULL,
+    role             TEXT NOT NULL CHECK(role IN ('live','backfill')),
+    next_block       INTEGER NOT NULL,
+    anchor_block     INTEGER NOT NULL,
+    last_committed   INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    updated_at       TEXT NOT NULL,
+    note             TEXT,
+    PRIMARY KEY (chain, role)
+);
+
+CREATE TABLE IF NOT EXISTS address_chain_state (
+    address          TEXT NOT NULL,
+    chain            TEXT NOT NULL,
+    checked_at       TEXT NOT NULL,
+    last_success_at  TEXT,
+    status           TEXT NOT NULL,
+    has_code         INTEGER,
+    native_raw       TEXT,
+    native_amount    REAL,
+    observed_native_usd REAL,
+    included_native_usd REAL,
+    excluded_usd     REAL NOT NULL DEFAULT 0,
+    tokens_usd       REAL,
+    total_usd        REAL,
+    valuation_status TEXT,
+    failure_streak   INTEGER NOT NULL DEFAULT 0,
+    next_retry_at    TEXT NOT NULL,
+    note             TEXT,
+    PRIMARY KEY (address, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_address_chain_retry
+    ON address_chain_state(next_retry_at, address);
+
+CREATE TABLE IF NOT EXISTS address_token_state (
+    address          TEXT NOT NULL,
+    chain            TEXT NOT NULL,
+    token            TEXT NOT NULL,
+    checked_at       TEXT NOT NULL,
+    raw_amount       TEXT NOT NULL,
+    amount           REAL,
+    symbol           TEXT,
+    price_usd        REAL,
+    usd_value        REAL,
+    priced           INTEGER NOT NULL,
+    valuation_status TEXT NOT NULL DEFAULT 'included',
+    PRIMARY KEY (address, chain, token)
+);
+
+CREATE TABLE IF NOT EXISTS asset_valuation_policies (
+    chain            TEXT NOT NULL,
+    address          TEXT NOT NULL,
+    asset            TEXT NOT NULL,
+    policy           TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    source           TEXT,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (chain, address, asset)
+);
+
+CREATE TABLE IF NOT EXISTS anomalous_balances (
+    chain            TEXT NOT NULL,
+    address          TEXT NOT NULL,
+    asset            TEXT NOT NULL,
+    detected_at      TEXT NOT NULL,
+    last_seen_at     TEXT NOT NULL,
+    raw_amount       TEXT NOT NULL,
+    observed_usd     REAL,
+    second_rpc_match INTEGER,
+    early_block_raw  TEXT,
+    status           TEXT NOT NULL,
+    evidence_json    TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (chain, address, asset)
+);
+
+CREATE TABLE IF NOT EXISTS rpc_method_health (
+    chain            TEXT NOT NULL,
+    endpoint_fp      TEXT NOT NULL,
+    hostname         TEXT NOT NULL,
+    method_group     TEXT NOT NULL,
+    fail_streak      INTEGER NOT NULL DEFAULT 0,
+    success_streak   INTEGER NOT NULL DEFAULT 0,
+    cooldown_until   REAL NOT NULL DEFAULT 0,
+    circuit_until    REAL NOT NULL DEFAULT 0,
+    permanent_error  TEXT,
+    latency_ewma_ms  REAL,
+    batch_limit      INTEGER,
+    success_since_resize INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (chain, endpoint_fp, method_group)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_meta (
+    key              TEXT PRIMARY KEY,
+    value            TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
 """
 
 
 class DB:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._lock = threading.Lock()
-        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=60)
+        self.read_only = read_only
+        self._lock = threading.RLock()
+        if read_only:
+            uri = f"file:{path.as_posix()}?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=60)
+        else:
+            self.conn = sqlite3.connect(path, check_same_thread=False, timeout=60)
         self.conn.row_factory = sqlite3.Row
+        if read_only:
+            self.conn.execute("PRAGMA query_only=ON")
+            return
         self.conn.executescript(SCHEMA)
         chain_state_columns = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(chain_state)")
@@ -503,6 +637,27 @@ class DB:
         }
         if "rpc_scan_id" not in rabby_columns:
             self.conn.execute("ALTER TABLE rabby_estimates ADD COLUMN rpc_scan_id INTEGER")
+        chain_scan_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(address_chain_scans)")
+        }
+        for name, declaration in {
+            "native_raw": "TEXT",
+            "observed_native_usd": "REAL",
+            "included_native_usd": "REAL",
+            "excluded_usd": "REAL NOT NULL DEFAULT 0",
+            "valuation_status": "TEXT",
+        }.items():
+            if name not in chain_scan_columns:
+                self.conn.execute(
+                    f"ALTER TABLE address_chain_scans ADD COLUMN {name} {declaration}"
+                )
+        token_scan_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(address_token_scans)")
+        }
+        if "valuation_status" not in token_scan_columns:
+            self.conn.execute(
+                "ALTER TABLE address_token_scans ADD COLUMN valuation_status TEXT NOT NULL DEFAULT 'included'"
+            )
         self.conn.execute(
             """
             INSERT OR IGNORE INTO contract_discoveries(
@@ -515,13 +670,354 @@ class DB:
             """
         )
         self.conn.execute(
-            "INSERT INTO schema_meta(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
+            "INSERT INTO schema_meta(version) SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
         )
-        self.conn.execute("UPDATE schema_meta SET version=4 WHERE version < 4")
+        self.conn.execute("UPDATE schema_meta SET version=7 WHERE version < 7")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO runtime_meta(key,value,updated_at) VALUES('data_revision','0',?)",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _bump_revision_locked(self) -> int:
+        row = self.conn.execute(
+            "SELECT CAST(value AS INTEGER) FROM runtime_meta WHERE key='data_revision'"
+        ).fetchone()
+        revision = int(row[0] if row else 0) + 1
+        self.conn.execute(
+            """INSERT INTO runtime_meta(key,value,updated_at) VALUES('data_revision',?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+            (str(revision), datetime.now(timezone.utc).isoformat()),
+        )
+        return revision
+
+    def data_revision(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='data_revision'"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def seed_valuation_policies(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        values = []
+        for row in rows:
+            address = normalize_evm_address(row.get("address"))
+            if address is None:
+                raise ValueError(f"invalid valuation policy address: {row.get('address')}")
+            policy = str(row.get("policy") or "").strip()
+            if policy not in {"include", "exclude_from_total", "quarantine"}:
+                raise ValueError(f"invalid valuation policy: {policy}")
+            values.append((
+                str(row["chain"]), address, str(row.get("asset") or "native").lower(),
+                policy, str(row.get("reason") or "manual policy"), row.get("source"), now,
+            ))
+        with self._lock, self.conn:
+            self.conn.executemany(
+                """INSERT INTO asset_valuation_policies(
+                       chain,address,asset,policy,reason,source,updated_at
+                   ) VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(chain,address,asset) DO UPDATE SET
+                     policy=excluded.policy,reason=excluded.reason,
+                     source=excluded.source,updated_at=excluded.updated_at""",
+                values,
+            )
+
+    def valuation_policy(self, chain: str, address: str, asset: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM asset_valuation_policies WHERE chain=? AND address=? AND asset=?",
+                (chain, address.lower(), asset.lower()),
+            ).fetchone()
+
+    def revalue_system_balances(self, min_usd: float) -> int:
+        """Revalue historical aggregate scans without deleting their raw observations."""
+        with self._lock, self.conn:
+            policies = self.conn.execute(
+                """SELECT chain,address,reason FROM asset_valuation_policies
+                   WHERE asset='native' AND policy='exclude_from_total'"""
+            ).fetchall()
+            touched: set[int] = set()
+            for policy in policies:
+                rows = self.conn.execute(
+                    """SELECT c.scan_id,c.native_usd,c.total_usd
+                       FROM address_chain_scans c JOIN address_scans a ON a.id=c.scan_id
+                       WHERE c.chain=? AND lower(a.address)=? AND c.has_code=1
+                         AND COALESCE(c.valuation_status,'included')!='exclude_from_total'""",
+                    (policy["chain"], policy["address"]),
+                ).fetchall()
+                for row in rows:
+                    observed = float(row["native_usd"] or 0.0)
+                    self.conn.execute(
+                        """UPDATE address_chain_scans SET
+                             native_raw=COALESCE(native_raw,(
+                               SELECT raw_amount FROM address_token_scans t
+                               WHERE t.scan_id=address_chain_scans.scan_id
+                                 AND t.chain=address_chain_scans.chain AND t.token='native'
+                             )),
+                             observed_native_usd=COALESCE(observed_native_usd,native_usd),
+                             included_native_usd=0,
+                             excluded_usd=MAX(excluded_usd,?),
+                             valuation_status='exclude_from_total',
+                             total_usd=MAX(0,COALESCE(total_usd,0)-?)
+                           WHERE scan_id=? AND chain=?""",
+                        (observed, observed, row["scan_id"], policy["chain"]),
+                    )
+                    self.conn.execute(
+                        """UPDATE address_token_scans SET valuation_status='exclude_from_total'
+                           WHERE scan_id=? AND chain=? AND token='native'""",
+                        (row["scan_id"], policy["chain"]),
+                    )
+                    touched.add(int(row["scan_id"]))
+            for scan_id in touched:
+                total = float(self.conn.execute(
+                    "SELECT COALESCE(SUM(total_usd),0) FROM address_chain_scans WHERE scan_id=?",
+                    (scan_id,),
+                ).fetchone()[0])
+                parts = self.conn.execute(
+                    "SELECT status FROM address_chain_scans WHERE scan_id=?", (scan_id,)
+                ).fetchall()
+                status = (
+                    "qualifying" if total >= min_usd
+                    else "below" if parts and all(row["status"] in ("complete", "absent") for row in parts)
+                    else "incomplete"
+                )
+                self.conn.execute(
+                    "UPDATE address_scans SET total_usd=?,status=?,note=TRIM(COALESCE(note,'') || ', system_balance_excluded',', ') WHERE id=?",
+                    (total, status, scan_id),
+                )
+            if touched:
+                self._bump_revision_locked()
+            return len(touched)
+
+    def reclassify_latest_scans(self, min_usd: float) -> int:
+        changed = 0
+        with self._lock, self.conn:
+            latest = self.conn.execute(
+                """SELECT a.* FROM address_scans a WHERE a.id=(
+                     SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
+                     ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
+            ).fetchall()
+            for scan in latest:
+                parts = self.conn.execute(
+                    "SELECT status FROM address_chain_scans WHERE scan_id=?", (scan["id"],)
+                ).fetchall()
+                total = float(scan["total_usd"] or 0.0)
+                status = (
+                    "qualifying" if total >= min_usd
+                    else "below" if parts and all(
+                        row["status"] in ("complete", "absent") for row in parts
+                    ) else "incomplete"
+                )
+                if status != scan["status"]:
+                    self.conn.execute(
+                        "UPDATE address_scans SET status=? WHERE id=?", (status, scan["id"])
+                    )
+                    changed += 1
+                self.conn.execute(
+                    "UPDATE contracts SET last_status=?,last_total_usd=? WHERE lower(address)=?",
+                    (status, total, scan["address"].lower()),
+                )
+            if changed:
+                self._bump_revision_locked()
+        return changed
+
+    def save_anomaly(
+        self, chain: str, address: str, asset: str, raw_amount: int,
+        observed_usd: float | None, second_rpc_match: bool | None,
+        early_block_raw: int | None, status: str, evidence: dict[str, Any],
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO anomalous_balances(
+                       chain,address,asset,detected_at,last_seen_at,raw_amount,
+                       observed_usd,second_rpc_match,early_block_raw,status,evidence_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(chain,address,asset) DO UPDATE SET
+                     last_seen_at=excluded.last_seen_at,raw_amount=excluded.raw_amount,
+                     observed_usd=excluded.observed_usd,
+                     second_rpc_match=excluded.second_rpc_match,
+                     early_block_raw=excluded.early_block_raw,status=excluded.status,
+                     evidence_json=excluded.evidence_json""",
+                (chain, address.lower(), asset.lower(), now, now, str(raw_amount),
+                 observed_usd, None if second_rpc_match is None else int(second_rpc_match),
+                 None if early_block_raw is None else str(early_block_raw), status,
+                 json.dumps(evidence, ensure_ascii=False, sort_keys=True)),
+            )
+
+    def init_chain_cursors(
+        self, chain: str, start_block: int, safe_head: int, lookback: int = 2,
+    ) -> dict[str, sqlite3.Row]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            existing_live_before = self.conn.execute(
+                "SELECT last_committed FROM chain_cursors WHERE chain=? AND role='live'",
+                (chain,),
+            ).fetchone()
+            old = self.conn.execute(
+                "SELECT last_indexed FROM chain_state WHERE chain=?", (chain,)
+            ).fetchone()
+            historical = int(old[0]) if old else max(0, start_block - 1)
+            backfill_next = max(start_block, historical + 1)
+            backfill_status = "complete" if backfill_next > safe_head else "active"
+            live_next = max(start_block, safe_head - max(0, lookback) + 1)
+            self.conn.execute(
+                """INSERT OR IGNORE INTO chain_cursors(
+                       chain,role,next_block,anchor_block,last_committed,status,updated_at,note
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (chain, "backfill", backfill_next, safe_head, backfill_next - 1,
+                 backfill_status, now, "migrated from chain_state"),
+            )
+            self.conn.execute(
+                """INSERT OR IGNORE INTO chain_cursors(
+                       chain,role,next_block,anchor_block,last_committed,status,updated_at,note
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (chain, "live", live_next, safe_head, live_next - 1,
+                 "active", now, "safe-head anchor with two-block lookback"),
+            )
+            if existing_live_before is not None:
+                replay_from = max(
+                    start_block, int(existing_live_before["last_committed"]) - lookback + 1
+                )
+                self.conn.execute(
+                    """UPDATE chain_cursors SET next_block=?,last_committed=?,anchor_block=?,
+                         status='active',updated_at=?,note='startup reorg lookback'
+                       WHERE chain=? AND role='live'""",
+                    (replay_from, replay_from - 1, safe_head, now, chain),
+                )
+            rows = self.conn.execute(
+                "SELECT * FROM chain_cursors WHERE chain=?", (chain,)
+            ).fetchall()
+        return {str(row["role"]): row for row in rows}
+
+    def cursor(self, chain: str, role: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM chain_cursors WHERE chain=? AND role=?", (chain, role)
+            ).fetchone()
+
+    def advance_cursor_start(self, chain: str, role: str, next_block: int) -> None:
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT next_block FROM chain_cursors WHERE chain=? AND role=?", (chain, role)
+            ).fetchone()
+            if row is not None and int(row["next_block"]) < next_block:
+                self.conn.execute(
+                    """UPDATE chain_cursors SET next_block=?,last_committed=?,updated_at=?,
+                         note='advanced by --from-block' WHERE chain=? AND role=?""",
+                    (next_block, next_block - 1, datetime.now(timezone.utc).isoformat(), chain, role),
+                )
+
+    def commit_index_range(
+        self, chain: str, role: str, range_end: int,
+        contract_rows: list[tuple[Any, ...]],
+        discovery_rows: list[tuple[Any, ...]],
+        cache_rows: list[tuple[Any, ...]],
+        token_rows: list[tuple[Any, ...]],
+        relation_rows: list[tuple[Any, ...]],
+    ) -> tuple[int, int]:
+        """Commit all derived data and the matching cursor in one transaction."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "SELECT next_block,anchor_block FROM chain_cursors WHERE chain=? AND role=?",
+                (chain, role),
+            ).fetchone()
+            if cursor is None:
+                raise RuntimeError(f"missing {chain}/{role} cursor")
+            before = self.conn.total_changes
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO contracts(
+                       chain,address,created_block,created_tx,creator,first_seen_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                contract_rows,
+            )
+            inserted = self.conn.total_changes - before
+            self.conn.executemany(
+                """UPDATE contracts SET created_block=COALESCE(created_block,?),
+                     created_tx=COALESCE(created_tx,?),creator=COALESCE(creator,?)
+                   WHERE chain=? AND address=? AND ? IS NOT NULL""",
+                [(row[2], row[3], row[4], row[0], row[1], row[2]) for row in contract_rows],
+            )
+            before_sources = self.conn.total_changes
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO contract_discoveries(
+                       chain,address,source,observed_block,observed_tx,actor,first_seen_at
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                discovery_rows,
+            )
+            sources_inserted = self.conn.total_changes - before_sources
+            self.conn.executemany(
+                """INSERT INTO contract_code_cache(chain,address,has_code,checked_at,checked_block)
+                   VALUES(?,?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET
+                     has_code=excluded.has_code,checked_at=excluded.checked_at,
+                     checked_block=excluded.checked_block""",
+                cache_rows,
+            )
+            self.conn.executemany(
+                """INSERT INTO tokens(chain,address,symbol,decimals,source) VALUES(?,?,?,?,?)
+                   ON CONFLICT(chain,address) DO UPDATE SET
+                     symbol=COALESCE(excluded.symbol,tokens.symbol),
+                     decimals=COALESCE(excluded.decimals,tokens.decimals)""",
+                token_rows,
+            )
+            self.conn.executemany(
+                """INSERT INTO contract_tokens(
+                       chain,contract,token,source,first_seen_block,last_seen_block
+                   ) VALUES(?,?,?,?,?,?) ON CONFLICT(chain,contract,token) DO UPDATE SET
+                     last_seen_block=MAX(contract_tokens.last_seen_block,excluded.last_seen_block)""",
+                [(*row, row[4]) for row in relation_rows],
+            )
+            anchor = int(cursor["anchor_block"])
+            status = "complete" if role == "backfill" and range_end >= anchor else "active"
+            self.conn.execute(
+                """UPDATE chain_cursors SET next_block=?,last_committed=?,status=?,updated_at=?,note=NULL
+                   WHERE chain=? AND role=?""",
+                (range_end + 1, range_end, status, now, chain, role),
+            )
+            if role == "backfill":
+                self.conn.execute(
+                    "UPDATE chain_state SET last_indexed=MAX(last_indexed,?) WHERE chain=?",
+                    (range_end, chain),
+                )
+            self._bump_revision_locked()
+            return int(inserted), int(sources_inserted)
+
+    def save_rpc_health(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        with self._lock, self.conn:
+            self.conn.executemany(
+                """INSERT INTO rpc_method_health(
+                       chain,endpoint_fp,hostname,method_group,fail_streak,success_streak,
+                       cooldown_until,circuit_until,permanent_error,latency_ewma_ms,
+                       batch_limit,success_since_resize,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(chain,endpoint_fp,method_group) DO UPDATE SET
+                     hostname=excluded.hostname,fail_streak=excluded.fail_streak,
+                     success_streak=excluded.success_streak,cooldown_until=excluded.cooldown_until,
+                     circuit_until=excluded.circuit_until,permanent_error=excluded.permanent_error,
+                     latency_ewma_ms=excluded.latency_ewma_ms,batch_limit=excluded.batch_limit,
+                     success_since_resize=excluded.success_since_resize,updated_at=excluded.updated_at""",
+                [(
+                    row["chain"], row["endpoint_fp"], row["hostname"], row["method_group"],
+                    row["fail_streak"], row["success_streak"], row["cooldown_until"],
+                    row["circuit_until"], row.get("permanent_error"), row.get("latency_ewma_ms"),
+                    row.get("batch_limit"), row.get("success_since_resize"), row["updated_at"],
+                ) for row in rows],
+            )
+
+    def load_rpc_health(self, chain: str) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.conn.execute(
+                "SELECT * FROM rpc_method_health WHERE chain=?", (chain,)
+            ))
 
     def init_chain(
         self, chain: str, start_block: int, discover_tx_to_contracts: bool = False
@@ -885,32 +1381,215 @@ class DB:
         self, recheck_sec: int, limit: int = 200, retry_sec: int | None = None,
         as_of: float | None = None,
     ) -> list[str]:
-        now = time.time() if as_of is None else as_of
-        cutoff = datetime.fromtimestamp(now - recheck_sec, timezone.utc).isoformat()
-        retry_cutoff = datetime.fromtimestamp(
-            now - (retry_sec if retry_sec is not None else recheck_sec), timezone.utc
+        now_iso = datetime.fromtimestamp(
+            time.time() if as_of is None else as_of, timezone.utc
         ).isoformat()
         with self._lock:
             rows = self.conn.execute(
                 """
                 SELECT lower(c.address) AS address
                 FROM contracts c
-                LEFT JOIN address_scans a
-                  ON a.id=(
-                    SELECT a2.id FROM address_scans a2
-                    WHERE a2.address=lower(c.address)
-                    ORDER BY a2.scanned_at DESC, a2.id DESC LIMIT 1
-                  )
-                WHERE a.scanned_at IS NULL OR a.scanned_at < ?
-                   OR ((a.status='incomplete' OR a.coverage < a.total_networks)
-                       AND a.scanned_at < ?)
                 GROUP BY lower(c.address)
-                ORDER BY COALESCE(a.scanned_at, '') ASC, lower(c.address)
+                HAVING NOT EXISTS (
+                    SELECT 1 FROM address_chain_state s
+                    WHERE s.address=lower(c.address)
+                ) OR EXISTS (
+                    SELECT 1 FROM address_chain_state s
+                    WHERE s.address=lower(c.address) AND s.next_retry_at<=?
+                )
+                ORDER BY MIN(c.last_checked_at IS NOT NULL), MIN(COALESCE(c.last_checked_at,'')),
+                         lower(c.address)
                 LIMIT ?
                 """,
-                (cutoff, retry_cutoff, limit),
+                (now_iso, limit),
             ).fetchall()
             return [row["address"] for row in rows]
+
+    def due_address_chains(
+        self, address: str, chain_keys: list[str], as_of: float | None = None,
+    ) -> list[str]:
+        now_iso = datetime.fromtimestamp(
+            time.time() if as_of is None else as_of, timezone.utc
+        ).isoformat()
+        with self._lock:
+            rows = {
+                str(row["chain"]): row
+                for row in self.conn.execute(
+                    "SELECT chain,next_retry_at FROM address_chain_state WHERE address=?",
+                    (address.lower(),),
+                )
+            }
+        return [
+            chain for chain in chain_keys
+            if chain not in rows or str(rows[chain]["next_retry_at"]) <= now_iso
+        ]
+
+    def save_address_chain_state(
+        self, address: str, row: dict[str, Any], token_rows: list[dict[str, Any]],
+        min_usd: float,
+    ) -> None:
+        address = address.lower()
+        chain = str(row["chain"])
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        status = str(row.get("status") or "rpc_error")
+        with self._lock, self.conn:
+            previous = self.conn.execute(
+                "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
+                (address, chain),
+            ).fetchone()
+            failed = status in {"rpc_error", "partial", "timeout"}
+            failure_streak = (int(previous["failure_streak"]) if previous else 0) + 1 if failed else 0
+            if failed:
+                delay = min(21_600, 600 * (2 ** min(max(0, failure_streak - 1), 6)))
+            elif status in {"price_missing", "anomalous_balance"}:
+                delay = 3_600
+            elif status == "complete" and float(row.get("total_usd") or 0) >= min_usd:
+                delay = 21_600
+            else:
+                delay = 86_400
+            next_retry = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
+            has_observation = row.get("has_code") is not None and row.get("total_usd") is not None
+            def observed(name: str, fallback: Any = None) -> Any:
+                value = row.get(name)
+                if value is None and previous is not None:
+                    return previous[name]
+                return fallback if value is None else value
+            self.conn.execute(
+                """INSERT INTO address_chain_state(
+                       address,chain,checked_at,last_success_at,status,has_code,native_raw,
+                       native_amount,observed_native_usd,included_native_usd,excluded_usd,
+                       tokens_usd,total_usd,valuation_status,failure_streak,next_retry_at,note
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(address,chain) DO UPDATE SET
+                     checked_at=excluded.checked_at,last_success_at=excluded.last_success_at,
+                     status=excluded.status,has_code=excluded.has_code,native_raw=excluded.native_raw,
+                     native_amount=excluded.native_amount,
+                     observed_native_usd=excluded.observed_native_usd,
+                     included_native_usd=excluded.included_native_usd,
+                     excluded_usd=excluded.excluded_usd,tokens_usd=excluded.tokens_usd,
+                     total_usd=excluded.total_usd,valuation_status=excluded.valuation_status,
+                     failure_streak=excluded.failure_streak,next_retry_at=excluded.next_retry_at,
+                     note=excluded.note""",
+                (
+                    address, chain, now_iso,
+                    now_iso if has_observation else (previous["last_success_at"] if previous else None),
+                    status, observed("has_code"), observed("native_raw"),
+                    # A failed chain has no observation.  Keep its amounts NULL
+                    # (or retain a previous successful value), never silently
+                    # turn an RPC failure into a zero balance.
+                    observed("native_amount"), observed("observed_native_usd"),
+                    observed("included_native_usd"), observed("excluded_usd", 0.0),
+                    observed("tokens_usd"), observed("total_usd"),
+                    observed("valuation_status"), failure_streak, next_retry, row.get("note"),
+                ),
+            )
+            if has_observation:
+                if status in {"complete", "price_missing", "anomalous_balance", "absent"}:
+                    self.conn.execute(
+                        "DELETE FROM address_token_state WHERE address=? AND chain=?",
+                        (address, chain),
+                    )
+                else:
+                    checked_tokens = list(row.get("checked_tokens") or [])
+                    for offset in range(0, len(checked_tokens), 500):
+                        chunk = checked_tokens[offset:offset + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        if chunk:
+                            self.conn.execute(
+                                f"DELETE FROM address_token_state WHERE address=? AND chain=? AND token IN ({placeholders})",
+                                (address, chain, *chunk),
+                            )
+                self.conn.executemany(
+                    """INSERT INTO address_token_state(
+                           address,chain,token,checked_at,raw_amount,amount,symbol,
+                           price_usd,usd_value,priced,valuation_status
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    [(
+                        address, chain, token["token"], now_iso,
+                        str(token.get("raw_amount", "0")), token.get("amount"),
+                        token.get("symbol"), token.get("price_usd"), token.get("usd_value"),
+                        int(bool(token.get("priced"))),
+                        token.get("valuation_status", "included"),
+                    ) for token in token_rows],
+                )
+                if status == "partial":
+                    token_total = float(self.conn.execute(
+                        """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
+                           WHERE address=? AND chain=? AND token!='native'
+                             AND valuation_status='included'""",
+                        (address, chain),
+                    ).fetchone()[0])
+                    included_native = float(observed("included_native_usd", 0.0) or 0.0)
+                    self.conn.execute(
+                        """UPDATE address_chain_state SET tokens_usd=?,total_usd=?
+                           WHERE address=? AND chain=?""",
+                        (token_total, token_total + included_native, address, chain),
+                    )
+            self._bump_revision_locked()
+
+    def current_address_parts(
+        self, address: str, chain_keys: list[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        address = address.lower()
+        with self._lock:
+            state = {
+                str(row["chain"]): dict(row)
+                for row in self.conn.execute(
+                    "SELECT * FROM address_chain_state WHERE address=?", (address,)
+                )
+            }
+            tokens = [
+                dict(row) for row in self.conn.execute(
+                    "SELECT * FROM address_token_state WHERE address=? ORDER BY chain,token",
+                    (address,),
+                )
+            ]
+        chain_rows: list[dict[str, Any]] = []
+        for chain in chain_keys:
+            row = state.get(chain)
+            if row is None:
+                chain_rows.append({
+                    "chain": chain, "has_code": None, "status": "rpc_error",
+                    "total_usd": None, "note": "not_checked",
+                })
+            else:
+                row.setdefault("native_usd", row.get("observed_native_usd"))
+                chain_rows.append(row)
+        return chain_rows, tokens
+
+    def apply_address_schedule(self, address: str, status: str) -> None:
+        if status != "qualifying":
+            return
+        target = datetime.fromtimestamp(time.time() + 21_600, timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE address_chain_state SET next_retry_at=CASE
+                     WHEN next_retry_at>? THEN ? ELSE next_retry_at END
+                   WHERE address=? AND status NOT IN ('rpc_error','partial','price_missing','anomalous_balance')""",
+                (target, target, address.lower()),
+            )
+
+    def ingest_indexed_tokens(
+        self, address: str, rows: list[dict[str, Any]], source: str,
+    ) -> int:
+        token_rows: list[tuple[str, str, str | None, int | None, str]] = []
+        relations: list[tuple[str, str, str, str, int]] = []
+        for row in rows:
+            token = normalize_evm_address(row.get("token"))
+            chain = str(row.get("chain") or "")
+            if token is None or not chain or token == ZERO:
+                continue
+            decimals = row.get("decimals")
+            try:
+                decimals = int(decimals) if decimals is not None else None
+            except (TypeError, ValueError):
+                decimals = None
+            token_rows.append((chain, token, row.get("symbol"), decimals, source))
+            relations.append((chain, address.lower(), token, source, 0))
+        self.upsert_tokens(token_rows)
+        self.upsert_contract_tokens(relations)
+        return len(relations)
 
     def save_rabby_estimate(self, address: str, estimate: dict[str, Any], scan_id: int) -> None:
         with self._lock:
@@ -934,9 +1613,14 @@ class DB:
             )
             self.conn.commit()
 
-    def pending_rabby_scan(self, retry_sec: int, as_of: float | None = None) -> sqlite3.Row | None:
-        cutoff = datetime.fromtimestamp(
-            (time.time() if as_of is None else as_of) - retry_sec, timezone.utc
+    def pending_rabby_scan(
+        self, retry_sec: int, as_of: float | None = None,
+        minimum_age_sec: int = 900,
+    ) -> sqlite3.Row | None:
+        now = time.time() if as_of is None else as_of
+        cutoff = datetime.fromtimestamp(now - retry_sec, timezone.utc).isoformat()
+        old_enough = datetime.fromtimestamp(
+            time.time() - minimum_age_sec, timezone.utc
         ).isoformat()
         with self._lock:
             return self.conn.execute(
@@ -945,8 +1629,9 @@ class DB:
                    WHERE a.id=(SELECT MAX(a2.id) FROM address_scans a2 WHERE a2.address=a.address)
                      AND EXISTS (SELECT 1 FROM address_chain_scans c WHERE c.scan_id=a.id
                                  AND c.status NOT IN ('complete','absent'))
+                     AND a.scanned_at <= ?
                      AND (r.address IS NULL OR r.checked_at < ?)
-                   ORDER BY COALESCE(r.checked_at, '') ASC, a.id LIMIT 1""", (cutoff,)
+                   ORDER BY COALESCE(r.checked_at, '') ASC, a.id LIMIT 1""", (old_enough, cutoff)
             ).fetchone()
 
     def rabby_estimate(self, address: str) -> sqlite3.Row | None:
@@ -982,8 +1667,9 @@ class DB:
                 """
                 INSERT INTO address_chain_scans(
                     scan_id, chain, has_code, status, native_amount, native_usd,
-                    tokens_usd, total_usd, note
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    tokens_usd, total_usd, note, native_raw, observed_native_usd,
+                    included_native_usd, excluded_usd, valuation_status
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -996,6 +1682,11 @@ class DB:
                         row.get("tokens_usd"),
                         row.get("total_usd"),
                         row.get("note"),
+                        row.get("native_raw"),
+                        row.get("observed_native_usd", row.get("native_usd")),
+                        row.get("included_native_usd", row.get("native_usd")),
+                        row.get("excluded_usd", 0.0),
+                        row.get("valuation_status"),
                     )
                     for row in chain_rows
                 ],
@@ -1004,8 +1695,8 @@ class DB:
                 """
                 INSERT INTO address_token_scans(
                     scan_id, chain, token, symbol, raw_amount, amount,
-                    price_usd, usd_value, priced
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    price_usd, usd_value, priced, valuation_status
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -1018,6 +1709,7 @@ class DB:
                         row.get("price_usd"),
                         row.get("usd_value"),
                         1 if row.get("priced") else 0,
+                        row.get("valuation_status", "included"),
                     )
                     for row in token_rows
                 ],
@@ -1030,6 +1722,7 @@ class DB:
                 """,
                 (now, total_usd, status, address),
             )
+            self._bump_revision_locked()
             self.conn.commit()
             return scan_id
 
@@ -1099,7 +1792,7 @@ class DB:
             ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
 
-    def monitoring_snapshot(self) -> dict[str, Any]:
+    def monitoring_snapshot(self, min_usd: float) -> dict[str, Any]:
         """Return one cheap aggregate snapshot for monitoring.db."""
         with self._lock:
             unique_addresses = int(self.conn.execute(
@@ -1115,25 +1808,34 @@ class DB:
                 )
             }
             pending = int(self.conn.execute(
-                "SELECT COUNT(DISTINCT lower(address)) FROM contracts WHERE last_checked_at IS NULL"
+                """SELECT COUNT(DISTINCT lower(c.address)) FROM contracts c
+                   WHERE NOT EXISTS(SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
+                      OR EXISTS(SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address)
+                                AND strftime('%s',s.next_retry_at)<=strftime('%s','now'))"""
             ).fetchone()[0])
             oldest_age = self.conn.execute(
-                "SELECT MAX(strftime('%s','now')-strftime('%s',first_seen_at)) "
-                "FROM contracts WHERE last_checked_at IS NULL"
+                """SELECT MAX(strftime('%s','now')-strftime('%s',c.first_seen_at))
+                   FROM contracts c WHERE NOT EXISTS(
+                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))"""
             ).fetchone()[0]
             completed = int(self.conn.execute(
                 "SELECT COUNT(DISTINCT address) FROM address_scans"
             ).fetchone()[0])
+            latest = list(self.conn.execute(
+                """SELECT a.* FROM address_scans a
+                   WHERE a.id=(SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
+                               ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
+            ))
             statuses = {
-                str(row["status"]): int(row["n"])
-                for row in self.conn.execute(
-                    """
-                    SELECT status,COUNT(*) AS n FROM address_scans a
-                    WHERE a.id=(SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
-                                ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)
-                    GROUP BY status
-                    """
-                )
+                "qualifying": sum(float(row["total_usd"] or 0) >= min_usd for row in latest),
+                "below": sum(
+                    row["status"] == "below" and 0 < float(row["total_usd"] or 0) < min_usd
+                    for row in latest
+                ),
+                "incomplete": sum(
+                    row["status"] == "incomplete" and float(row["total_usd"] or 0) < min_usd
+                    for row in latest
+                ),
             }
             coverage = {
                 f"{int(row['coverage'])}/{int(row['total_networks'])}": int(row["n"])
@@ -1219,6 +1921,22 @@ def classify_rpc_problem(status: int | None, body: str, headers: httpx.Headers |
 
 
 @dataclass
+class MethodHealth:
+    cooldown_until: float = 0.0
+    circuit_until: float = 0.0
+    fail_streak: int = 0
+    ok_streak: int = 0
+    permanent_error: str | None = None
+    last_error: str | None = None
+    latency_ewma_ms: float | None = None
+    success_since_resize: int = 0
+
+    def available(self) -> bool:
+        now = time.time()
+        return self.permanent_error is None and now >= self.cooldown_until and now >= self.circuit_until
+
+
+@dataclass
 class Endpoint:
     url: str
     cooldown_until: float = 0.0
@@ -1228,29 +1946,85 @@ class Endpoint:
     batch_supported: bool = True
     last_error: str | None = None
     chain_verified: bool = False
+    priority: int = 0
+    private: bool = False
+    method_health: dict[str, MethodHealth] = field(default_factory=dict)
+    next_request_at: float = 0.0
+    rate_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def available(self) -> bool:
-        return self.permanent_error is None and time.time() >= self.cooldown_until
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self.url.encode("utf-8")).hexdigest()[:16]
 
-    def cool(self, seconds: float, cap: float) -> float:
+    def health(self, method_group: str) -> MethodHealth:
+        return self.method_health.setdefault(method_group, MethodHealth())
+
+    def available(self, method_group: str = "head") -> bool:
+        return (
+            self.permanent_error is None
+            and time.time() >= self.cooldown_until
+            and self.health(method_group).available()
+        )
+
+    def cool(self, seconds: float, cap: float, method_group: str = "head") -> float:
+        state = self.health(method_group)
         wait = min(cap, max(1.0, seconds))
-        self.fail_streak += 1
+        state.fail_streak += 1
+        state.ok_streak = 0
+        self.fail_streak = max(self.fail_streak, state.fail_streak)
         self.ok_streak = 0
         # экспонента от серии фейлов
-        wait = min(cap, wait * (2 ** min(self.fail_streak - 1, 6)))
+        wait = min(cap, wait * (2 ** min(state.fail_streak - 1, 6)))
         wait *= random.uniform(0.85, 1.15)
-        self.cooldown_until = time.time() + wait
+        state.cooldown_until = time.time() + wait
+        if state.fail_streak >= 5:
+            state.circuit_until = time.time() + 300
+        state.last_error = self.last_error
         return wait
 
-    def ok(self) -> None:
+    def ok(self, method_group: str = "head", latency_ms: float | None = None) -> None:
+        state = self.health(method_group)
+        state.fail_streak = 0
+        state.ok_streak += 1
+        state.success_since_resize += 1
+        state.cooldown_until = 0.0
+        state.circuit_until = 0.0
+        state.last_error = None
+        if latency_ms is not None:
+            state.latency_ewma_ms = (
+                latency_ms if state.latency_ewma_ms is None
+                else (state.latency_ewma_ms * 0.8 + latency_ms * 0.2)
+            )
         self.fail_streak = 0
         self.ok_streak += 1
-        self.cooldown_until = 0.0
+        # cooldown_until is the legacy/global gate; successful calls must not
+        # clear a manually imposed global pause for unrelated methods.
         self.last_error = None
 
     def disable(self, reason: str) -> None:
         self.permanent_error = reason
         self.last_error = reason
+        for state in self.method_health.values():
+            state.permanent_error = reason
+            state.last_error = reason
+
+
+def rpc_method_group(method: str) -> str:
+    if method in {"eth_chainId", "eth_blockNumber"}:
+        return "head"
+    if method == "eth_getBlockByNumber":
+        return "blocks"
+    if method in {"eth_getTransactionReceipt", "eth_getBlockReceipts"}:
+        return "receipts"
+    if method == "eth_getLogs":
+        return "logs"
+    if method == "eth_getCode":
+        return "code"
+    if method == "eth_getBalance":
+        return "balance"
+    if method == "eth_call":
+        return "eth_call"
+    return "head"
 
 
 class RpcPool:
@@ -1262,30 +2036,71 @@ class RpcPool:
         expected_chain_id: int | None = None,
         global_sem: asyncio.Semaphore | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        health_store: DB | None = None,
     ):
         if not urls:
             raise ValueError(f"{chain}: нет RPC URL")
         self.chain = chain
         self.cfg = cfg
         self.expected_chain_id = expected_chain_id
-        self.endpoints = [Endpoint(u) for u in urls]
+        private_hosts = {"lb.drpc.live", "alchemy.com", "g.alchemy.com"}
+        self.endpoints = [
+            Endpoint(
+                u, priority=index,
+                private=(urlparse(u).hostname or "").endswith(tuple(private_hosts)),
+            )
+            for index, u in enumerate(urls)
+        ]
         self.timeout = cfg.http_timeout_sec
         self.retries = cfg.max_retries
         self.sem = asyncio.Semaphore(cfg.rpc_concurrency)
         self.global_sem = global_sem or asyncio.Semaphore(cfg.global_rpc_concurrency)
         self.transport = transport
+        self.health_store = health_store
         self.preflight_complete = False
         self._i = 0
         self._client: httpx.AsyncClient | None = None
         self.block_batch = cfg.block_batch_size
         self.receipt_batch = cfg.receipt_batch_size
-        self.call_batch = min(cfg.receipt_batch_size, 20)
+        self.call_batch = max(1, cfg.eth_call_batch_size)
+        if self.endpoints and (urlparse(self.endpoints[0].url).hostname or "") == "lb.drpc.live":
+            # dRPC free endpoints reject JSON-RPC batches larger than three.
+            self.block_batch = min(self.block_batch, 3)
+            self.receipt_batch = min(self.receipt_batch, 3)
+            self.call_batch = min(self.call_batch, 3)
         self.paused_until = 0.0
         self.metric_requests = 0
         self.metric_successes = 0
         self.metric_errors: dict[str, int] = {}
         self.metric_latencies_ms: list[float] = []
         self.last_head: int | None = None
+        self._batch_successes = {"block": 0, "receipt": 0, "call": 0}
+        if health_store is not None:
+            persisted = health_store.load_rpc_health(chain)
+            by_fp = {endpoint.fingerprint: endpoint for endpoint in self.endpoints}
+            now = time.time()
+            for row in persisted:
+                endpoint = by_fp.get(str(row["endpoint_fp"]))
+                if endpoint is None:
+                    continue
+                state = endpoint.health(str(row["method_group"]))
+                state.fail_streak = int(row["fail_streak"])
+                state.ok_streak = int(row["success_streak"])
+                state.cooldown_until = max(now, float(row["cooldown_until"] or 0)) if float(row["cooldown_until"] or 0) > now else 0.0
+                state.circuit_until = max(now, float(row["circuit_until"] or 0)) if float(row["circuit_until"] or 0) > now else 0.0
+                # auth/wrong-chain disablement lasts only for the process; cooldowns
+                # and learned limits survive restarts.
+                state.permanent_error = None
+                state.latency_ewma_ms = row["latency_ewma_ms"]
+                state.success_since_resize = int(row["success_since_resize"] or 0)
+                limit = row["batch_limit"]
+                if limit is not None:
+                    if row["method_group"] == "blocks":
+                        self.block_batch = max(1, min(self.block_batch, int(limit)))
+                    elif row["method_group"] == "receipts":
+                        self.receipt_batch = max(1, min(self.receipt_batch, int(limit)))
+                    elif row["method_group"] in {"code", "eth_call"}:
+                        self.call_batch = max(1, min(self.call_batch, int(limit)))
 
     async def __aenter__(self) -> "RpcPool":
         self._client = httpx.AsyncClient(
@@ -1307,42 +2122,57 @@ class RpcPool:
         old = getattr(self, attr)
         new = max(1, old // 2)
         setattr(self, attr, new)
+        self._batch_successes[kind] = 0
         if new != old:
             log.warning("[%s] %s batch %s -> %s", self.chain, kind, old, new)
 
     def grow_batch(self, kind: str = "block") -> None:
         if not self.cfg.adaptive_batch:
             return
+        self._batch_successes[kind] = self._batch_successes.get(kind, 0) + 1
+        if self._batch_successes[kind] < 100:
+            return
+        self._batch_successes[kind] = 0
         attr, limit = {
             "block": ("block_batch", self.cfg.block_batch_size),
             "receipt": ("receipt_batch", self.cfg.receipt_batch_size),
-            "call": ("call_batch", min(self.cfg.receipt_batch_size, 20)),
+            "call": ("call_batch", self.cfg.eth_call_batch_size),
         }.get(kind, ("block_batch", self.cfg.block_batch_size))
         if getattr(self, attr) < limit:
             setattr(self, attr, min(limit, getattr(self, attr) + 1))
 
-    def _pick(self) -> Endpoint | None:
-        n = len(self.endpoints)
-        for i in range(n):
-            ep = self.endpoints[(self._i + i) % n]
-            if ep.available() and (not self.preflight_complete or ep.chain_verified):
-                self._i = (self._i + i + 1) % n
-                return ep
-        return None
+    def _pick(self, method_group: str = "head", exclude: set[str] | None = None) -> Endpoint | None:
+        exclude = exclude or set()
+        candidates = [
+            ep for ep in self.endpoints
+            if ep.fingerprint not in exclude
+            and ep.available(method_group)
+            and (not self.preflight_complete or ep.chain_verified)
+        ]
+        if not candidates:
+            return None
+        def score(ep: Endpoint) -> tuple[float, int]:
+            state = ep.health(method_group)
+            latency = state.latency_ewma_ms if state.latency_ewma_ms is not None else 500.0
+            return (ep.priority * 1000 + state.fail_streak * 5000 + latency, ep.priority)
+        return min(candidates, key=score)
 
-    def _soonest_wait(self) -> float:
+    def _soonest_wait(self, method_group: str = "head") -> float:
         now = time.time()
         waits = [
-            max(0.0, ep.cooldown_until - now)
+            max(0.0, max(ep.health(method_group).cooldown_until,
+                         ep.health(method_group).circuit_until) - now)
             for ep in self.endpoints
             if ep.permanent_error is None
             and (not self.preflight_complete or ep.chain_verified)
         ]
         return min(waits) if waits else self.cfg.all_down_sleep_sec
 
-    async def _wait_healthy_endpoint(self) -> Endpoint:
+    async def _wait_healthy_endpoint(
+        self, method_group: str = "head", exclude: set[str] | None = None,
+    ) -> Endpoint:
         while True:
-            ep = self._pick()
+            ep = self._pick(method_group, exclude)
             if ep is not None:
                 return ep
             if BALANCE_RPC.get():
@@ -1351,6 +2181,7 @@ class RpcPool:
                 item for item in self.endpoints
                 if item.permanent_error is None
                 and (not self.preflight_complete or item.chain_verified)
+                and item.fingerprint not in (exclude or set())
             ]
             if not usable:
                 reasons = ", ".join(
@@ -1363,22 +2194,30 @@ class RpcPool:
                 )
             wait = min(
                 self.cfg.cooldown_max_sec,
-                max(self.cfg.all_down_sleep_sec, self._soonest_wait()),
+                max(self.cfg.all_down_sleep_sec, self._soonest_wait(method_group)),
             )
             self.paused_until = time.time() + wait
             log.warning("[%s] all RPC endpoints cooling down for %.0fs", self.chain, wait)
             await asyncio.sleep(wait)
 
-    async def _request_endpoint(self, ep: Endpoint, payload: Any) -> Any:
+    async def _request_endpoint(
+        self, ep: Endpoint, payload: Any, method_group: str = "head",
+    ) -> Any:
         assert self._client
         started = time.monotonic()
         self.metric_requests += 1
         try:
             try:
+                interval = 0.2 if ep.private else 1.0
+                async with ep.rate_lock:
+                    delay = max(0.0, ep.next_request_at - time.monotonic())
+                    if delay:
+                        await asyncio.sleep(delay)
+                    ep.next_request_at = time.monotonic() + interval
                 # Queued work for one chain must not reserve global slots.
                 async with self.sem:
                     async with self.global_sem:
-                        if BALANCE_RPC.get() and not ep.available():
+                        if BALANCE_RPC.get() and not ep.available(method_group):
                             raise RpcError("cooldown", "endpoint became unavailable while queued")
                         response = await self._client.post(ep.url, json=payload)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
@@ -1398,7 +2237,8 @@ class RpcPool:
                 raise classify_rpc_problem(None, error_text) or RpcError("rpc", "JSON-RPC error")
             if not isinstance(data, (dict, list)):
                 raise RpcError("malformed", f"unexpected JSON type: {type(data).__name__}")
-            ep.ok()
+            latency_ms = (time.monotonic() - started) * 1000
+            ep.ok(method_group, latency_ms)
             self.metric_successes += 1
             return data
         except Exception as exc:
@@ -1410,13 +2250,19 @@ class RpcPool:
             if len(self.metric_latencies_ms) > 5000:
                 del self.metric_latencies_ms[:-2500]
 
-    async def _post(self, payload: Any) -> tuple[Endpoint, Any]:
+    async def _post(
+        self, payload: Any, method_group: str | None = None,
+        exclude: set[str] | None = None,
+    ) -> tuple[Endpoint, Any]:
         last: Exception | None = None
+        if method_group is None:
+            method = payload[0].get("method", "") if isinstance(payload, list) and payload else payload.get("method", "")
+            method_group = rpc_method_group(str(method))
         attempts = min(2, self.retries) if BALANCE_RPC.get() else self.retries
         for _attempt in range(max(1, attempts)):
-            ep = await self._wait_healthy_endpoint()
+            ep = await self._wait_healthy_endpoint(method_group, exclude)
             try:
-                return ep, await self._request_endpoint(ep, payload)
+                return ep, await self._request_endpoint(ep, payload, method_group)
             except RpcError as exc:
                 last = exc
                 if exc.kind == "cooldown":
@@ -1431,10 +2277,11 @@ class RpcPool:
                         exc.kind,
                     )
                     continue
-                base = exc.retry_after or self.cfg.cooldown_min_sec
-                if exc.kind == "network":
-                    base *= 2
-                slept = ep.cool(base, self.cfg.cooldown_max_sec)
+                base = exc.retry_after or (
+                    60.0 if exc.kind == "rate_limit" else self.cfg.cooldown_min_sec
+                )
+                ep.health(method_group).last_error = exc.kind
+                slept = ep.cool(base, self.cfg.cooldown_max_sec, method_group)
                 log.warning(
                     "[%s] %s %s, cooldown %.0fs",
                     self.chain,
@@ -1447,7 +2294,10 @@ class RpcPool:
             except Exception as exc:
                 last = exc
                 ep.last_error = type(exc).__name__
-                slept = ep.cool(self.cfg.cooldown_min_sec, self.cfg.cooldown_max_sec)
+                ep.health(method_group).last_error = type(exc).__name__
+                slept = ep.cool(
+                    self.cfg.cooldown_min_sec, self.cfg.cooldown_max_sec, method_group
+                )
                 log.warning(
                     "[%s] %s unexpected %s, cooldown %.0fs",
                     self.chain,
@@ -1463,13 +2313,30 @@ class RpcPool:
 
     async def call(self, method: str, params: list[Any]) -> Any:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        _ep, data = await self._post(payload)
+        _ep, data = await self._post(payload, rpc_method_group(method))
         if not isinstance(data, dict) or "result" not in data:
             raise RpcError("malformed", f"{method}: missing result")
         result = data["result"]
         if method == "eth_blockNumber" and result is not None:
             self.last_head = hex_int(result)
         return result
+
+    async def confirmed_call(
+        self, method: str, params: list[Any], expected: Any,
+    ) -> tuple[bool | None, Any | None]:
+        """Repeat a sensitive read on a distinct endpoint without trusting it for valuation."""
+        group = rpc_method_group(method)
+        payload = {"jsonrpc": "2.0", "id": 91, "method": method, "params": params}
+        first = self._pick(group)
+        if first is None:
+            return None, None
+        try:
+            endpoint, data = await self._post(payload, group, {first.fingerprint})
+        except RpcError:
+            return None, None
+        if not isinstance(data, dict) or "result" not in data:
+            return False, None
+        return data["result"] == expected, data["result"]
 
     async def batch_partial(self, calls: list[tuple[str, list[Any]]]) -> list[Any | Exception]:
         if not calls:
@@ -1492,7 +2359,8 @@ class RpcPool:
         ]
         endpoint: Endpoint | None = None
         try:
-            endpoint, data = await self._post(payload)
+            group = rpc_method_group(calls[0][0]) if calls else "head"
+            endpoint, data = await self._post(payload, group)
         except RpcError:
             data = None
         if not isinstance(data, list):
@@ -1546,11 +2414,21 @@ class RpcPool:
     async def preflight(self) -> list[dict[str, Any]]:
         """Validate endpoint chain IDs and basic calls without exposing full URLs."""
         assert self._client
-        report: list[dict[str, Any]] = []
-        for ep in self.endpoints:
+        # Startup must not wait behind a dead public endpoint.  This is a
+        # diagnostic probe, not an indexing request: a short deadline is
+        # enough to choose a healthy fallback and let workers start.
+        async def request(ep: Endpoint, payload: Any) -> Any:
+            try:
+                return await asyncio.wait_for(
+                    self._request_endpoint(ep, payload, "head"), timeout=30.0,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RpcError("timeout", "preflight request timed out") from exc
+
+        async def probe(ep: Endpoint) -> dict[str, Any]:
             row: dict[str, Any] = {"endpoint": _short_url(ep.url), "ok": False}
             try:
-                chain_data = await self._request_endpoint(
+                chain_data = await request(
                     ep,
                     {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
                 )
@@ -1564,7 +2442,7 @@ class RpcPool:
                     raise RpcError("wrong_chain", reason, permanent=True)
                 ep.chain_verified = True
 
-                head_data = await self._request_endpoint(
+                head_data = await request(
                     ep,
                     {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []},
                 )
@@ -1573,7 +2451,7 @@ class RpcPool:
                 row["head"] = hex_int(head_data["result"])
                 self.last_head = max(self.last_head or 0, int(row["head"]))
                 try:
-                    batch_data = await self._request_endpoint(
+                    batch_data = await request(
                         ep,
                         [
                             {"jsonrpc": "2.0", "id": 11, "method": "eth_chainId", "params": []},
@@ -1600,7 +2478,13 @@ class RpcPool:
                     ep.disable(exc.kind)
                 else:
                     ep.last_error = exc.kind
-            report.append(row)
+            return row
+
+        # Environment variables may contain a long historical rotation of
+        # keys.  A startup gate only needs the preferred two plus one
+        # fallback; probing every dormant fallback serially behind the
+        # per-chain semaphore delayed the scanner by minutes.
+        report = list(await asyncio.gather(*(probe(ep) for ep in self.endpoints[:3])))
         self.preflight_complete = True
         return report
 
@@ -1608,7 +2492,7 @@ class RpcPool:
         ep = next(
             (
                 candidate for candidate in self.endpoints
-                if candidate.available()
+                if candidate.available("head")
                 and (not self.preflight_complete or candidate.chain_verified)
             ),
             None,
@@ -1636,6 +2520,41 @@ class RpcPool:
         self.metric_successes = 0
         self.metric_errors = {}
         self.metric_latencies_ms = []
+        return result
+
+    def health_rows(self) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc).isoformat()
+        rows: list[dict[str, Any]] = []
+        for endpoint in self.endpoints:
+            hostname = _short_url(endpoint.url)
+            for group, state in endpoint.method_health.items():
+                limit = {
+                    "blocks": self.block_batch,
+                    "receipts": self.receipt_batch,
+                    "code": self.call_batch,
+                    "eth_call": self.call_batch,
+                }.get(group)
+                rows.append({
+                    "chain": self.chain, "endpoint_fp": endpoint.fingerprint,
+                    "hostname": hostname, "method_group": group,
+                    "fail_streak": state.fail_streak, "success_streak": state.ok_streak,
+                    "cooldown_until": state.cooldown_until,
+                    "circuit_until": state.circuit_until,
+                    "permanent_error": endpoint.permanent_error or state.permanent_error,
+                    "latency_ewma_ms": state.latency_ewma_ms, "batch_limit": limit,
+                    "success_since_resize": state.success_since_resize,
+                    "updated_at": now,
+                })
+        return rows
+
+    def method_cooldowns(self) -> dict[str, float]:
+        now = time.time()
+        result: dict[str, float] = {}
+        for endpoint in self.endpoints:
+            for group, state in endpoint.method_health.items():
+                result[f"{_short_url(endpoint.url)}:{group}"] = max(
+                    0.0, max(state.cooldown_until, state.circuit_until) - now
+                )
         return result
 
 
@@ -1758,6 +2677,144 @@ def rpc_code_has_bytecode(value: Any) -> bool:
     return bool(value[2:].lstrip("0"))
 
 
+class DiscoverySlots:
+    """A fair global 3:1 live/backfill scheduler with independent capacities."""
+
+    def __init__(self, live_slots: int = 2, backfill_slots: int = 1):
+        self.live_slots = max(1, live_slots)
+        self.backfill_slots = max(1, backfill_slots)
+        self.active = {"live": 0, "backfill": 0}
+        self.waiting = {"live": 0, "backfill": 0}
+        self.live_grants = 0
+        self.condition = asyncio.Condition()
+
+    def _allowed(self, role: str) -> bool:
+        capacity = self.live_slots if role == "live" else self.backfill_slots
+        if self.active[role] >= capacity:
+            return False
+        if role == "live":
+            return self.live_grants < 3 or self.waiting["backfill"] == 0
+        return self.live_grants >= 3 or self.waiting["live"] == 0
+
+    @asynccontextmanager
+    async def slot(self, role: str):
+        async with self.condition:
+            self.waiting[role] += 1
+            try:
+                await self.condition.wait_for(lambda: self._allowed(role))
+                self.active[role] += 1
+                if role == "live":
+                    self.live_grants += 1
+                else:
+                    self.live_grants = 0
+            finally:
+                self.waiting[role] -= 1
+        try:
+            yield
+        finally:
+            async with self.condition:
+                self.active[role] -= 1
+                self.condition.notify_all()
+
+
+async def collect_tx_to_contracts(
+    db: DB, chain: ChainCfg, rpc: RpcPool, cfg: AppCfg,
+    candidates: dict[str, tuple[dict[str, Any], int]], known_contracts: set[str],
+    known_active_calls: set[str], checked_block: int, seen_at: str,
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]], list[tuple[Any, ...]], set[str], int]:
+    cached = db.cached_code_statuses(
+        chain.key,
+        [address for address in candidates if address not in known_contracts],
+        cfg.code_cache_ttl_sec,
+    )
+    contract_addresses = {
+        address for address in candidates
+        if address in known_contracts or cached.get(address) is True
+    }
+    unknown = [
+        address for address in candidates
+        if address not in known_contracts and address not in cached
+    ]
+    cache_rows: list[tuple[Any, ...]] = []
+    offset = 0
+    while offset < len(unknown):
+        size = max(1, rpc.call_batch)
+        chunk = unknown[offset:offset + size]
+        results = await rpc.batch([("eth_getCode", [address, "latest"]) for address in chunk])
+        if len(results) != len(chunk):
+            rpc.shrink_batch("call")
+            raise RpcError("partial", "one or more eth_getCode results are missing")
+        parsed = [rpc_code_has_bytecode(value) for value in results]
+        for address, has_code in zip(chunk, parsed):
+            cache_rows.append((chain.key, address, int(has_code), seen_at, checked_block))
+            if has_code:
+                contract_addresses.add(address)
+        rpc.grow_batch("call")
+        offset += len(chunk)
+    contracts = [
+        (chain.key, address, None, None, None, seen_at)
+        for address in sorted(contract_addresses) if address not in known_contracts
+    ]
+    discoveries = []
+    for address in sorted(contract_addresses):
+        if address in known_active_calls:
+            continue
+        tx, block_number = candidates[address]
+        discoveries.append((
+            chain.key, address, "active_call", block_number, tx.get("hash"),
+            normalize_evm_address(tx.get("from")), seen_at,
+        ))
+    return contracts, discoveries, cache_rows, contract_addresses, len(unknown)
+
+
+async def collect_transfers(
+    chain: ChainCfg, rpc: RpcPool, start: int, end: int, known: set[str],
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    if not known:
+        return [], []
+    step = max(1, min(chain.logs_max_range, end - start + 1))
+    token_rows: dict[str, tuple[Any, ...]] = {}
+    relation_rows: dict[tuple[str, str], tuple[Any, ...]] = {}
+    known_list = sorted(known)
+    cursor = start
+    while cursor <= end:
+        range_end = min(end, cursor + step - 1)
+        try:
+            logs: list[dict[str, Any]] = []
+            for offset in range(0, len(known_list), 50):
+                holders = known_list[offset:offset + 50]
+                topics = ["0x" + pad_addr(holder) for holder in holders]
+                part = await rpc.call("eth_getLogs", [{
+                    "fromBlock": hex(cursor), "toBlock": hex(range_end),
+                    "topics": [TRANSFER_TOPIC, None, topics[0] if len(topics) == 1 else topics],
+                }])
+                if not isinstance(part, list):
+                    raise RpcError("malformed", "eth_getLogs did not return a list")
+                logs.extend(part)
+        except RpcError as exc:
+            if exc.kind in {"range", "rate_limit"} and step > 1:
+                step = max(1, step // 2)
+                continue
+            raise
+        for item in logs:
+            topics = item.get("topics") or []
+            if len(topics) < 3:
+                continue
+            holder = topic_to_addr(topics[2])
+            token = normalize_evm_address(item.get("address"))
+            if holder not in known or token is None or token == ZERO:
+                continue
+            block_number = hex_int(item.get("blockNumber"))
+            token_rows[token] = (chain.key, token, None, None, "transfer_log")
+            relation_rows[(holder, token)] = (
+                chain.key, holder, token, "transfer_log", block_number,
+            )
+        cursor = range_end + 1
+        if step < chain.logs_max_range:
+            step = min(chain.logs_max_range, step * 2)
+    return list(token_rows.values()), list(relation_rows.values())
+
+
 async def discover_tx_to_contracts(
     db: DB,
     chain: ChainCfg,
@@ -1843,6 +2900,143 @@ async def discover_tx_to_contracts(
 
 async def latest_block(rpc: RpcPool) -> int:
     return hex_int(await rpc.call("eth_blockNumber", []))
+
+
+async def index_chain_cursor(
+    db: DB, chain: ChainCfg, rpc: RpcPool, cfg: AppCfg, stop: asyncio.Event,
+    role: str, slots: DiscoverySlots, from_block_override: int | None = None,
+    to_block_override: int | None = None, monitor: MonitorStore | None = None,
+) -> None:
+    if from_block_override is not None:
+        db.advance_cursor_start(chain.key, role, from_block_override)
+    known_contracts = db.contract_addresses(chain.key)
+    known_active_calls = db.discovery_addresses(chain.key, "active_call")
+    failures = 0
+    while not stop.is_set():
+        await wait_if_paused(monitor, stop)
+        cursor = db.cursor(chain.key, role)
+        if cursor is None:
+            raise RuntimeError(f"{chain.key}/{role}: cursor not initialized")
+        if role == "backfill" and cursor["status"] == "complete":
+            log.info("[%s/%s] anchor %s complete", chain.key, role, cursor["anchor_block"])
+            return
+        try:
+            head = max(0, await latest_block(rpc) - chain.confirmations)
+            target = head if role == "live" else min(head, int(cursor["anchor_block"]))
+            if to_block_override is not None:
+                target = min(target, to_block_override)
+        except Exception as exc:
+            if stop.is_set():
+                return
+            log.warning("[%s/%s] head unavailable: %s", chain.key, role, type(exc).__name__)
+            await asyncio.sleep(cfg.all_down_sleep_sec)
+            continue
+        start = int(cursor["next_block"])
+        if start > target:
+            if role == "backfill":
+                # Empty migrated ranges are complete without manufacturing a block commit.
+                with db._lock, db.conn:
+                    db.conn.execute(
+                        "UPDATE chain_cursors SET status='complete',updated_at=? WHERE chain=? AND role='backfill'",
+                        (datetime.now(timezone.utc).isoformat(), chain.key),
+                    )
+                return
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=6)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        end = min(target, start + max(1, rpc.block_batch) - 1)
+        async with slots.slot(role):
+            try:
+                numbers = list(range(start, end + 1))
+                blocks = await rpc.batch([
+                    ("eth_getBlockByNumber", [hex(number), True]) for number in numbers
+                ])
+                if len(blocks) != len(numbers) or any(not isinstance(block, dict) for block in blocks):
+                    raise RpcError("partial", "one or more blocks are missing")
+                for expected, block in zip(numbers, blocks):
+                    if hex_int(block.get("number")) != expected:
+                        raise RpcError("partial", f"wrong block returned for {expected}")
+                deployments: list[dict[str, Any]] = []
+                candidates: dict[str, tuple[dict[str, Any], int]] = {}
+                for number, block in zip(numbers, blocks):
+                    for tx in block.get("transactions") or []:
+                        if tx.get("to") in (None, "", "0x"):
+                            deployments.append(tx)
+                        elif cfg.discover_tx_to_contracts:
+                            address = normalize_evm_address(tx.get("to"))
+                            if address is not None and address not in known_active_calls:
+                                candidates.setdefault(address, (tx, number))
+                receipts: list[dict[str, Any]] = []
+                for offset in range(0, len(deployments), max(1, rpc.receipt_batch)):
+                    chunk = deployments[offset:offset + max(1, rpc.receipt_batch)]
+                    part = await rpc.batch([
+                        ("eth_getTransactionReceipt", [tx["hash"]]) for tx in chunk
+                    ])
+                    if len(part) != len(chunk) or any(not isinstance(item, dict) for item in part):
+                        rpc.shrink_batch("receipt")
+                        raise RpcError("partial", "one or more deployment receipts are missing")
+                    receipts.extend(part)
+                    rpc.grow_batch("receipt")
+                now = datetime.now(timezone.utc).isoformat()
+                direct_contracts: list[tuple[Any, ...]] = []
+                direct_discoveries: list[tuple[Any, ...]] = []
+                for tx, receipt in zip(deployments, receipts):
+                    address = normalize_evm_address(receipt.get("contractAddress"))
+                    if address is None:
+                        continue
+                    block_number = hex_int(tx.get("blockNumber"))
+                    creator = normalize_evm_address(tx.get("from"))
+                    direct_contracts.append((
+                        chain.key, address, block_number, tx.get("hash"), creator, now,
+                    ))
+                    direct_discoveries.append((
+                        chain.key, address, "direct_deploy", block_number,
+                        tx.get("hash"), creator, now,
+                    ))
+                active_contracts: list[tuple[Any, ...]] = []
+                active_discoveries: list[tuple[Any, ...]] = []
+                cache_rows: list[tuple[Any, ...]] = []
+                found_active: set[str] = set()
+                code_checked = 0
+                if cfg.discover_tx_to_contracts:
+                    (active_contracts, active_discoveries, cache_rows,
+                     found_active, code_checked) = await collect_tx_to_contracts(
+                        db, chain, rpc, cfg, candidates, known_contracts,
+                        known_active_calls, end, now,
+                    )
+                range_contracts = {
+                    row[1] for row in [*direct_contracts, *active_contracts]
+                }
+                tokens: list[tuple[Any, ...]] = []
+                relations: list[tuple[Any, ...]] = []
+                if cfg.discover_tokens_from_transfers:
+                    tokens, relations = await collect_transfers(
+                        chain, rpc, start, end, known_contracts | range_contracts,
+                    )
+                inserted, source_inserted = db.commit_index_range(
+                    chain.key, role, end, [*direct_contracts, *active_contracts],
+                    [*direct_discoveries, *active_discoveries], cache_rows,
+                    tokens, relations,
+                )
+                known_contracts.update(range_contracts)
+                known_active_calls.update(found_active)
+                failures = 0
+                rpc.grow_batch("block")
+                log.info(
+                    "[%s/%s] idx %s..%s head=%s new=%s sources=%s code=%s",
+                    chain.key, role, start, end, head, inserted, source_inserted, code_checked,
+                )
+            except Exception as exc:
+                failures += 1
+                rpc.shrink_batch("block")
+                log.warning(
+                    "[%s/%s] range %s-%s not committed: %s",
+                    chain.key, role, start, end,
+                    exc.kind if isinstance(exc, RpcError) else type(exc).__name__,
+                )
+                await asyncio.sleep(min(120, cfg.cooldown_min_sec * max(1, failures)))
 
 
 async def index_chain(
@@ -2136,6 +3330,7 @@ async def scan_address_chain(
     chain: ChainCfg,
     rpc: RpcPool | None,
     prices: PriceBook,
+    cfg: AppCfg,
     address: str,
     balance_sem: asyncio.Semaphore,
     timeout_sec: float = 20,
@@ -2144,13 +3339,13 @@ async def scan_address_chain(
     async with balance_sem:
         policy = BALANCE_RPC.set(True)
         try:
-            return await _scan_address_chain(db, chain, rpc, prices, address, timeout_sec)
+            return await _scan_address_chain(db, chain, rpc, prices, cfg, address, timeout_sec)
         finally:
             BALANCE_RPC.reset(policy)
 
 
 async def _scan_address_chain(
-    db: DB, chain: ChainCfg, rpc: RpcPool | None, prices: PriceBook,
+    db: DB, chain: ChainCfg, rpc: RpcPool | None, prices: PriceBook, cfg: AppCfg,
     address: str, timeout_sec: float,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     base_row: dict[str, Any] = {
@@ -2158,7 +3353,14 @@ async def _scan_address_chain(
         "has_code": None,
         "status": "rpc_error",
         "native_amount": None,
+        "native_raw": None,
         "native_usd": None,
+        "observed_native_usd": None,
+        "included_native_usd": None,
+        "excluded_usd": 0.0,
+        "valuation_status": None,
+        "checked_tokens": [],
+        "failed_tokens": [],
         "tokens_usd": None,
         "total_usd": None,
         "note": None,
@@ -2231,15 +3433,69 @@ async def _scan_address_chain(
             native_raw = decode_uint(raw_native)
             native_amount = native_raw / (10 ** chain.native_decimals)
             native_price = book.get(llama_key(chain))
-            native_usd = native_amount * native_price if native_price is not None else None
-            base_row.update(native_amount=native_amount, native_usd=native_usd,
-                            tokens_usd=0.0, total_usd=native_usd or 0.0)
+            observed_native_usd = native_amount * native_price if native_price is not None else None
+            policy = db.valuation_policy(chain.key, address, "native")
+            valuation_status = "included"
+            included_native_usd = observed_native_usd
+            excluded_usd = 0.0
+            anomaly = False
+            anomaly_note: str | None = None
+            if policy is not None and policy["policy"] in {"exclude_from_total", "quarantine"}:
+                valuation_status = str(policy["policy"])
+                included_native_usd = 0.0
+                excluded_usd = float(observed_native_usd or 0.0)
+                anomaly_note = str(policy["reason"])
+            elif (
+                observed_native_usd is not None
+                and observed_native_usd >= cfg.native_anomaly_usd
+                and not (policy is not None and policy["policy"] == "include")
+            ):
+                match, second_value = await rpc.confirmed_call(
+                    "eth_getBalance", [address, "latest"], raw_native
+                )
+                early_raw: int | None = None
+                try:
+                    early_raw = decode_uint(
+                        await rpc.call("eth_getBalance", [address, "0x0"])
+                    )
+                except Exception:
+                    pass
+                evidence = {
+                    "threshold_usd": cfg.native_anomaly_usd,
+                    "second_rpc_value": second_value,
+                    "lifecycle": chain.lifecycle,
+                    "early_balance_ratio": (
+                        early_raw / native_raw if early_raw is not None and native_raw else None
+                    ),
+                }
+                db.save_anomaly(
+                    chain.key, address, "native", native_raw, observed_native_usd,
+                    match, early_raw, "quarantined", evidence,
+                )
+                valuation_status = "anomalous_balance"
+                included_native_usd = 0.0
+                excluded_usd = float(observed_native_usd)
+                anomaly = True
+                anomaly_note = "large native balance quarantined pending valuation policy"
+            native_usd = observed_native_usd
+            base_row.update(
+                native_raw=str(native_raw), native_amount=native_amount,
+                native_usd=native_usd, observed_native_usd=observed_native_usd,
+                included_native_usd=included_native_usd, excluded_usd=excluded_usd,
+                valuation_status=valuation_status, tokens_usd=0.0,
+                total_usd=included_native_usd or 0.0,
+            )
             token_rows.append({
                 "chain": chain.key, "token": "native", "symbol": chain.native_symbol,
                 "raw_amount": native_raw, "amount": native_amount,
                 "price_usd": native_price, "usd_value": native_usd,
                 "priced": native_price is not None,
+                "valuation_status": valuation_status,
             })
+            checked_tokens = ["native"]
+            failed_tokens: list[str] = []
+            base_row["checked_tokens"] = checked_tokens
+            base_row["failed_tokens"] = failed_tokens
 
             holder_data = BALANCE_OF_SEL + pad_addr(address)
             token_rpc_error = False
@@ -2262,12 +3518,15 @@ async def _scan_address_chain(
                 for token, result in zip(chunk, part):
                     if isinstance(result, Exception) or result is None:
                         token_rpc_error = True
+                        failed_tokens.append(token["address"])
                         continue
                     try:
                         raw_amount = decode_uint(result)
                     except Exception:
                         token_rpc_error = True
+                        failed_tokens.append(token["address"])
                         continue
+                    checked_tokens.append(token["address"])
                     if raw_amount <= 0:
                         continue
                     decimals = token["decimals"]
@@ -2291,24 +3550,40 @@ async def _scan_address_chain(
                             "priced": priced,
                         }
                     )
-                base_row.update(tokens_usd=tokens_usd, total_usd=(native_usd or 0.0) + tokens_usd)
+                base_row.update(
+                    tokens_usd=tokens_usd,
+                    total_usd=(included_native_usd or 0.0) + tokens_usd,
+                )
 
-            known_total = (native_usd or 0.0) + tokens_usd
+            known_total = (included_native_usd or 0.0) + tokens_usd
             if token_rpc_error:
                 chain_status = "partial"
                 note = "one or more token balance calls failed"
+            elif anomaly:
+                chain_status = "anomalous_balance"
+                note = anomaly_note
             elif unpriced_positive:
                 chain_status = "price_missing"
                 note = "positive balance without metadata or price"
             else:
                 chain_status = "complete"
-                note = None
+                note = anomaly_note
+            if chain.lifecycle != "active":
+                lifecycle_note = f"network lifecycle={chain.lifecycle}"
+                note = f"{note}; {lifecycle_note}" if note else lifecycle_note
             return {
                 **base_row,
                 "has_code": 1,
                 "status": chain_status,
                 "native_amount": native_amount,
                 "native_usd": native_usd,
+                "native_raw": str(native_raw),
+                "observed_native_usd": observed_native_usd,
+                "included_native_usd": included_native_usd,
+                "excluded_usd": excluded_usd,
+                "valuation_status": valuation_status,
+                "checked_tokens": checked_tokens,
+                "failed_tokens": failed_tokens,
                 "tokens_usd": tokens_usd,
                 "total_usd": known_total,
                 "note": note,
@@ -2442,6 +3717,7 @@ def build_rabby_estimate(
         token_parts.append({
             "chain": key, "token": str(token.get("id", "")),
             "symbol": str(token.get("symbol") or token.get("id", "")),
+            "decimals": token.get("decimals"),
             "raw_amount": str(token.get("raw_amount_str", token.get("raw_amount", ""))),
             "amount": amount, "price_usd": price if priced else None,
             "usd_value": amount * price if priced else None, "priced": priced,
@@ -2478,7 +3754,10 @@ async def rabby_fallback_loop(
         while not stop.is_set():
             if client.disabled:
                 return
-            row = db.pending_rabby_scan(cfg.balance_retry_sec, snapshot_at)
+            row = db.pending_rabby_scan(
+                cfg.balance_retry_sec, snapshot_at,
+                cfg.rabby_token_discovery_after_sec,
+            )
             if row is None or time.monotonic() < client.cooldown_until:
                 if once and rpc_finished.is_set() and row is None:
                     return
@@ -2505,9 +3784,17 @@ async def rabby_fallback_loop(
                     "note": "Rabby unavailable: " + (exc.kind if isinstance(exc, RpcError) else type(exc).__name__),
                 }
             db.save_rabby_estimate(row["address"], estimate, row["id"])
+            discovered = db.ingest_indexed_tokens(
+                row["address"], estimate.get("tokens") or [], "rabby_discovery"
+            )
             log.info("[rabby] %s estimate=%s status=%s coverage=%s/%s",
                      row["address"], estimate["estimated_usd"], estimate["status"],
                      estimate["coverage"], len(chains))
+            if discovered:
+                log.info(
+                    "[rabby] %s discovered %s token contracts for RPC verification",
+                    row["address"], discovered,
+                )
     finally:
         await client.close()
 
@@ -2533,11 +3820,14 @@ async def check_multichain_balances(
 
     async def scan_one(address: str) -> None:
         started = time.monotonic()
+        due_keys = db.due_address_chains(address, list(chains), snapshot_at)
+        if not due_keys:
+            return
         jobs = {
             asyncio.create_task(scan_address_chain(
-                db, chain, pools.get(chain.key), prices, address, chain_sem,
+                db, chain, pools.get(chain.key), prices, cfg, address, chain_sem,
                 cfg.balance_chain_timeout_sec,
-            )): chain.key for chain in chains.values()
+            )): chain.key for chain in chains.values() if chain.key in due_keys
         }
         try:
             done, unfinished = await asyncio.wait(jobs, timeout=cfg.balance_address_timeout_sec)
@@ -2558,8 +3848,9 @@ async def check_multichain_balances(
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
-        chain_rows = [item[0] for item in results]
-        token_rows = [token for item in results for token in item[1]]
+        for chain_row, tokens in results:
+            db.save_address_chain_state(address, chain_row, tokens, min_usd)
+        chain_rows, token_rows = db.current_address_parts(address, list(chains))
         total_usd = sum(float(row.get("total_usd") or 0.0) for row in chain_rows)
         status, coverage = classify_address_scan(total_usd, chain_rows, min_usd)
         notes = sorted({row["status"] for row in chain_rows
@@ -2568,8 +3859,12 @@ async def check_multichain_balances(
             address, status, total_usd, coverage, len(chains),
             chain_rows, token_rows, ", ".join(notes) or None,
         )
-        log.info("[balances] %s $%.2f %s coverage=%s/%s elapsed=%.2fs",
-                 address, total_usd, status, coverage, len(chains), time.monotonic() - started)
+        db.apply_address_schedule(address, status)
+        log.info(
+            "[balances] %s $%.2f %s coverage=%s/%s refreshed=%s elapsed=%.2fs",
+            address, total_usd, status, coverage, len(chains), len(due_keys),
+            time.monotonic() - started,
+        )
 
     active: dict[asyncio.Task[Any], str] = {}
     stop_job = asyncio.create_task(stop.wait())
@@ -2712,13 +4007,21 @@ def export_xlsx(
             if item["has_code"] != 1:
                 continue
             amount = float(item["total_usd"] or 0.0)
-            networks.append(f"{item['chain']}=${amount:,.2f} ({item['status']})")
+            observed = item["observed_native_usd"] if "observed_native_usd" in item.keys() else None
+            excluded = float(item["excluded_usd"] or 0.0) if "excluded_usd" in item.keys() else 0.0
+            detail = f", observed native=${float(observed):,.2f}, excluded=${excluded:,.2f}" if excluded else ""
+            networks.append(
+                f"{item['chain']}=${amount:,.2f} ({item['status']}{detail}; "
+                f"lifecycle={chains[item['chain']].lifecycle if item['chain'] in chains else 'unknown'})"
+            )
         token_values = []
         for item in token_parts:
             label = item["symbol"] or item["token"][:10]
             if item["priced"]:
+                valuation = item["valuation_status"] if "valuation_status" in item.keys() else "included"
+                suffix = f" ({valuation})" if valuation != "included" else ""
                 token_values.append(
-                    f"{item['chain']}:{label}=${float(item['usd_value'] or 0):,.2f}"
+                    f"{item['chain']}:{label}=${float(item['usd_value'] or 0):,.2f}{suffix}"
                 )
             else:
                 amount = item["amount"] if item["amount"] is not None else item["raw_amount"]
@@ -2821,6 +4124,57 @@ def export_xlsx(
         len(incomplete),
     )
     return paths
+
+
+def export_bundle_process(
+    db_path: Path, cfg: AppCfg, chains: dict[str, ChainCfg], min_usd: float,
+) -> None:
+    """Spawn target: export from query-only connections, never the scanner connection."""
+    db = DB(db_path, read_only=True)
+    sui_store = SuiStore(db_path, read_only=True)
+    try:
+        export_xlsx(db, cfg, chains, min_usd, snapshot=False)
+        export_sui_xlsx(sui_store, cfg.export_dir, min_usd, snapshot=False)
+    finally:
+        sui_store.close()
+        db.close()
+
+
+async def run_export_process(
+    db: DB, cfg: AppCfg, chains: dict[str, ChainCfg], lock: asyncio.Lock,
+) -> tuple[Path, ...]:
+    async with lock:
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=export_bundle_process,
+            args=(db.path, cfg, chains, cfg.min_usd),
+            name="xlsx-export",
+        )
+        process.start()
+        await asyncio.to_thread(process.join)
+        if process.exitcode != 0:
+            raise RuntimeError(f"XLSX export process exited with {process.exitcode}")
+        return tuple(
+            cfg.export_dir / name for name in (
+                "qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx",
+                "sui_qualifying.xlsx", "sui_below_threshold.xlsx",
+                "sui_incomplete.xlsx", "sui_packages.xlsx",
+            )
+        )
+
+
+def copy_daily_report_snapshot(export_dir: Path, now: datetime | None = None) -> list[Path]:
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("Europe/Moscow"))
+    folder = export_dir / "archive" / local.strftime("%Y%m%d")
+    folder.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for source in export_dir.glob("*.xlsx"):
+        target = folder / source.name
+        temporary = target.with_suffix(".tmp.xlsx")
+        shutil.copy2(source, temporary)
+        temporary.replace(target)
+        copied.append(target)
+    return copied
 
 
 # ---------------------------------------------------------------------------
@@ -2944,24 +4298,29 @@ async def heartbeat_loop(
         ]
         for key, pool in pools.items():
             c = cfg.chains[key]
-            role = "discovery" if key in discovery_keys else "balance"
-            last = db.last_indexed(c.key) if role == "discovery" else None
+            role = "live" if key in discovery_keys else "balance"
+            live_cursor = db.cursor(c.key, "live") if key in discovery_keys else None
+            backfill_cursor = db.cursor(c.key, "backfill") if key in discovery_keys else None
+            last = int(live_cursor["last_committed"]) if live_cursor is not None else None
             head = max(0, pool.last_head - c.confirmations) if pool.last_head is not None else None
             lag = (head - last) if head is not None and last is not None else None
             cnt = db.chain_counts(c.key)
-            cooldown = max(
-                [max(0.0, endpoint.cooldown_until - time.time()) for endpoint in pool.endpoints]
-                or [0.0]
-            )
-            errors = sorted({endpoint.last_error for endpoint in pool.endpoints if endpoint.last_error})
-            old = previous.get(c.key)
+            method_cooldowns = pool.method_cooldowns()
+            cooldown = max(method_cooldowns.values(), default=0.0)
+            errors = sorted({
+                state.last_error
+                for endpoint in pool.endpoints
+                for state in endpoint.method_health.values()
+                if state.last_error
+            })
+            old = previous.get(f"{c.key}:live")
             blocks_per_hour = None
             if old and last is not None and sampled_at.timestamp() > old[0]:
                 blocks_per_hour = max(
                     0.0, (last - old[1]) * 3600 / (sampled_at.timestamp() - old[0])
                 )
             if last is not None:
-                previous[c.key] = (sampled_at.timestamp(), last)
+                previous[f"{c.key}:live"] = (sampled_at.timestamp(), last)
             metrics = pool.take_metrics()
             monitor.add_chain_sample(
                 run_id=run_id, chain=c.key, role=role, cursor=last,
@@ -2975,6 +4334,27 @@ async def heartbeat_loop(
                 latency_p95_ms=metrics["latency_p95_ms"],
                 errors_json=metrics["errors_by_type"],
             )
+            if backfill_cursor is not None:
+                backfill_last = int(backfill_cursor["last_committed"])
+                backfill_anchor = int(backfill_cursor["anchor_block"])
+                old_backfill = previous.get(f"{c.key}:backfill")
+                backfill_bph = None
+                if old_backfill and sampled_at.timestamp() > old_backfill[0]:
+                    backfill_bph = max(
+                        0.0, (backfill_last - old_backfill[1]) * 3600
+                        / (sampled_at.timestamp() - old_backfill[0])
+                    )
+                previous[f"{c.key}:backfill"] = (sampled_at.timestamp(), backfill_last)
+                monitor.add_chain_sample(
+                    run_id=run_id, chain=c.key, role="backfill", cursor=backfill_last,
+                    safe_head=backfill_anchor, lag=max(0, backfill_anchor - backfill_last),
+                    blocks_per_hour=backfill_bph, contracts=cnt["contracts"],
+                    direct_deploy=db.discovery_count(c.key, "direct_deploy"),
+                    active_call=db.discovery_count(c.key, "active_call"),
+                    active_rpc=pool.active_endpoint(), cooldown_sec=cooldown,
+                    rpc_requests=0, rpc_successes=0, rpc_errors=0,
+                    latency_p50_ms=None, latency_p95_ms=None, errors_json={},
+                )
             line = (
                 f"{c.key:<14} {(f'{last:,}' if last is not None else 'balance'):>12} "
                 f"{(f'{head:,}' if head is not None else 'n/a'):>12} "
@@ -2983,14 +4363,31 @@ async def heartbeat_loop(
                 f"{cooldown:>8.0f}s {','.join(errors) or '-'}"
             )
             lines.append(line)
+            active_method_cooldowns = [
+                f"{name}={seconds:.0f}s" for name, seconds in method_cooldowns.items()
+                if seconds > 0
+            ]
+            if active_method_cooldowns:
+                lines.append("  method_cooldowns " + ", ".join(active_method_cooldowns))
+            lines.append(
+                f"  adaptive_batch blocks={pool.block_batch} receipts={pool.receipt_batch} calls={pool.call_batch}"
+            )
+            if backfill_cursor is not None:
+                lines.append(
+                    f"{c.key + '/backfill':<14} {int(backfill_cursor['last_committed']):>12,} "
+                    f"{int(backfill_cursor['anchor_block']):>12,} "
+                    f"{max(0, int(backfill_cursor['anchor_block']) - int(backfill_cursor['last_committed'])):>10,} "
+                    f"status={backfill_cursor['status']}"
+                )
             log.info("heartbeat %s", line)
+            db.save_rpc_health(pool.health_rows())
         aggregate = db.aggregate_counts()
         lines.append(
             "address_scans "
             + " ".join(f"{status}={count}" for status, count in sorted(aggregate.items()))
         )
         write_status(status_path, lines)
-        snapshot = db.monitoring_snapshot()
+        snapshot = db.monitoring_snapshot(cfg.min_usd)
         reports: dict[str, dict[str, Any]] = {}
         export_times: list[str] = []
         for name in ("qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx"):
@@ -3014,7 +4411,8 @@ async def heartbeat_loop(
             last_prune_day = prune_day
         # короткий пинг в консоль, чтобы по ssh было видно что жив
         console.info("heartbeat  " + " | ".join(
-            f"{c.key}:{db.last_indexed(c.key)}" for c in selected
+            f"{c.key}:live={int(db.cursor(c.key, 'live')['last_committed']) if db.cursor(c.key, 'live') else 'n/a'}"
+            for c in selected
         ))
 
 
@@ -3024,9 +4422,14 @@ async def export_loop(
     selected: list[ChainCfg],
     stop: asyncio.Event,
     monitor: MonitorStore | None = None,
+    sui_store: SuiStore | None = None,
+    export_lock: asyncio.Lock | None = None,
 ) -> None:
     mapping = {c.key: c for c in selected}
-    last_snap_day = ""
+    export_lock = export_lock or asyncio.Lock()
+    last_export_revision = int(
+        monitor.setting("last_export_revision", "-1") if monitor else -1
+    )
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=cfg.export_every_sec)
@@ -3034,17 +4437,28 @@ async def export_loop(
         except asyncio.TimeoutError:
             pass
         try:
-            export_xlsx(db, cfg, mapping, cfg.min_usd, snapshot=False)
-            day = datetime.now(timezone.utc).strftime("%Y%m%d")
-            if cfg.daily_snapshot and day != last_snap_day:
-                export_xlsx(db, cfg, mapping, cfg.min_usd, snapshot=True)
-                last_snap_day = day
+            revision = db.data_revision()
+            if revision != last_export_revision:
+                if monitor:
+                    monitor.set_setting("exporter_state", "running")
+                await run_export_process(db, cfg, mapping, export_lock)
+                last_export_revision = revision
+                if monitor:
+                    monitor.set_setting("last_export_revision", revision)
+            local = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow"))
+            snapshot_day = monitor.setting("last_snapshot_day", "") if monitor else ""
+            if cfg.daily_snapshot and local.hour >= 3 and snapshot_day != local.strftime("%Y%m%d"):
+                await asyncio.to_thread(copy_daily_report_snapshot, cfg.export_dir)
+                if monitor:
+                    monitor.set_setting("last_snapshot_day", local.strftime("%Y%m%d"))
             if monitor:
+                monitor.set_setting("exporter_state", "idle")
                 monitor.set_setting("consecutive_export_failures", "0")
                 monitor.resolve_incident("export:failed")
         except Exception as e:
             log.warning("periodic export: %s", e)
             if monitor:
+                monitor.set_setting("exporter_state", "failed")
                 failures = int(monitor.setting("consecutive_export_failures", "0") or 0) + 1
                 monitor.set_setting("consecutive_export_failures", failures)
                 if failures >= 2:
@@ -3060,6 +4474,7 @@ async def control_loop(
     chains: dict[str, ChainCfg],
     monitor: MonitorStore,
     stop: asyncio.Event,
+    export_lock: asyncio.Lock,
 ) -> None:
     while not stop.is_set():
         for request in monitor.pending_controls():
@@ -3072,7 +4487,7 @@ async def control_loop(
                     monitor.set_setting("scanner_paused", "0")
                     result = "scanner resumed"
                 elif request.action == "export":
-                    paths = await asyncio.to_thread(export_xlsx, db, cfg, chains, cfg.min_usd)
+                    paths = await run_export_process(db, cfg, chains, export_lock)
                     result = "exported: " + ", ".join(path.name for path in paths)
                 elif request.action == "backup":
                     path = await asyncio.to_thread(backup_database, db, ROOT / "backups", 7)
@@ -3154,10 +4569,10 @@ async def run(args: argparse.Namespace) -> None:
     monitor = MonitorStore(cfg.monitoring_db_path)
     profile = os.getenv("SCANNER_LOAD_PROFILE", "").strip().lower()
     if not profile:
-        profile = (monitor.setting("load_profile", "normal") or "normal").lower()
+        profile = (monitor.setting("load_profile", "conservative") or "conservative").lower()
     if profile not in LOAD_PROFILES:
-        log.warning("unknown load profile %s; using normal", profile)
-        profile = "normal"
+        log.warning("unknown load profile %s; using conservative", profile)
+        profile = "conservative"
     apply_load_profile(cfg, profile)
     if args.min_usd is not None:
         cfg.min_usd = args.min_usd
@@ -3171,20 +4586,32 @@ async def run(args: argparse.Namespace) -> None:
         if args.chains
         else cfg.default_chains
     )
-    unknown = [key for key in wanted if key not in cfg.chains]
+    sui_cfg = SuiConfig.from_mapping(cfg.sui)
+    unknown = [key for key in wanted if key not in cfg.chains and key != "sui"]
     if unknown:
         raise SystemExit(
-            f"unknown network(s): {', '.join(unknown)}. Available: {', '.join(cfg.chains)}"
+            f"unknown network(s): {', '.join(unknown)}. Available: {', '.join((*cfg.chains, 'sui'))}"
         )
-    selected = [cfg.chains[key] for key in wanted]
+    selected = [cfg.chains[key] for key in wanted if key in cfg.chains]
+    sui_requested = "sui" in wanted and sui_cfg.enabled
     balance_chains = {key: chain for key, chain in cfg.chains.items() if chain.enabled}
 
     db = DB(cfg.db_path)
+    sui_store = SuiStore(cfg.db_path)
+    db.seed_valuation_policies(cfg.valuation_policies)
+    revalued = db.revalue_system_balances(cfg.min_usd)
+    if revalued:
+        log.info("revalued %s historical address scans using asset policies", revalued)
+    reclassified = db.reclassify_latest_scans(cfg.min_usd)
+    if reclassified:
+        log.info("reclassified %s latest scans at threshold $%s", reclassified, cfg.min_usd)
     seed_tokens(db, load_token_seed(ROOT / "tokens.yaml"), list(balance_chains))
     cfg.export_dir.mkdir(parents=True, exist_ok=True)
+    export_lock = asyncio.Lock()
 
     if args.export_only:
-        export_xlsx(db, cfg, balance_chains, cfg.min_usd)
+        await run_export_process(db, cfg, balance_chains, export_lock)
+        sui_store.close()
         db.close()
         monitor.close()
         return
@@ -3206,8 +4633,19 @@ async def run(args: argparse.Namespace) -> None:
     global_rpc_sem = asyncio.Semaphore(cfg.global_rpc_concurrency)
     prices = PriceBook(cfg.http_timeout_sec, cfg.price_batch_size)
     pools: dict[str, RpcPool] = {}
+    sui_client: BlockberryClient | None = None
     should_export = not args.rpc_check
     try:
+        if sui_requested:
+            blockberry_key = os.getenv("BLOCKBERRY_API_KEY", "").strip()
+            if blockberry_key:
+                sui_client = BlockberryClient(
+                    blockberry_key, sui_cfg, global_rpc_sem,
+                    [value.strip() for value in os.getenv("SUI_RPC", "").split(",") if value.strip()],
+                )
+                await sui_client.__aenter__()
+            else:
+                log.warning("[sui] BLOCKBERRY_API_KEY is not configured; Sui is disabled")
         needed = (
             balance_chains
             if not args.index_only or args.rpc_check
@@ -3223,6 +4661,7 @@ async def run(args: argparse.Namespace) -> None:
                 cfg,
                 expected_chain_id=chain.chain_id,
                 global_sem=global_rpc_sem,
+                health_store=db,
             )
             await pool.__aenter__()
             pools[chain.key] = pool
@@ -3248,6 +4687,34 @@ async def run(args: argparse.Namespace) -> None:
                 head_text = f" head={max(heads):,}" if heads else ""
                 console.info(f"{key}: {ok_count}/{len(report)}{head_text}  {details}")
 
+        if sui_requested:
+            if sui_client is None:
+                if args.rpc_check:
+                    console.info("sui: ERROR missing BLOCKBERRY_API_KEY")
+            else:
+                try:
+                    report = await sui_client.preflight()
+                    capabilities = (
+                        f"discovery={'ok' if report.get('discovery_ok') else 'error'} "
+                        f"defi={'ok' if report.get('defi_ok') else report.get('defi_error') or 'error'}"
+                    )
+                    if args.rpc_check:
+                        console.info(
+                            f"sui: ok head={report['head']:,} provider=Blockberry-indexed "
+                            f"{capabilities}"
+                        )
+                    else:
+                        log.info(
+                            "[sui] Blockberry preflight head=%s %s",
+                            report["head"], capabilities,
+                        )
+                except Exception as exc:
+                    log.warning("[sui] Blockberry preflight failed: %s", type(exc).__name__)
+                    if args.rpc_check:
+                        console.info(f"sui: ERROR {type(exc).__name__}")
+                    await sui_client.__aexit__(None, None, None)
+                    sui_client = None
+
         if args.rpc_check:
             return
 
@@ -3255,14 +4722,22 @@ async def run(args: argparse.Namespace) -> None:
             chain for chain in selected
             if chain.key in pools and pools[chain.key].usable()
         ]
-        if not discovery_ready and not args.balances_only:
+        if not discovery_ready and sui_client is None and not args.balances_only:
             raise RuntimeError("none of the selected discovery networks has an RPC")
         await print_startup_status(discovery_ready, pools, db)
+        for chain in discovery_ready:
+            db.init_chain(chain.key, chain.start_block, cfg.discover_tx_to_contracts)
+            head = pools[chain.key].last_head
+            if head is None:
+                head = await latest_block(pools[chain.key])
+            db.init_chain_cursors(
+                chain.key, chain.start_block,
+                max(0, int(head) - chain.confirmations), lookback=2,
+            )
 
         if args.once:
             if cfg.run_indexer and not args.balances_only:
-                await asyncio.gather(
-                    *(
+                index_jobs = [
                         index_chain(
                             db,
                             chain,
@@ -3275,50 +4750,60 @@ async def run(args: argparse.Namespace) -> None:
                             monitor=monitor,
                         )
                         for chain in discovery_ready
-                    )
-                )
+                ]
+                if sui_client is not None:
+                    index_jobs.append(sui_discovery_loop(
+                        sui_store, sui_client, sui_cfg, stop, once=True,
+                        from_checkpoint=args.from_block, to_checkpoint=args.to_block,
+                        monitor=monitor, run_id=run_id,
+                    ))
+                await asyncio.gather(*index_jobs)
             if cfg.run_balance_checker and not args.index_only:
-                await check_multichain_balances(
-                    db,
-                    balance_chains,
-                    pools,
-                    prices,
-                    cfg,
-                    cfg.min_usd,
-                    stop,
-                    once=True,
-                    monitor=monitor,
-                )
-            export_xlsx(db, cfg, balance_chains, cfg.min_usd)
+                balance_jobs = [check_multichain_balances(
+                    db, balance_chains, pools, prices, cfg, cfg.min_usd, stop,
+                    once=True, monitor=monitor,
+                )]
+                if sui_client is not None:
+                    balance_jobs.append(sui_balance_loop(
+                        sui_store, sui_client, sui_cfg, cfg.min_usd, stop, once=True,
+                    ))
+                await asyncio.gather(*balance_jobs)
+            await run_export_process(db, cfg, balance_chains, export_lock)
             should_export = False
             return
 
         tasks: list[asyncio.Task[Any]] = []
+        discovery_slots = DiscoverySlots(live_slots=2, backfill_slots=1)
         if cfg.run_indexer and not args.balances_only:
             for chain in discovery_ready:
                 pool = pools[chain.key]
-                tasks.append(
-                    asyncio.create_task(
-                        supervised(
-                            f"idx-{chain.key}",
-                            lambda c=chain, p=pool: index_chain(
-                                db,
-                                c,
-                                p,
-                                cfg,
-                                stop,
-                                args.from_block,
-                                args.to_block,
-                                once=False,
-                                monitor=monitor,
+                for role in ("live", "backfill"):
+                    tasks.append(
+                        asyncio.create_task(
+                            supervised(
+                                f"idx-{chain.key}-{role}",
+                                lambda c=chain, p=pool, r=role: index_chain_cursor(
+                                    db, c, p, cfg, stop, r, discovery_slots,
+                                    args.from_block, args.to_block, monitor,
+                                ),
+                                stop, cfg.task_restart_sec, monitor,
                             ),
-                            stop,
-                            cfg.task_restart_sec,
-                            monitor,
-                        ),
-                        name=f"idx-{chain.key}",
+                            name=f"idx-{chain.key}-{role}",
+                        )
                     )
-                )
+            if sui_client is not None:
+                tasks.append(asyncio.create_task(
+                    supervised(
+                        "idx-sui",
+                        lambda: sui_discovery_loop(
+                            sui_store, sui_client, sui_cfg, stop,
+                            from_checkpoint=args.from_block, to_checkpoint=args.to_block,
+                            monitor=monitor, run_id=run_id,
+                        ),
+                        stop, cfg.task_restart_sec, monitor,
+                    ),
+                    name="idx-sui",
+                ))
         if cfg.run_balance_checker and not args.index_only:
             tasks.append(
                 asyncio.create_task(
@@ -3341,9 +4826,23 @@ async def run(args: argparse.Namespace) -> None:
                     name="balances",
                 )
             )
+            if sui_client is not None:
+                tasks.append(asyncio.create_task(
+                    supervised(
+                        "balances-sui",
+                        lambda: sui_balance_loop(
+                            sui_store, sui_client, sui_cfg, cfg.min_usd, stop,
+                        ),
+                        stop, cfg.task_restart_sec, monitor,
+                    ),
+                    name="balances-sui",
+                ))
         tasks.append(
             asyncio.create_task(
-                export_loop(db, cfg, list(balance_chains.values()), stop, monitor),
+                export_loop(
+                    db, cfg, list(balance_chains.values()), stop, monitor,
+                    sui_store, export_lock,
+                ),
                 name="xlsx",
             )
         )
@@ -3355,7 +4854,7 @@ async def run(args: argparse.Namespace) -> None:
         )
         tasks.append(
             asyncio.create_task(
-                control_loop(db, cfg, balance_chains, monitor, stop),
+                control_loop(db, cfg, balance_chains, monitor, stop, export_lock),
                 name="control",
             )
         )
@@ -3371,11 +4870,14 @@ async def run(args: argparse.Namespace) -> None:
         stop.set()
         if should_export:
             try:
-                export_xlsx(db, cfg, balance_chains, cfg.min_usd)
+                await run_export_process(db, cfg, balance_chains, export_lock)
             except Exception as exc:
                 log.warning("final export: %s", exc)
         for pool in pools.values():
             await pool.__aexit__(None, None, None)
+        if sui_client is not None:
+            await sui_client.__aexit__(None, None, None)
+        sui_store.close()
         db.close()
         if run_id is not None:
             monitor.finish_run(run_id)

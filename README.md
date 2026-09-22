@@ -1,5 +1,21 @@
 # DeFi Liquidity Scanner
 
+## Reliable 24/7 mode
+
+The default server profile is `conservative`: six global EVM requests, one
+request per network, two addresses and four address/network parts at a time.
+Discovery uses separate `live` and `backfill` cursors on every enabled network;
+a failed block, receipt, log or code request cannot advance its cursor.
+
+Balance state is persisted per `address + chain`, so a transient failure retries
+only that network. Large native balances are quarantined until classified.
+Known system reserves remain auditable but are excluded from `total_usd`; this
+includes the genesis-prefunded Polygon zkEVM bridge reserve. Polygon zkEVM is
+marked `legacy_read_only`.
+
+XLSX generation runs in a separate process over query-only SQLite connections,
+only after data changes and at most once per 30 minutes.
+
 Deployment and Telegram monitoring: [MONITORING.md](MONITORING.md).
 
 Последовательный EVM-сканер прямых деплоев и активных контрактов. Основная точка входа осталась прежней: `scan_defi.py`.

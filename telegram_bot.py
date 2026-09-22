@@ -238,6 +238,47 @@ class ReportBuilder:
         parsed = iso_to_dt(value)
         return parsed.astimezone(self.tz).strftime("%d.%m %H:%M:%S") if parsed else "n/a"
 
+    def _sui_summary(self, cutoff: str | None = None) -> dict[str, int] | None:
+        if not self.contracts_db.exists():
+            return None
+        try:
+            runtime = self.monitor.runtime()
+            min_usd = float(runtime["min_usd"] or 500000) if runtime else 500000.0
+            with sqlite3.connect(self.contracts_db, timeout=5) as conn:
+                package_total = int(conn.execute("SELECT COUNT(*) FROM sui_packages").fetchone()[0])
+                new_packages = int(conn.execute(
+                    "SELECT COUNT(*) FROM sui_packages WHERE first_seen_at>=?", (cutoff,),
+                ).fetchone()[0]) if cutoff else 0
+                objects = int(conn.execute(
+                    "SELECT COUNT(*) FROM sui_package_objects WHERE active=1"
+                ).fetchone()[0])
+                pending = int(conn.execute(
+                    "SELECT COUNT(*) FROM sui_seen_transactions WHERE enriched=0"
+                ).fetchone()[0])
+                sources = dict(conn.execute(
+                    "SELECT source,COUNT(*) FROM sui_discoveries GROUP BY source"
+                ).fetchall())
+                statuses = dict(conn.execute(
+                    """SELECT CASE
+                         WHEN provider_complete=0 OR packages_json='[]'
+                           OR strftime('%s','now')-strftime('%s',synced_at)>1800 THEN 'incomplete'
+                         WHEN COALESCE(indexed_tvl,0)>=? THEN 'qualifying'
+                         ELSE 'below' END AS current_status,COUNT(*)
+                       FROM sui_defi_projects GROUP BY current_status""",
+                    (min_usd,),
+                ).fetchall())
+            return {
+                "packages": package_total, "new_packages": new_packages,
+                "objects": objects, "pending": pending,
+                "publish": int(sources.get("publish", 0)),
+                "active_call": int(sources.get("active_call", 0)),
+                "qualifying": int(statuses.get("qualifying", 0)),
+                "below": int(statuses.get("below", 0)),
+                "incomplete": int(statuses.get("incomplete", 0)),
+            }
+        except sqlite3.Error:
+            return None
+
     def status(self) -> str:
         runtime = self.monitor.runtime()
         latest = self.monitor.rows("SELECT * FROM aggregate_samples ORDER BY id DESC LIMIT 1")
@@ -254,12 +295,19 @@ class ReportBuilder:
             f"Парсер: {runtime['state']} | heartbeat {human_duration(age)} назад",
             f"Uptime: {human_duration(uptime)} | профиль: {runtime['load_profile']} | порог: ${float(runtime['min_usd'] or 0):,.0f}",
         ]
+        lines.append(f"Exporter: {self.monitor.setting('exporter_state', 'idle')}")
         if aggregate:
             lines.append(
                 f"Адреса: {aggregate['unique_addresses']:,} | очередь: {aggregate['balance_pending']:,}"
             )
             lines.append(
                 f"≥ порога: {aggregate['qualifying']:,} | below: {aggregate['below_count']:,} | incomplete: {aggregate['incomplete']:,}"
+            )
+        sui = self._sui_summary()
+        if sui:
+            lines.append(
+                f"Sui: packages {sui['packages']:,} | >= threshold {sui['qualifying']:,} | "
+                f"incomplete {sui['incomplete']:,} | enrichment queue {sui['pending']:,}"
             )
         return "\n".join(lines)
 
@@ -271,7 +319,7 @@ class ReportBuilder:
         chains = self.monitor.rows(
             """
             SELECT c.* FROM chain_samples c JOIN(
-              SELECT chain,MAX(id) id FROM chain_samples WHERE ts>=? GROUP BY chain
+              SELECT chain,role,MAX(id) id FROM chain_samples WHERE ts>=? GROUP BY chain,role
             ) x ON x.id=c.id ORDER BY c.chain
             """, (cutoff,),
         )
@@ -292,6 +340,16 @@ class ReportBuilder:
             "",
             "Сети:",
         ]
+        sui = self._sui_summary(cutoff)
+        if sui:
+            lines.extend([
+                f"Sui packages: +{sui['new_packages']:,}, now {sui['packages']:,}; "
+                f"publish/active {sui['publish']:,}/{sui['active_call']:,}",
+                f"Sui lower-bound >= threshold/below/incomplete: "
+                f"{sui['qualifying']:,}/{sui['below']:,}/{sui['incomplete']:,}; "
+                f"state objects {sui['objects']:,}, enrichment queue {sui['pending']:,}",
+                "",
+            ])
         for row in chains:
             requests = int(row["rpc_requests"] or 0)
             errors = int(row["rpc_errors"] or 0)
@@ -314,7 +372,7 @@ class ReportBuilder:
         rows = self.monitor.rows(
             """
             SELECT c.* FROM chain_samples c JOIN(
-              SELECT chain,MAX(id) id FROM chain_samples GROUP BY chain
+              SELECT chain,role,MAX(id) id FROM chain_samples GROUP BY chain,role
             ) x ON x.id=c.id ORDER BY c.chain
             """
         )
@@ -327,6 +385,31 @@ class ReportBuilder:
                 f"RPC {row['active_rpc']}; cooldown {float(row['cooldown_sec'] or 0):.0f}s; "
                 f"p50/p95 {float(row['latency_p50_ms'] or 0):.0f}/{float(row['latency_p95_ms'] or 0):.0f}ms"
             )
+        try:
+            with sqlite3.connect(self.contracts_db, timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                method_rows = conn.execute(
+                    """SELECT chain,hostname,method_group,cooldown_until,circuit_until,
+                              permanent_error,batch_limit
+                       FROM rpc_method_health
+                       WHERE cooldown_until>? OR circuit_until>? OR permanent_error IS NOT NULL
+                       ORDER BY chain,hostname,method_group""",
+                    (time.time(), time.time()),
+                ).fetchall()
+            if method_rows:
+                lines.append("Method cooldowns / circuits:")
+                for item in method_rows:
+                    remaining = max(
+                        0.0, float(item["cooldown_until"] or 0),
+                        float(item["circuit_until"] or 0),
+                    ) - time.time()
+                    lines.append(
+                        f"  {item['chain']} {item['hostname']}:{item['method_group']} "
+                        f"{max(0, remaining):.0f}s batch={item['batch_limit'] or '-'} "
+                        f"{item['permanent_error'] or ''}"
+                    )
+        except sqlite3.Error:
+            pass
         return "\n".join(lines)[:4000]
 
     def resources(self, seconds: int) -> str:
@@ -487,7 +570,11 @@ class BotService:
         if not await self.guard(update, "/files"):
             return
         lines = ["Отчёты:"]
-        for name in ("qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx"):
+        for name in (
+            "qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx",
+            "sui_qualifying.xlsx", "sui_below_threshold.xlsx", "sui_incomplete.xlsx",
+            "sui_packages.xlsx",
+        ):
             path = ROOT / "reports" / name
             if path.exists():
                 stamp = datetime.fromtimestamp(path.stat().st_mtime, self.tz).strftime("%d.%m %H:%M")
@@ -499,10 +586,18 @@ class BotService:
     async def cmd_file(self, update: Any, context: Any) -> None:
         if not await self.guard(update, "/file"):
             return
-        mapping = {"qualifying": "qualifying.xlsx", "below": "below_threshold.xlsx", "incomplete": "incomplete.xlsx"}
+        mapping = {
+            "qualifying": "qualifying.xlsx", "below": "below_threshold.xlsx",
+            "incomplete": "incomplete.xlsx", "sui_qualifying": "sui_qualifying.xlsx",
+            "sui_below": "sui_below_threshold.xlsx", "sui_incomplete": "sui_incomplete.xlsx",
+            "sui_packages": "sui_packages.xlsx",
+        }
         key = context.args[0].lower() if context.args else ""
         if key not in mapping:
-            await update.message.reply_text("Использование: /file qualifying|below|incomplete")
+            await update.message.reply_text(
+                "Использование: /file qualifying|below|incomplete|"
+                "sui_qualifying|sui_below|sui_incomplete|sui_packages"
+            )
             return
         await self.send_file(update.effective_chat.id, ROOT / "reports" / mapping[key], context.bot)
 
@@ -549,12 +644,12 @@ class BotService:
         if not await self.guard(update, "/load"):
             return
         if not context.args:
-            profile = self.monitor.setting("load_profile", "normal")
-            await update.message.reply_text(f"Профиль: {profile}\n{json.dumps(LOAD_PROFILES.get(profile or 'normal', {}), ensure_ascii=False, indent=2)}")
+            profile = self.monitor.setting("load_profile", "conservative")
+            await update.message.reply_text(f"Профиль: {profile}\n{json.dumps(LOAD_PROFILES.get(profile or 'conservative', {}), ensure_ascii=False, indent=2)}")
             return
         profile = context.args[0].lower()
         if profile not in LOAD_PROFILES:
-            await update.message.reply_text("Разрешены только low, normal, high.")
+            await update.message.reply_text("Разрешены только conservative, low, normal, high.")
             return
         await self.ask_confirmation(update, "load", {"profile": profile}, f"Переключить профиль на {profile} и перезапустить scanner?")
 
@@ -632,8 +727,9 @@ class BotService:
             return
         await update.message.reply_text(
             "/status\n/report 1h|6h|24h|7d\n/networks\n/resources 1h|6h|24h\n"
-            "/errors 1h|6h|24h\n/files\n/file qualifying|below|incomplete\n"
-            "/schedule 30m|1h|6h|12h|24h\n/load [low|normal|high]\n"
+            "/errors 1h|6h|24h\n/files\n"
+            "/file qualifying|below|incomplete|sui_qualifying|sui_below|sui_incomplete|sui_packages\n"
+            "/schedule 30m|1h|6h|12h|24h\n/load [conservative|low|normal|high]\n"
             "/start /stop /restart\n/pause /resume\n/export /backup\n/history"
         )
 
@@ -646,6 +742,9 @@ class BotService:
                     try:
                         await application.bot.send_message(chat_id, self.reporter.report(interval))
                         await self.send_file(chat_id, ROOT / "reports" / "qualifying.xlsx", application.bot)
+                        sui_report = ROOT / "reports" / "sui_qualifying.xlsx"
+                        if sui_report.exists():
+                            await self.send_file(chat_id, sui_report, application.bot)
                         self.monitor.record_delivery(str(chat_id), "scheduled_report", "sent")
                     except Exception as exc:
                         self.monitor.record_delivery(str(chat_id), "scheduled_report", "failed", error=type(exc).__name__)
@@ -700,7 +799,7 @@ class BotService:
 
         latest_chains = self.monitor.rows(
             "SELECT chain,active_rpc,cooldown_sec FROM chain_samples WHERE id IN "
-            "(SELECT MAX(id) FROM chain_samples GROUP BY chain)"
+            "(SELECT MAX(id) FROM chain_samples WHERE role IN ('live','balance','discovery+balance') GROUP BY chain)"
         )
         for row in latest_chains:
             down_samples = self.monitor.rows(
@@ -713,7 +812,7 @@ class BotService:
                             f"All RPC endpoints for {row['chain']} are unavailable")
             movement = self.monitor.rows(
                 "SELECT MIN(cursor) min_cursor,MAX(cursor) max_cursor,MIN(safe_head) min_head,MAX(safe_head) max_head "
-                "FROM chain_samples WHERE chain=? AND ts>=?", (row["chain"], fifteen),
+                "FROM chain_samples WHERE chain=? AND role IN ('live','discovery+balance') AND ts>=?", (row["chain"], fifteen),
             )[0]
             stalled = (movement["min_cursor"] is not None and movement["min_cursor"] == movement["max_cursor"]
                        and int(movement["max_head"] or 0) > int(movement["min_head"] or 0))
@@ -808,14 +907,14 @@ class BotService:
                     if recovery:
                         text += f"\nДлительность: {human_duration(duration)}"
                     if not recovery and row["kind"] in {"system_load", "container_load"}:
-                        text += "\nРекомендация: /load low (потребуется подтверждение)."
+                        text += "\nРекомендация: /load conservative (потребуется подтверждение)."
                     delivered = False
                     for chat_id in self.allowed_chats:
                         try:
                             markup = None
                             if not recovery and row["kind"] in {"system_load", "container_load"}:
                                 markup = InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("Переключить на LOW", callback_data="suggest:low")
+                                    InlineKeyboardButton("Переключить на CONSERVATIVE", callback_data="suggest:conservative")
                                 ]])
                             await application.bot.send_message(chat_id, text, reply_markup=markup)
                             self.monitor.record_delivery(str(chat_id), "recovery" if recovery else "incident", "sent", str(row["id"]))
@@ -841,7 +940,7 @@ class BotService:
         if not self.allowed(update):
             return
         token = uuid.uuid4().hex[:16]
-        self.confirmations[token] = (update.effective_chat.id, time.time() + 60, "load", {"profile": "low"})
+        self.confirmations[token] = (update.effective_chat.id, time.time() + 60, "load", {"profile": "conservative"})
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Подтвердить LOW", callback_data=f"confirm:{token}:yes"),
             InlineKeyboardButton("Отмена", callback_data=f"confirm:{token}:no"),
@@ -876,7 +975,7 @@ class BotService:
         app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CallbackQueryHandler(self.on_confirmation, pattern=r"^confirm:"))
-        app.add_handler(CallbackQueryHandler(self.on_suggest_low, pattern=r"^suggest:low$"))
+        app.add_handler(CallbackQueryHandler(self.on_suggest_low, pattern=r"^suggest:(low|conservative)$"))
         return app
 
 

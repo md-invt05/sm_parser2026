@@ -19,7 +19,7 @@ class ConfigAndDatabaseTests(unittest.TestCase):
     def test_config_has_exact_supported_networks_and_all_network_default(self):
         cfg = scan_defi.load_config(ROOT / "config.yaml")
         self.assertEqual(20, len(cfg.chains))
-        self.assertEqual(list(cfg.chains), cfg.default_chains)
+        self.assertEqual([*cfg.chains, "sui"], cfg.default_chains)
         excluded = {
             "aurora", "moonbeam", "moonriver", "evmos", "coredao", "songbird", "flare", "pulse"
         }
@@ -30,8 +30,10 @@ class ConfigAndDatabaseTests(unittest.TestCase):
         self.assertTrue(all(len(chain.get("rpc") or []) <= 3 for chain in raw["chains"].values()))
         self.assertTrue(cfg.discover_tx_to_contracts)
         self.assertEqual(86400, cfg.code_cache_ttl_sec)
-        self.assertEqual(8, cfg.balance_concurrency)
-        self.assertEqual(12, cfg.balance_chain_concurrency)
+        self.assertEqual(2, cfg.balance_concurrency)
+        self.assertEqual(4, cfg.balance_chain_concurrency)
+        self.assertEqual(6, cfg.global_rpc_concurrency)
+        self.assertEqual("legacy_read_only", cfg.chains["zk"].lifecycle)
 
     def test_env_rpc_is_prepended_and_public_fallbacks_remain(self):
         old = os.environ.get("ETHEREUM_RPC")
@@ -81,6 +83,8 @@ class ConfigAndDatabaseTests(unittest.TestCase):
             for table in (
                 "contract_tokens", "address_scans", "address_chain_scans",
                 "address_token_scans", "contract_discoveries", "contract_code_cache",
+                "chain_cursors", "address_chain_state", "address_token_state",
+                "asset_valuation_policies", "anomalous_balances", "rpc_method_health",
             ):
                 row = second.conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -90,7 +94,7 @@ class ConfigAndDatabaseTests(unittest.TestCase):
                 "SELECT source FROM contract_discoveries WHERE chain='ethereum' AND address='0xabc'"
             ).fetchone()
             self.assertEqual("direct_deploy", source["source"])
-            self.assertEqual(4, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
+            self.assertEqual(7, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
             second.close()
 
     def test_upsert_contract_count_is_exact_for_executemany(self):

@@ -1,5 +1,5 @@
 # Contract address threshold across every supported EVM network.
-min_usd: 100000
+min_usd: 500000
 
 db_path: data/contracts.db
 monitoring_db_path: data/monitoring.db
@@ -8,33 +8,34 @@ log_dir: logs
 recheck_interval_sec: 86400
 
 # Conservative defaults for public, best-effort RPC endpoints.
-global_rpc_concurrency: 12
-rpc_concurrency: 2
-balance_concurrency: 8
+global_rpc_concurrency: 6
+rpc_concurrency: 1
+balance_concurrency: 2
 # Parallel network scans shared by all balance addresses; HTTP still uses 12/2 limits.
-balance_chain_concurrency: 12
-balance_chain_timeout_sec: 20
-balance_address_timeout_sec: 60
-balance_retry_sec: 300
+balance_chain_concurrency: 4
+balance_chain_timeout_sec: 45
+balance_address_timeout_sec: 240
+balance_retry_sec: 600
 # Supplemental estimates only for incomplete/slow RPC scans; their own serial queue.
 rabby_fallback: true
 rabby_request_interval_sec: 3
 rabby_timeout_sec: 12
 # Assumed possible deviation of the API estimate from reality, not a guaranteed bound.
 rabby_uncertainty: 0.10
-block_batch_size: 8
-receipt_batch_size: 20
-price_batch_size: 40
+block_batch_size: 4
+receipt_batch_size: 10
+eth_call_batch_size: 10
+price_batch_size: 20
 http_timeout_sec: 40
-max_retries: 8
-cooldown_min_sec: 5
+max_retries: 3
+cooldown_min_sec: 30
 cooldown_max_sec: 900
 all_down_sleep_sec: 30
 adaptive_batch: true
 
 # Structured heartbeat for monitoring.db and Telegram bot.
 heartbeat_sec: 60
-export_every_sec: 300
+export_every_sec: 1800
 daily_snapshot: true
 task_restart_sec: 20
 run_indexer: true
@@ -45,9 +46,38 @@ discover_tx_to_contracts: true
 # Empty-code recipients are not checked again during fast backfills until this expires.
 code_cache_ttl_sec: 86400
 
+native_anomaly_usd: 100000000
+rabby_token_discovery_after_sec: 900
+valuation_policies:
+  - chain: zk
+    address: "0x2a3dd3eb832af982ec71669e178424b10dca2ede"
+    asset: native
+    policy: exclude_from_total
+    reason: genesis-prefunded Polygon zkEVM bridge reserve
+    source: polygon_panoptichain_config
+
 # Discovery runs on every enabled network by default. --chains can narrow this list;
 # balance coverage still checks every enabled network below.
-default_chains: [ethereum, bsc, polygon, arbitrum, optimism, base, zk, zksync, robinhood, hyperliquid, linea, scroll, mantle, blast, celo, gnosis, cronos, kava, metis, harmony]
+default_chains: [ethereum, bsc, polygon, arbitrum, optimism, base, zk, zksync, robinhood, hyperliquid, linea, scroll, mantle, blast, celo, gnosis, cronos, kava, metis, harmony, sui]
+
+# Sui runs as a separate Move-package scanner. Blockberry is the primary
+# provider; the API key is read only from BLOCKBERRY_API_KEY in .env.
+sui:
+  enabled: true
+  discovery_days: 30
+  poll_sec: 30
+  page_size: 100
+  max_pages: 500
+  raw_enrich_per_pass: 100
+  balance_recheck_sec: 86400
+  balance_concurrency: 1
+  timeout_sec: 30
+  max_retries: 3
+  requests_per_second: 2
+  defi_sync_sec: 900
+  pool_verify_sec: 21600
+  pool_limit: 5000
+  pool_min_liquidity_usd: 25000
 
 chains:
   ethereum:
@@ -150,6 +180,7 @@ chains:
     enabled: true
     chain_id: 1101
     display_name: Polygon zkEVM
+    lifecycle: legacy_read_only
     llama_chain: polygon_zkevm
     native_symbol: ETH
     native_coingecko: ethereum

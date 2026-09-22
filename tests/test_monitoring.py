@@ -99,10 +99,11 @@ class MonitoringStoreTests(unittest.TestCase):
 
 class MonitoringHelpersTests(unittest.TestCase):
     def test_profiles_match_fixed_safe_values(self):
+        self.assertEqual(2, LOAD_PROFILES["conservative"]["balance_concurrency"])
         self.assertEqual(6, LOAD_PROFILES["low"]["global_rpc_concurrency"])
         self.assertEqual(8, LOAD_PROFILES["normal"]["balance_concurrency"])
         self.assertEqual(20, LOAD_PROFILES["high"]["balance_chain_concurrency"])
-        self.assertEqual({"low", "normal", "high"}, set(LOAD_PROFILES))
+        self.assertEqual({"conservative", "low", "normal", "high"}, set(LOAD_PROFILES))
 
     def test_period_and_percentile(self):
         self.assertEqual(21600, parse_period("6h"))

@@ -19,11 +19,20 @@ def utc_now() -> str:
 
 
 LOAD_PROFILES: dict[str, dict[str, int]] = {
+    "conservative": {
+        "global_rpc_concurrency": 6,
+        "rpc_concurrency": 1,
+        "balance_concurrency": 2,
+        "balance_chain_concurrency": 4,
+        "block_batch_size": 4,
+        "receipt_batch_size": 10,
+        "price_batch_size": 20,
+    },
     "low": {
         "global_rpc_concurrency": 6,
         "rpc_concurrency": 1,
-        "balance_concurrency": 4,
-        "balance_chain_concurrency": 6,
+        "balance_concurrency": 2,
+        "balance_chain_concurrency": 4,
         "block_batch_size": 4,
         "receipt_batch_size": 10,
         "price_batch_size": 20,
@@ -65,7 +74,7 @@ CREATE TABLE IF NOT EXISTS runtime_state(
     stopped_at TEXT,
     mode TEXT,
     min_usd REAL,
-    load_profile TEXT NOT NULL DEFAULT 'normal',
+    load_profile TEXT NOT NULL DEFAULT 'conservative',
     pid INTEGER,
     args_json TEXT NOT NULL DEFAULT '{}',
     note TEXT
@@ -223,8 +232,12 @@ class MonitorStore:
         if "balance_oldest_age_sec" not in aggregate_columns:
             self.conn.execute("ALTER TABLE aggregate_samples ADD COLUMN balance_oldest_age_sec REAL")
         with self.conn:
+            previous_version_row = self.conn.execute(
+                "SELECT version FROM schema_meta LIMIT 1"
+            ).fetchone()
+            previous_version = int(previous_version_row[0]) if previous_version_row else 0
             self.conn.execute(
-                "INSERT INTO schema_meta(version) SELECT 1 WHERE NOT EXISTS "
+                "INSERT INTO schema_meta(version) SELECT 2 WHERE NOT EXISTS "
                 "(SELECT 1 FROM schema_meta)"
             )
             self.conn.execute(
@@ -233,8 +246,15 @@ class MonitorStore:
             )
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
-                ("load_profile", "normal", utc_now()),
+                ("load_profile", "conservative", utc_now()),
             )
+            if previous_version < 2:
+                self.conn.execute(
+                    "UPDATE settings SET value='conservative',updated_at=? "
+                    "WHERE key='load_profile' AND value IN ('low','normal')",
+                    (utc_now(),),
+                )
+                self.conn.execute("UPDATE schema_meta SET version=2 WHERE version<2")
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                 ("scanner_paused", "0", utc_now()),

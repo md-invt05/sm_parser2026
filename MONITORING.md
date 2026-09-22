@@ -1,5 +1,11 @@
 # Telegram monitoring and Docker deployment
 
+Network samples distinguish `live` and `backfill` cursors. RPC health is persisted
+per endpoint fingerprint and method group without storing complete private URLs.
+The default profile is `conservative` (`low` remains a compatibility alias), and
+Telegram never increases load automatically. Qualifying counts are recalculated
+with the current threshold rather than copied from historical scan labels.
+
 The production stack is defined in `docker-compose.yml` and contains four isolated services:
 
 - `scanner` writes heartbeat and minute aggregates to `data/monitoring.db`;
@@ -33,7 +39,7 @@ Available commands: `/status`, `/report`, `/networks`, `/resources`, `/errors`,
 `/files`, `/file`, `/schedule`, `/load`, `/start`, `/stop`, `/restart`, `/pause`,
 `/resume`, `/export`, `/backup`, `/history`, `/help`.
 
-The scanner reads the persisted `low`, `normal` or `high` profile on startup.
+The scanner reads the persisted `conservative`, `low`, `normal` or `high` profile on startup.
 Pause is cooperative: no new block range or address starts while current SQLite
 transactions finish. SIGTERM has a 35-second Compose grace period and performs a
 final export. Online SQLite backups are created daily; the newest seven are kept.
