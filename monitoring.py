@@ -27,6 +27,8 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
         "block_batch_size": 4,
         "receipt_batch_size": 10,
         "price_batch_size": 20,
+        "discovery_live_slots": 4,
+        "discovery_backfill_slots": 1,
     },
     "low": {
         "global_rpc_concurrency": 6,
@@ -36,6 +38,8 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
         "block_batch_size": 4,
         "receipt_batch_size": 10,
         "price_batch_size": 20,
+        "discovery_live_slots": 4,
+        "discovery_backfill_slots": 1,
     },
     "normal": {
         "global_rpc_concurrency": 12,
@@ -45,6 +49,8 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
         "block_batch_size": 8,
         "receipt_batch_size": 20,
         "price_batch_size": 40,
+        "discovery_live_slots": 6,
+        "discovery_backfill_slots": 1,
     },
     "high": {
         "global_rpc_concurrency": 20,
@@ -54,6 +60,8 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
         "block_batch_size": 12,
         "receipt_batch_size": 30,
         "price_batch_size": 60,
+        "discovery_live_slots": 10,
+        "discovery_backfill_slots": 2,
     },
 }
 

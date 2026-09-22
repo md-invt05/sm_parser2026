@@ -40,6 +40,10 @@ Available commands: `/status`, `/report`, `/networks`, `/resources`, `/errors`,
 `/resume`, `/export`, `/backup`, `/history`, `/help`.
 
 The scanner reads the persisted `conservative`, `low`, `normal` or `high` profile on startup.
+Discovery uses separate fair live/backfill queues. Profile capacities are `4/1` for
+`conservative` and `low`, `6/1` for `normal`, and `10/2` for `high`. Live waiters
+older than 30 seconds take FIFO priority; otherwise the largest lag is served first.
+`/status` shows active slots, queued networks, and the oldest wait time.
 Pause is cooperative: no new block range or address starts while current SQLite
 transactions finish. SIGTERM has a 35-second Compose grace period and performs a
 final export. Online SQLite backups are created daily; the newest seven are kept.

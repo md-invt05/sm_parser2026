@@ -103,6 +103,22 @@ class MonitoringHelpersTests(unittest.TestCase):
         self.assertEqual(6, LOAD_PROFILES["low"]["global_rpc_concurrency"])
         self.assertEqual(8, LOAD_PROFILES["normal"]["balance_concurrency"])
         self.assertEqual(20, LOAD_PROFILES["high"]["balance_chain_concurrency"])
+        self.assertEqual((4, 1), (
+            LOAD_PROFILES["conservative"]["discovery_live_slots"],
+            LOAD_PROFILES["conservative"]["discovery_backfill_slots"],
+        ))
+        self.assertEqual((4, 1), (
+            LOAD_PROFILES["low"]["discovery_live_slots"],
+            LOAD_PROFILES["low"]["discovery_backfill_slots"],
+        ))
+        self.assertEqual((6, 1), (
+            LOAD_PROFILES["normal"]["discovery_live_slots"],
+            LOAD_PROFILES["normal"]["discovery_backfill_slots"],
+        ))
+        self.assertEqual((10, 2), (
+            LOAD_PROFILES["high"]["discovery_live_slots"],
+            LOAD_PROFILES["high"]["discovery_backfill_slots"],
+        ))
         self.assertEqual({"conservative", "low", "normal", "high"}, set(LOAD_PROFILES))
 
     def test_period_and_percentile(self):

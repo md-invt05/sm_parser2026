@@ -33,7 +33,13 @@ class ConfigAndDatabaseTests(unittest.TestCase):
         self.assertEqual(2, cfg.balance_concurrency)
         self.assertEqual(4, cfg.balance_chain_concurrency)
         self.assertEqual(6, cfg.global_rpc_concurrency)
+        self.assertEqual((4, 1), (cfg.discovery_live_slots, cfg.discovery_backfill_slots))
         self.assertEqual("legacy_read_only", cfg.chains["zk"].lifecycle)
+
+        scan_defi.apply_load_profile(cfg, "normal")
+        self.assertEqual((6, 1), (cfg.discovery_live_slots, cfg.discovery_backfill_slots))
+        scan_defi.apply_load_profile(cfg, "high")
+        self.assertEqual((10, 2), (cfg.discovery_live_slots, cfg.discovery_backfill_slots))
 
     def test_env_rpc_is_prepended_and_public_fallbacks_remain(self):
         old = os.environ.get("ETHEREUM_RPC")
@@ -599,6 +605,132 @@ class MultichainBalanceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("7000000000000000000", tokens[0]["raw_amount"])
             self.assertEqual(0, tokens[0]["priced"])
             db.close()
+
+
+class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def _wait_for(self, predicate, timeout=1.0):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail("condition was not reached before timeout")
+            await asyncio.sleep(0.001)
+
+    async def test_twenty_live_workers_all_run_with_capacity_four(self):
+        slots = scan_defi.DiscoverySlots(live_slots=4, backfill_slots=1)
+        active = 0
+        peak = 0
+        completed = []
+
+        async def worker(index):
+            nonlocal active, peak
+            async with slots.slot("live", f"chain-{index}", lag=index):
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.003)
+                completed.append(index)
+                active -= 1
+
+        await asyncio.gather(*(worker(index) for index in range(20)))
+        snapshot = await slots.snapshot()
+        self.assertEqual(set(range(20)), set(completed))
+        self.assertEqual(4, peak)
+        self.assertEqual(0, snapshot["live_active"])
+        self.assertEqual(0, snapshot["live_waiting"])
+
+    async def test_live_prefers_lag_but_waiting_thirty_seconds_wins(self):
+        slots = scan_defi.DiscoverySlots(
+            live_slots=1, backfill_slots=1, starvation_sec=0.03,
+        )
+        release = asyncio.Event()
+        holder_ready = asyncio.Event()
+        order = []
+
+        async def holder():
+            async with slots.slot("live", "holder", lag=0):
+                holder_ready.set()
+                await release.wait()
+
+        async def worker(name, lag):
+            async with slots.slot("live", name, lag=lag):
+                order.append(name)
+
+        holder_task = asyncio.create_task(holder())
+        await holder_ready.wait()
+        low = asyncio.create_task(worker("low", 1))
+        await self._wait_for(lambda: len(slots.queues["live"]) == 1)
+        high = asyncio.create_task(worker("high", 1000))
+        await self._wait_for(lambda: len(slots.queues["live"]) == 2)
+        release.set()
+        await asyncio.gather(holder_task, low, high)
+        self.assertEqual(["high", "low"], order)
+
+        release = asyncio.Event()
+        holder_ready = asyncio.Event()
+        order.clear()
+        holder_task = asyncio.create_task(holder())
+        await holder_ready.wait()
+        low = asyncio.create_task(worker("starved-low", 1))
+        await self._wait_for(lambda: len(slots.queues["live"]) == 1)
+        await asyncio.sleep(0.04)
+        high = asyncio.create_task(worker("fresh-high", 1000))
+        await self._wait_for(lambda: len(slots.queues["live"]) == 2)
+        release.set()
+        await asyncio.gather(holder_task, low, high)
+        self.assertEqual(["starved-low", "fresh-high"], order)
+
+    async def test_backfill_is_fifo_and_independent_from_live(self):
+        slots = scan_defi.DiscoverySlots(live_slots=1, backfill_slots=1)
+        live_release = asyncio.Event()
+        backfill_release = asyncio.Event()
+        entered = []
+
+        async def worker(role, name, release=None):
+            async with slots.slot(role, name, lag=0):
+                entered.append(name)
+                if release is not None:
+                    await release.wait()
+
+        live = asyncio.create_task(worker("live", "live", live_release))
+        first = asyncio.create_task(worker("backfill", "backfill-1", backfill_release))
+        await self._wait_for(lambda: len(entered) == 2)
+        second = asyncio.create_task(worker("backfill", "backfill-2"))
+        await self._wait_for(lambda: len(slots.queues["backfill"]) == 1)
+        live_release.set()
+        await live
+        self.assertNotIn("backfill-2", entered)
+        backfill_release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual({"live", "backfill-1"}, set(entered[:2]))
+        self.assertEqual("backfill-2", entered[2])
+
+    async def test_cancelling_waiter_and_holder_does_not_leak_slots(self):
+        slots = scan_defi.DiscoverySlots(live_slots=1, backfill_slots=1)
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def holder():
+            async with slots.slot("live", "holder"):
+                entered.set()
+                await release.wait()
+
+        async def waiter(name):
+            async with slots.slot("live", name):
+                return name
+
+        holder_task = asyncio.create_task(holder())
+        await entered.wait()
+        cancelled = asyncio.create_task(waiter("cancelled"))
+        survivor = asyncio.create_task(waiter("survivor"))
+        await self._wait_for(lambda: len(slots.queues["live"]) == 2)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        release.set()
+        self.assertEqual("survivor", await survivor)
+        await holder_task
+        snapshot = await slots.snapshot()
+        self.assertEqual(0, snapshot["live_active"])
+        self.assertEqual(0, snapshot["live_waiting"])
 
 
 class CursorBulkTests(unittest.IsolatedAsyncioTestCase):

@@ -162,6 +162,8 @@ class AppCfg:
     receipt_batch_size: int
     eth_call_batch_size: int
     price_batch_size: int
+    discovery_live_slots: int
+    discovery_backfill_slots: int
     http_timeout_sec: int
     max_retries: int
     cooldown_min_sec: float
@@ -264,6 +266,8 @@ def load_config(path: Path) -> AppCfg:
         receipt_batch_size=int(raw.get("receipt_batch_size", 20)),
         eth_call_batch_size=int(raw.get("eth_call_batch_size", 10)),
         price_batch_size=int(raw.get("price_batch_size", 40)),
+        discovery_live_slots=max(1, int(raw.get("discovery_live_slots", 4))),
+        discovery_backfill_slots=max(1, int(raw.get("discovery_backfill_slots", 1))),
         http_timeout_sec=int(raw.get("http_timeout_sec", 40)),
         max_retries=int(raw.get("max_retries", 8)),
         cooldown_min_sec=float(raw.get("cooldown_min_sec", 5)),
@@ -2732,44 +2736,112 @@ def rpc_code_has_bytecode(value: Any) -> bool:
     return bool(value[2:].lstrip("0"))
 
 
+@dataclass
+class DiscoveryTicket:
+    role: str
+    chain: str
+    lag: int
+    sequence: int
+    enqueued_at: float
+    future: asyncio.Future[None]
+    granted: bool = False
+
+
 class DiscoverySlots:
-    """A fair global 3:1 live/backfill scheduler with independent capacities."""
+    """Fair live/backfill queues with independent capacities and bounded starvation."""
 
-    def __init__(self, live_slots: int = 2, backfill_slots: int = 1):
-        self.live_slots = max(1, live_slots)
-        self.backfill_slots = max(1, backfill_slots)
+    def __init__(
+        self, live_slots: int = 4, backfill_slots: int = 1,
+        starvation_sec: float = 30.0,
+    ):
+        self.capacity = {
+            "live": max(1, live_slots),
+            "backfill": max(1, backfill_slots),
+        }
+        self.starvation_sec = max(0.0, starvation_sec)
         self.active = {"live": 0, "backfill": 0}
-        self.waiting = {"live": 0, "backfill": 0}
-        self.live_grants = 0
-        self.condition = asyncio.Condition()
+        self.queues: dict[str, list[DiscoveryTicket]] = {"live": [], "backfill": []}
+        self.sequence = 0
+        self.lock = asyncio.Lock()
 
-    def _allowed(self, role: str) -> bool:
-        capacity = self.live_slots if role == "live" else self.backfill_slots
-        if self.active[role] >= capacity:
-            return False
-        if role == "live":
-            return self.live_grants < 3 or self.waiting["backfill"] == 0
-        return self.live_grants >= 3 or self.waiting["live"] == 0
+    def _next_ticket(self, role: str, now: float) -> DiscoveryTicket | None:
+        queue = [ticket for ticket in self.queues[role] if not ticket.future.cancelled()]
+        self.queues[role] = queue
+        if not queue:
+            return None
+        if role == "backfill":
+            return min(queue, key=lambda ticket: ticket.sequence)
+        starved = [
+            ticket for ticket in queue
+            if now - ticket.enqueued_at >= self.starvation_sec
+        ]
+        if starved:
+            return min(starved, key=lambda ticket: ticket.sequence)
+        return min(queue, key=lambda ticket: (-ticket.lag, ticket.sequence))
+
+    def _dispatch_locked(self) -> None:
+        now = time.monotonic()
+        for role in ("live", "backfill"):
+            while self.active[role] < self.capacity[role]:
+                ticket = self._next_ticket(role, now)
+                if ticket is None:
+                    break
+                self.queues[role].remove(ticket)
+                ticket.granted = True
+                self.active[role] += 1
+                if not ticket.future.done():
+                    ticket.future.set_result(None)
+
+    async def snapshot(self) -> dict[str, int | float]:
+        async with self.lock:
+            now = time.monotonic()
+            result: dict[str, int | float] = {}
+            for role in ("live", "backfill"):
+                queue = [
+                    ticket for ticket in self.queues[role]
+                    if not ticket.future.cancelled() and not ticket.granted
+                ]
+                result[f"{role}_slots"] = self.capacity[role]
+                result[f"{role}_active"] = self.active[role]
+                result[f"{role}_waiting"] = len(queue)
+                result[f"{role}_max_wait_sec"] = max(
+                    (now - ticket.enqueued_at for ticket in queue), default=0.0,
+                )
+            return result
 
     @asynccontextmanager
-    async def slot(self, role: str):
-        async with self.condition:
-            self.waiting[role] += 1
-            try:
-                await self.condition.wait_for(lambda: self._allowed(role))
-                self.active[role] += 1
-                if role == "live":
-                    self.live_grants += 1
-                else:
-                    self.live_grants = 0
-            finally:
-                self.waiting[role] -= 1
+    async def slot(self, role: str, chain: str, lag: int = 0):
+        if role not in self.capacity:
+            raise ValueError(f"unknown discovery role: {role}")
+        loop = asyncio.get_running_loop()
+        async with self.lock:
+            ticket = DiscoveryTicket(
+                role=role, chain=chain, lag=max(0, int(lag)),
+                sequence=self.sequence, enqueued_at=time.monotonic(),
+                future=loop.create_future(),
+            )
+            self.sequence += 1
+            self.queues[role].append(ticket)
+            self._dispatch_locked()
+        try:
+            await ticket.future
+        except asyncio.CancelledError:
+            async with self.lock:
+                if ticket.granted:
+                    ticket.granted = False
+                    self.active[role] -= 1
+                elif ticket in self.queues[role]:
+                    self.queues[role].remove(ticket)
+                self._dispatch_locked()
+            raise
         try:
             yield
         finally:
-            async with self.condition:
-                self.active[role] -= 1
-                self.condition.notify_all()
+            async with self.lock:
+                if ticket.granted:
+                    ticket.granted = False
+                    self.active[role] -= 1
+                self._dispatch_locked()
 
 
 async def collect_tx_to_contracts(
@@ -3002,7 +3074,11 @@ async def index_chain_cursor(
                 pass
             continue
         end = min(target, start + max(1, rpc.block_batch) - 1)
-        async with slots.slot(role):
+        async with slots.slot(role, chain.key, max(0, target - start + 1)):
+            if stop.is_set():
+                return
+            if monitor is not None and monitor.setting("scanner_paused", "0") == "1":
+                continue
             try:
                 numbers = list(range(start, end + 1))
                 blocks = await rpc.batch([
@@ -4333,6 +4409,7 @@ async def heartbeat_loop(
     stop: asyncio.Event,
     monitor: MonitorStore,
     run_id: str,
+    discovery_slots: DiscoverySlots,
 ) -> None:
     status_path = cfg.log_dir / "status.txt"
     previous: dict[str, tuple[float, int]] = {}
@@ -4346,9 +4423,22 @@ async def heartbeat_loop(
             pass
         sampled_at = datetime.now(timezone.utc)
         paused = monitor.setting("scanner_paused", "0") == "1"
-        monitor.heartbeat(run_id, "paused" if paused else "running")
+        slot_stats = await discovery_slots.snapshot()
+        monitor.heartbeat(
+            run_id, "paused" if paused else "running",
+            json.dumps({"discovery_scheduler": slot_stats}, separators=(",", ":")),
+        )
         lines = [
             f"updated_utc {sampled_at.isoformat()}",
+            (
+                "discovery_scheduler "
+                f"live={slot_stats['live_active']}/{slot_stats['live_slots']} "
+                f"waiting={slot_stats['live_waiting']} "
+                f"max_wait={slot_stats['live_max_wait_sec']:.1f}s; "
+                f"backfill={slot_stats['backfill_active']}/{slot_stats['backfill_slots']} "
+                f"waiting={slot_stats['backfill_waiting']} "
+                f"max_wait={slot_stats['backfill_max_wait_sec']:.1f}s"
+            ),
             f"{'chain':<14} {'last':>12} {'safe_head':>12} {'lag':>10} {'contracts':>10} {'rpc':<30} {'cooldown':>9} {'error'}",
         ]
         for key, pool in pools.items():
@@ -4465,10 +4555,16 @@ async def heartbeat_loop(
             monitor.prune(30)
             last_prune_day = prune_day
         # короткий пинг в консоль, чтобы по ssh было видно что жив
-        console.info("heartbeat  " + " | ".join(
+        console.info(
+            "heartbeat  slots live=%s/%s wait=%s backfill=%s/%s wait=%s | %s",
+            slot_stats["live_active"], slot_stats["live_slots"],
+            slot_stats["live_waiting"], slot_stats["backfill_active"],
+            slot_stats["backfill_slots"], slot_stats["backfill_waiting"],
+            " | ".join(
             f"{c.key}:live={int(db.cursor(c.key, 'live')['last_committed']) if db.cursor(c.key, 'live') else 'n/a'}"
             for c in selected
-        ))
+            ),
+        )
 
 
 async def export_loop(
@@ -4828,7 +4924,10 @@ async def run(args: argparse.Namespace) -> None:
             return
 
         tasks: list[asyncio.Task[Any]] = []
-        discovery_slots = DiscoverySlots(live_slots=2, backfill_slots=1)
+        discovery_slots = DiscoverySlots(
+            live_slots=cfg.discovery_live_slots,
+            backfill_slots=cfg.discovery_backfill_slots,
+        )
         if cfg.run_indexer and not args.balances_only:
             for chain in discovery_ready:
                 pool = pools[chain.key]
@@ -4903,7 +5002,10 @@ async def run(args: argparse.Namespace) -> None:
         )
         tasks.append(
             asyncio.create_task(
-                heartbeat_loop(db, cfg, discovery_ready, pools, stop, monitor, run_id),
+                heartbeat_loop(
+                    db, cfg, discovery_ready, pools, stop, monitor, run_id,
+                    discovery_slots,
+                ),
                 name="heartbeat",
             )
         )

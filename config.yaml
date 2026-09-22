@@ -26,6 +26,9 @@ block_batch_size: 4
 receipt_batch_size: 10
 eth_call_batch_size: 10
 price_batch_size: 20
+# Discovery has independent fair queues; live capacity is intentionally larger.
+discovery_live_slots: 4
+discovery_backfill_slots: 1
 http_timeout_sec: 40
 max_retries: 3
 cooldown_min_sec: 30

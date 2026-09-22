@@ -296,6 +296,21 @@ class ReportBuilder:
             f"Uptime: {human_duration(uptime)} | профиль: {runtime['load_profile']} | порог: ${float(runtime['min_usd'] or 0):,.0f}",
         ]
         lines.append(f"Exporter: {self.monitor.setting('exporter_state', 'idle')}")
+        try:
+            runtime_note = json.loads(runtime["note"] or "{}")
+            scheduler = runtime_note.get("discovery_scheduler") or {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            scheduler = {}
+        if scheduler:
+            lines.append(
+                "Discovery: "
+                f"live {scheduler.get('live_active', 0)}/{scheduler.get('live_slots', 0)}, "
+                f"wait {scheduler.get('live_waiting', 0)}, "
+                f"max {float(scheduler.get('live_max_wait_sec', 0)):.0f}s; "
+                f"backfill {scheduler.get('backfill_active', 0)}/{scheduler.get('backfill_slots', 0)}, "
+                f"wait {scheduler.get('backfill_waiting', 0)}, "
+                f"max {float(scheduler.get('backfill_max_wait_sec', 0)):.0f}s"
+            )
         if aggregate:
             lines.append(
                 f"Адреса: {aggregate['unique_addresses']:,} | очередь: {aggregate['balance_pending']:,}"

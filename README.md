@@ -176,6 +176,11 @@ Rabby вызывается не чаще одного запроса в 3 сек
 [официальный клиент Rabby](https://github.com/RabbyHub/rabby-api) и
 [документация отдельного DeBank Pro API](https://docs.cloud.debank.com/en/readme/api-pro-reference/user).
 
+Discovery scheduling is profile-driven: `conservative/low=4 live + 1 backfill`,
+`normal=6+1`, `high=10+2`. Live networks are selected by lag with a 30-second
+FIFO starvation guard; backfill uses its own FIFO queue. Current queue/slot data
+is visible in `/status` and `logs/status.txt`.
+
 Основные настройки: `balance_concurrency`, `balance_chain_concurrency`,
 `balance_chain_timeout_sec`, `balance_address_timeout_sec`, `balance_retry_sec`,
 `discover_tx_to_contracts`, `code_cache_ttl_sec`, `rabby_fallback`,
