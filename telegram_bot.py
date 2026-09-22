@@ -769,6 +769,82 @@ class BotService:
         else:
             self.monitor.resolve_incident(fingerprint)
 
+    def _evaluate_chain_incidents(self, now: datetime) -> None:
+        fifteen = (now - timedelta(minutes=15)).isoformat()
+        latest_chains = self.monitor.rows(
+            "SELECT chain,run_id,active_rpc,cooldown_sec,cursor,safe_head,ts FROM chain_samples WHERE id IN "
+            "(SELECT MAX(id) FROM chain_samples WHERE role IN ('live','balance','discovery+balance') GROUP BY chain)"
+        )
+        for row in latest_chains:
+            down_samples = self.monitor.rows(
+                "SELECT COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM chain_samples "
+                "WHERE chain=? AND run_id IS ? AND ts>=? AND active_rpc='none'",
+                (row["chain"], row["run_id"], (now - timedelta(minutes=2)).isoformat()),
+            )[0]
+            down_span = timestamp_span(down_samples["first_ts"], down_samples["last_ts"])
+            self._condition(
+                down_samples["n"] >= 2 and down_span >= 100,
+                f"rpc:down:{row['chain']}", "critical", "rpc_outage",
+                f"All RPC endpoints for {row['chain']} are unavailable",
+            )
+
+            fingerprint = f"cursor:stalled:{row['chain']}"
+            opened = self.monitor.active_incident(fingerprint)
+            latest_cursor = int(row["cursor"]) if row["cursor"] is not None else None
+            if opened is not None:
+                try:
+                    details = json.loads(opened["details_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    details = {}
+                if not isinstance(details, dict):
+                    details = {}
+                opened_cursor = details.get("opened_cursor")
+                if opened_cursor is None and latest_cursor is not None:
+                    opened_cursor = latest_cursor
+                    details["opened_cursor"] = opened_cursor
+                if (
+                    latest_cursor is not None
+                    and opened_cursor is not None
+                    and latest_cursor > int(opened_cursor)
+                ):
+                    self.monitor.resolve_incident(fingerprint)
+                else:
+                    # Losing the RPC or a head that stopped advancing is not a
+                    # recovery.  Keep the incident open until cursor advances.
+                    self.monitor.open_incident(
+                        fingerprint, "critical", "cursor_stall",
+                        f"Cursor for {row['chain']} did not move for 15 minutes while head advanced",
+                        details=details,
+                    )
+                continue
+
+            # Compare against the last sample at least fifteen minutes old.
+            # A monotonic cursor equal to that baseline has not moved during
+            # the full interval; this also prevents startup false positives.
+            baseline_rows = self.monitor.rows(
+                "SELECT cursor,safe_head,ts FROM chain_samples "
+                "WHERE chain=? AND run_id IS ? "
+                "AND role IN ('live','discovery+balance') AND ts<=? "
+                "ORDER BY id DESC LIMIT 1",
+                (row["chain"], row["run_id"], fifteen),
+            )
+            baseline = baseline_rows[0] if baseline_rows else None
+            stalled = bool(
+                row["active_rpc"] not in (None, "", "none")
+                and baseline is not None
+                and latest_cursor is not None
+                and baseline["cursor"] is not None
+                and latest_cursor == int(baseline["cursor"])
+                and int(row["safe_head"] or 0) > int(baseline["safe_head"] or 0)
+                and timestamp_span(baseline["ts"], row["ts"]) >= 900
+            )
+            if stalled:
+                self.monitor.open_incident(
+                    fingerprint, "critical", "cursor_stall",
+                    f"Cursor for {row['chain']} did not move for 15 minutes while head advanced",
+                    details={"opened_cursor": latest_cursor},
+                )
+
     async def evaluate_incidents(self) -> None:
         runtime = self.monitor.runtime()
         stale = True
@@ -787,7 +863,6 @@ class BotService:
 
         now = datetime.now(UTC)
         five = (now - timedelta(minutes=5)).isoformat()
-        fifteen = (now - timedelta(minutes=15)).isoformat()
         ten = (now - timedelta(minutes=10)).isoformat()
         rpc_rows = self.monitor.rows(
             "SELECT SUM(rpc_requests) req,SUM(rpc_errors) err FROM chain_samples WHERE ts>=?", (five,)
@@ -797,27 +872,7 @@ class BotService:
         self._condition(req >= 50 and err / req > .20, "rpc:error_rate", "critical", "rpc_error_rate",
                         f"RPC error rate is {err / req:.1%} ({err}/{req})" if req else "RPC error rate high")
 
-        latest_chains = self.monitor.rows(
-            "SELECT chain,active_rpc,cooldown_sec FROM chain_samples WHERE id IN "
-            "(SELECT MAX(id) FROM chain_samples WHERE role IN ('live','balance','discovery+balance') GROUP BY chain)"
-        )
-        for row in latest_chains:
-            down_samples = self.monitor.rows(
-                "SELECT COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM chain_samples "
-                "WHERE chain=? AND ts>=? AND active_rpc='none'",
-                (row["chain"], (now - timedelta(minutes=2)).isoformat()),
-            )[0]
-            down_span = timestamp_span(down_samples["first_ts"], down_samples["last_ts"])
-            self._condition(down_samples["n"] >= 2 and down_span >= 100, f"rpc:down:{row['chain']}", "critical", "rpc_outage",
-                            f"All RPC endpoints for {row['chain']} are unavailable")
-            movement = self.monitor.rows(
-                "SELECT MIN(cursor) min_cursor,MAX(cursor) max_cursor,MIN(safe_head) min_head,MAX(safe_head) max_head "
-                "FROM chain_samples WHERE chain=? AND role IN ('live','discovery+balance') AND ts>=?", (row["chain"], fifteen),
-            )[0]
-            stalled = (movement["min_cursor"] is not None and movement["min_cursor"] == movement["max_cursor"]
-                       and int(movement["max_head"] or 0) > int(movement["min_head"] or 0))
-            self._condition(stalled, f"cursor:stalled:{row['chain']}", "critical", "cursor_stall",
-                            f"Cursor for {row['chain']} did not move for 15 minutes while head advanced")
+        self._evaluate_chain_incidents(now)
 
         balances = self.monitor.rows(
             "SELECT MIN(balance_completed) min_done,MAX(balance_completed) max_done,MAX(balance_pending) pending,"

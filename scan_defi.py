@@ -2060,6 +2060,10 @@ class RpcPool:
         self.preflight_complete = False
         self._i = 0
         self._client: httpx.AsyncClient | None = None
+        # Only one worker per network may promote an unverified fallback at a
+        # time.  Without this lock every waiting live/balance task would probe
+        # the same URL concurrently when the verified endpoints go down.
+        self._fallback_verify_lock = asyncio.Lock()
         self.block_batch = cfg.block_batch_size
         self.receipt_batch = cfg.receipt_batch_size
         self.call_batch = max(1, cfg.eth_call_batch_size)
@@ -2175,6 +2179,11 @@ class RpcPool:
             ep = self._pick(method_group, exclude)
             if ep is not None:
                 return ep
+            if self.preflight_complete:
+                await self._verify_unchecked_fallback(method_group, exclude)
+                ep = self._pick(method_group, exclude)
+                if ep is not None:
+                    return ep
             if BALANCE_RPC.get():
                 raise RpcError("cooldown", "no ready endpoint for balance probe")
             usable = [
@@ -2411,80 +2420,126 @@ class RpcPool:
                 raise item
         return out
 
-    async def preflight(self) -> list[dict[str, Any]]:
-        """Validate endpoint chain IDs and basic calls without exposing full URLs."""
+    async def _probe_request(self, ep: Endpoint, payload: Any) -> Any:
+        """Run one bounded validation request directly against an endpoint."""
         assert self._client
-        # Startup must not wait behind a dead public endpoint.  This is a
-        # diagnostic probe, not an indexing request: a short deadline is
-        # enough to choose a healthy fallback and let workers start.
-        async def request(ep: Endpoint, payload: Any) -> Any:
-            try:
-                return await asyncio.wait_for(
-                    self._request_endpoint(ep, payload, "head"), timeout=30.0,
-                )
-            except asyncio.TimeoutError as exc:
-                raise RpcError("timeout", "preflight request timed out") from exc
+        try:
+            return await asyncio.wait_for(
+                self._request_endpoint(ep, payload, "head"), timeout=30.0,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RpcError("timeout", "preflight request timed out") from exc
 
-        async def probe(ep: Endpoint) -> dict[str, Any]:
-            row: dict[str, Any] = {"endpoint": _short_url(ep.url), "ok": False}
-            try:
-                chain_data = await request(
-                    ep,
-                    {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
-                )
-                if not isinstance(chain_data, dict) or "result" not in chain_data:
-                    raise RpcError("malformed", "eth_chainId missing result")
-                actual = hex_int(chain_data["result"])
-                row["chain_id"] = actual
-                if self.expected_chain_id is not None and actual != self.expected_chain_id:
-                    reason = f"wrong chain id {actual}, expected {self.expected_chain_id}"
-                    ep.disable(reason)
-                    raise RpcError("wrong_chain", reason, permanent=True)
-                ep.chain_verified = True
+    async def _probe_endpoint(self, ep: Endpoint) -> dict[str, Any]:
+        """Verify chain identity and capabilities without logging a private URL."""
+        row: dict[str, Any] = {"endpoint": _short_url(ep.url), "ok": False}
+        try:
+            chain_data = await self._probe_request(
+                ep,
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
+            )
+            if not isinstance(chain_data, dict) or "result" not in chain_data:
+                raise RpcError("malformed", "eth_chainId missing result")
+            actual = hex_int(chain_data["result"])
+            row["chain_id"] = actual
+            if self.expected_chain_id is not None and actual != self.expected_chain_id:
+                reason = f"wrong chain id {actual}, expected {self.expected_chain_id}"
+                ep.disable(reason)
+                raise RpcError("wrong_chain", reason, permanent=True)
 
-                head_data = await request(
+            head_data = await self._probe_request(
+                ep,
+                {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []},
+            )
+            if not isinstance(head_data, dict) or "result" not in head_data:
+                raise RpcError("malformed", "eth_blockNumber missing result")
+            row["head"] = hex_int(head_data["result"])
+            self.last_head = max(self.last_head or 0, int(row["head"]))
+            # An endpoint becomes eligible only after both identity and head
+            # checks succeeded.  A partial probe must never enter rotation.
+            ep.chain_verified = True
+            try:
+                batch_data = await self._probe_request(
                     ep,
-                    {"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []},
+                    [
+                        {"jsonrpc": "2.0", "id": 11, "method": "eth_chainId", "params": []},
+                        {"jsonrpc": "2.0", "id": 12, "method": "eth_blockNumber", "params": []},
+                    ],
                 )
-                if not isinstance(head_data, dict) or "result" not in head_data:
-                    raise RpcError("malformed", "eth_blockNumber missing result")
-                row["head"] = hex_int(head_data["result"])
-                self.last_head = max(self.last_head or 0, int(row["head"]))
-                try:
-                    batch_data = await request(
-                        ep,
-                        [
-                            {"jsonrpc": "2.0", "id": 11, "method": "eth_chainId", "params": []},
-                            {"jsonrpc": "2.0", "id": 12, "method": "eth_blockNumber", "params": []},
-                        ],
+                ep.batch_supported = (
+                    isinstance(batch_data, list)
+                    and len(batch_data) == 2
+                    and all(
+                        isinstance(item, dict)
+                        and item.get("error") is None
+                        and "result" in item
+                        for item in batch_data
                     )
-                    ep.batch_supported = (
-                        isinstance(batch_data, list)
-                        and len(batch_data) == 2
-                        and all(
-                            isinstance(item, dict)
-                            and item.get("error") is None
-                            and "result" in item
-                            for item in batch_data
-                        )
+                )
+            except RpcError:
+                ep.batch_supported = False
+            row["batch"] = ep.batch_supported
+            row["ok"] = True
+        except RpcError as exc:
+            row["error"] = exc.kind
+            ep.chain_verified = False
+            if exc.permanent or exc.kind in ("auth", "wrong_chain"):
+                ep.disable(exc.kind)
+            else:
+                ep.last_error = exc.kind
+                ep.health("head").last_error = exc.kind
+                ep.cool(
+                    exc.retry_after or self.cfg.cooldown_min_sec,
+                    self.cfg.cooldown_max_sec,
+                    "head",
+                )
+        return row
+
+    async def _verify_unchecked_fallback(
+        self, method_group: str, exclude: set[str] | None = None,
+    ) -> bool:
+        """Lazily promote the next unverified fallback when verified RPCs fail."""
+        exclude = exclude or set()
+        async with self._fallback_verify_lock:
+            if self._pick(method_group, exclude) is not None:
+                return True
+            candidates = [
+                endpoint for endpoint in self.endpoints
+                if not endpoint.chain_verified
+                and endpoint.permanent_error is None
+                and endpoint.fingerprint not in exclude
+                and endpoint.available("head")
+            ]
+            for endpoint in candidates:
+                report = await self._probe_endpoint(endpoint)
+                if report.get("ok"):
+                    log.info(
+                        "[%s] verified fallback %s",
+                        self.chain,
+                        _short_url(endpoint.url),
                     )
-                except RpcError:
-                    ep.batch_supported = False
-                row["batch"] = ep.batch_supported
-                row["ok"] = True
-            except RpcError as exc:
-                row["error"] = exc.kind
-                if exc.permanent or exc.kind in ("auth", "wrong_chain"):
-                    ep.disable(exc.kind)
-                else:
-                    ep.last_error = exc.kind
-            return row
+                    return True
+            return False
+
+    async def preflight(self) -> list[dict[str, Any]]:
+        """Validate priority RPCs, then continue until one fallback is usable."""
+        assert self._client
 
         # Environment variables may contain a long historical rotation of
         # keys.  A startup gate only needs the preferred two plus one
         # fallback; probing every dormant fallback serially behind the
         # per-chain semaphore delayed the scanner by minutes.
-        report = list(await asyncio.gather(*(probe(ep) for ep in self.endpoints[:3])))
+        report = list(await asyncio.gather(
+            *(self._probe_endpoint(ep) for ep in self.endpoints[:3])
+        ))
+        if not any(endpoint.chain_verified for endpoint in self.endpoints):
+            for offset in range(3, len(self.endpoints), 3):
+                group = self.endpoints[offset:offset + 3]
+                report.extend(await asyncio.gather(
+                    *(self._probe_endpoint(endpoint) for endpoint in group)
+                ))
+                if any(endpoint.chain_verified for endpoint in group):
+                    break
         self.preflight_complete = True
         return report
 

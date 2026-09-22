@@ -180,6 +180,97 @@ class MonitoringHelpersTests(unittest.TestCase):
 
 
 class MonitoringAsyncTests(unittest.IsolatedAsyncioTestCase):
+    def _bot_with_store(self, store):
+        service = BotService.__new__(BotService)
+        service.monitor = store
+        return service
+
+    def _add_chain_sample(self, store, **values):
+        values.setdefault("contracts", 0)
+        values.setdefault("direct_deploy", 0)
+        values.setdefault("active_call", 0)
+        values.setdefault("cooldown_sec", 0)
+        values.setdefault("rpc_requests", 0)
+        values.setdefault("rpc_successes", 0)
+        values.setdefault("rpc_errors", 0)
+        store.add_chain_sample(**values)
+
+    async def test_cursor_stall_requires_full_fifteen_minutes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            now = datetime.now(timezone.utc)
+            self._add_chain_sample(
+                store, ts=(now - timedelta(minutes=30)).isoformat(),
+                run_id="previous-run", chain="optimism", role="live",
+                cursor=50, safe_head=80, active_rpc="mainnet.optimism.io",
+            )
+            for age, head in ((300, 100), (0, 120)):
+                self._add_chain_sample(store,
+                    ts=(now - timedelta(seconds=age)).isoformat(),
+                    run_id="current-run",
+                    chain="optimism", role="live", cursor=50, safe_head=head,
+                    active_rpc="mainnet.optimism.io",
+                )
+            self._bot_with_store(store)._evaluate_chain_incidents(now)
+            self.assertIsNone(store.active_incident("cursor:stalled:optimism"))
+            store.close()
+
+    async def test_rpc_none_opens_outage_but_not_cursor_stall(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            now = datetime.now(timezone.utc)
+            for age, head in ((960, 100), (110, 115), (0, 120)):
+                self._add_chain_sample(store,
+                    ts=(now - timedelta(seconds=age)).isoformat(),
+                    chain="optimism", role="live", cursor=50, safe_head=head,
+                    active_rpc="none",
+                )
+            self._bot_with_store(store)._evaluate_chain_incidents(now)
+            self.assertIsNotNone(store.active_incident("rpc:down:optimism"))
+            self.assertIsNone(store.active_incident("cursor:stalled:optimism"))
+            store.close()
+
+    async def test_cursor_recovery_requires_actual_cursor_progress(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            now = datetime.now(timezone.utc)
+            self._add_chain_sample(store,
+                ts=(now - timedelta(minutes=16)).isoformat(),
+                chain="optimism", role="live", cursor=50, safe_head=100,
+                active_rpc="mainnet.optimism.io",
+            )
+            self._add_chain_sample(store,
+                ts=now.isoformat(), chain="optimism", role="live", cursor=50,
+                safe_head=130, active_rpc="mainnet.optimism.io",
+            )
+            service = self._bot_with_store(store)
+            service._evaluate_chain_incidents(now)
+            incident = store.active_incident("cursor:stalled:optimism")
+            self.assertIsNotNone(incident)
+            store.mark_incident_notified(int(incident["id"]), recovery=False)
+
+            # Head stopping and RPC disappearing must not manufacture recovery.
+            self._add_chain_sample(store,
+                ts=(now + timedelta(seconds=10)).isoformat(),
+                chain="optimism", role="live", cursor=50, safe_head=130,
+                active_rpc="none",
+            )
+            service._evaluate_chain_incidents(now + timedelta(seconds=10))
+            self.assertIsNotNone(store.active_incident("cursor:stalled:optimism"))
+            self.assertEqual([], store.pending_incident_notifications())
+
+            self._add_chain_sample(store,
+                ts=(now + timedelta(seconds=20)).isoformat(),
+                chain="optimism", role="live", cursor=51, safe_head=131,
+                active_rpc="mainnet.optimism.io",
+            )
+            service._evaluate_chain_incidents(now + timedelta(seconds=20))
+            self.assertIsNone(store.active_incident("cursor:stalled:optimism"))
+            pending = store.pending_incident_notifications()
+            self.assertEqual(1, len(pending))
+            self.assertIsNotNone(pending[0]["resolved_at"])
+            store.close()
+
     async def test_docker_controller_checks_label_before_lifecycle(self):
         calls = []
         async def handler(request: httpx.Request) -> httpx.Response:

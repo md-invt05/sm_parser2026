@@ -414,6 +414,15 @@ class MonitorStore:
             self.conn.execute("UPDATE incidents SET resolved_at=? WHERE id=?", (now, row["id"]))
             return int(row["id"])
 
+    def active_incident(self, fingerprint: str) -> sqlite3.Row | None:
+        """Return the current incident so recovery can use its opening state."""
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM incidents WHERE fingerprint=? AND resolved_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+
     def pending_incident_notifications(self) -> list[sqlite3.Row]:
         with self._lock:
             return list(self.conn.execute(

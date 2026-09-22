@@ -212,6 +212,92 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("wrong_chain", report[0]["error"])
         self.assertIsNotNone(pool.endpoints[0].permanent_error)
 
+    async def test_preflight_continues_past_first_three_until_fallback_works(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host != "fallback.g.alchemy.com":
+                return httpx.Response(503, text="temporarily unavailable")
+            payload = __import__("json").loads(request.content)
+            if isinstance(payload, list):
+                return httpx.Response(200, json=[
+                    {"jsonrpc": "2.0", "id": item["id"], "result":
+                     "0xa" if item["method"] == "eth_chainId" else "0x100"}
+                    for item in payload
+                ])
+            value = "0xa" if payload["method"] == "eth_chainId" else "0x100"
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": value}
+            )
+
+        cfg = replace(
+            scan_defi.load_config(ROOT / "config.yaml"),
+            rpc_concurrency=3, cooldown_min_sec=1, max_retries=1,
+        )
+        pool = scan_defi.RpcPool(
+            "optimism",
+            [
+                "https://one.g.alchemy.com/v2/key",
+                "https://two.g.alchemy.com/v2/key",
+                "https://three.g.alchemy.com/v2/key",
+                "https://fallback.g.alchemy.com/v2/key",
+            ],
+            cfg, expected_chain_id=10, transport=httpx.MockTransport(handler),
+        )
+        async with pool:
+            report = await pool.preflight()
+        self.assertEqual(4, len(report))
+        self.assertFalse(any(row.get("ok") for row in report[:3]))
+        self.assertTrue(report[3]["ok"])
+        self.assertTrue(pool.endpoints[3].chain_verified)
+        self.assertEqual("fallback.g.alchemy.com", pool.active_endpoint())
+
+    async def test_unverified_fallback_is_lazily_promoted_once(self):
+        fallback_chain_probes = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal fallback_chain_probes
+            payload = __import__("json").loads(request.content)
+            host = request.url.host
+            if host in {"two.g.alchemy.com", "three.g.alchemy.com"}:
+                return httpx.Response(401, text="API key required")
+            if isinstance(payload, list):
+                return httpx.Response(200, json=[
+                    {"jsonrpc": "2.0", "id": item["id"], "result":
+                     "0xa" if item["method"] == "eth_chainId" else "0x101"}
+                    for item in payload
+                ])
+            if host == "fallback.g.alchemy.com" and payload["method"] == "eth_chainId":
+                fallback_chain_probes += 1
+            value = "0xa" if payload["method"] == "eth_chainId" else "0x101"
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": value}
+            )
+
+        cfg = replace(
+            scan_defi.load_config(ROOT / "config.yaml"),
+            rpc_concurrency=3, cooldown_min_sec=1, max_retries=1,
+        )
+        pool = scan_defi.RpcPool(
+            "optimism",
+            [
+                "https://primary.g.alchemy.com/v2/key",
+                "https://two.g.alchemy.com/v2/key",
+                "https://three.g.alchemy.com/v2/key",
+                "https://fallback.g.alchemy.com/v2/key",
+            ],
+            cfg, expected_chain_id=10, transport=httpx.MockTransport(handler),
+        )
+        async with pool:
+            await pool.preflight()
+            self.assertFalse(pool.endpoints[3].chain_verified)
+            pool.endpoints[0].disable("test primary outage")
+            results = await asyncio.gather(
+                pool.call("eth_blockNumber", []),
+                pool.call("eth_blockNumber", []),
+            )
+        self.assertEqual(["0x101", "0x101"], results)
+        self.assertTrue(pool.endpoints[3].chain_verified)
+        self.assertEqual(1, fallback_chain_probes)
+
     async def test_malformed_json_switches_endpoint(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.host == "broken.invalid":
