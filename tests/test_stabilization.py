@@ -113,6 +113,11 @@ def test_reviewed_token_policy_can_explicitly_include_large_asset(tmp_path):
 def test_historical_token_revaluation_is_idempotent(tmp_path):
     db = scanner.DB(tmp_path / "old.db")
     huge = 10**150
+    with db.conn:
+        db.conn.execute(
+            "INSERT INTO contracts(chain,address,first_seen_at) VALUES(?,?,?)",
+            ("bsc", ADDRESS, "2026-09-01T00:00:00+00:00"),
+        )
     scan_id = db.save_address_scan(
         ADDRESS, "qualifying", huge, 1, 20,
         [{"chain": "bsc", "has_code": 1, "status": "complete",
@@ -131,6 +136,11 @@ def test_historical_token_revaluation_is_idempotent(tmp_path):
     assert row["status"] == "incomplete" and row["total_usd"] == 0
     assert token["raw_amount"] == str(10**30)
     assert token["valuation_status"] == "anomalous_balance"
+    contract = db.conn.execute(
+        "SELECT last_status,last_total_usd FROM contracts WHERE chain='bsc' AND address=?",
+        (ADDRESS,),
+    ).fetchone()
+    assert contract["last_status"] == "incomplete" and contract["last_total_usd"] == 0
     db.close()
 
 

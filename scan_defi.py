@@ -434,6 +434,7 @@ CREATE TABLE IF NOT EXISTS scan_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_contracts_check ON contracts(chain, last_checked_at);
+CREATE INDEX IF NOT EXISTS idx_contracts_address ON contracts(address);
 CREATE INDEX IF NOT EXISTS idx_scans_addr ON scans(chain, address, scanned_at);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -491,6 +492,8 @@ CREATE INDEX IF NOT EXISTS idx_contract_tokens_holder
     ON contract_tokens(chain, contract);
 CREATE INDEX IF NOT EXISTS idx_address_scans_latest
     ON address_scans(address, scanned_at);
+CREATE INDEX IF NOT EXISTS idx_address_scans_latest_id
+    ON address_scans(address, id);
 
 CREATE TABLE IF NOT EXISTS rabby_estimates (
     address          TEXT PRIMARY KEY,
@@ -582,6 +585,8 @@ CREATE TABLE IF NOT EXISTS address_token_state (
     valuation_status TEXT NOT NULL DEFAULT 'included',
     PRIMARY KEY (address, chain, token)
 );
+CREATE INDEX IF NOT EXISTS idx_address_token_state_valuation
+    ON address_token_state(valuation_status, usd_value);
 
 CREATE TABLE IF NOT EXISTS asset_valuation_policies (
     chain            TEXT NOT NULL,
@@ -685,6 +690,10 @@ class DB:
             self.conn.execute(
                 "ALTER TABLE address_token_scans ADD COLUMN valuation_status TEXT NOT NULL DEFAULT 'included'"
             )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_address_token_scans_valuation "
+            "ON address_token_scans(valuation_status, usd_value)"
+        )
         self.conn.execute(
             """
             INSERT OR IGNORE INTO contract_discoveries(
@@ -820,6 +829,14 @@ class DB:
                     "UPDATE address_scans SET total_usd=?,status=?,note=TRIM(COALESCE(note,'') || ', system_balance_excluded',', ') WHERE id=?",
                     (total, status, scan_id),
                 )
+                scan = self.conn.execute(
+                    "SELECT address FROM address_scans WHERE id=?", (scan_id,)
+                ).fetchone()
+                if scan is not None:
+                    self.conn.execute(
+                        "UPDATE contracts SET last_status=?,last_total_usd=? WHERE address=?",
+                        (status, total, str(scan["address"]).lower()),
+                    )
             if touched:
                 self._bump_revision_locked()
             return len(touched)
@@ -930,6 +947,14 @@ class DB:
                     "COALESCE(note,'') || ', token_balance_quarantined',', ') WHERE id=?",
                     (total, status, scan_id),
                 )
+                scan = self.conn.execute(
+                    "SELECT address FROM address_scans WHERE id=?", (scan_id,)
+                ).fetchone()
+                if scan is not None:
+                    self.conn.execute(
+                        "UPDATE contracts SET last_status=?,last_total_usd=? WHERE address=?",
+                        (status, total, str(scan["address"]).lower()),
+                    )
             for address, chain in touched_state:
                 tokens_usd = float(self.conn.execute(
                     "SELECT COALESCE(SUM(usd_value),0) FROM address_token_state "
@@ -970,29 +995,38 @@ class DB:
         changed = 0
         with self._lock, self.conn:
             latest = self.conn.execute(
-                """SELECT a.* FROM address_scans a WHERE a.id=(
-                     SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
-                     ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
+                """WITH latest_ids AS (
+                       SELECT address,MAX(id) AS id FROM address_scans GROUP BY address
+                     )
+                     SELECT a.id,a.address,a.total_usd,a.status,
+                            COUNT(c.chain) AS part_count,
+                            SUM(CASE WHEN c.status NOT IN ('complete','absent')
+                                     THEN 1 ELSE 0 END) AS incomplete_parts
+                     FROM latest_ids l JOIN address_scans a ON a.id=l.id
+                     LEFT JOIN address_chain_scans c ON c.scan_id=a.id
+                     GROUP BY a.id,a.address,a.total_usd,a.status"""
             ).fetchall()
+            scan_updates: list[tuple[str, int]] = []
+            contract_updates: list[tuple[str, float, str]] = []
             for scan in latest:
-                parts = self.conn.execute(
-                    "SELECT status FROM address_chain_scans WHERE scan_id=?", (scan["id"],)
-                ).fetchall()
                 total = float(scan["total_usd"] or 0.0)
                 status = (
                     "qualifying" if total >= min_usd
-                    else "below" if parts and all(
-                        row["status"] in ("complete", "absent") for row in parts
-                    ) else "incomplete"
+                    else "below" if int(scan["part_count"] or 0) > 0
+                    and int(scan["incomplete_parts"] or 0) == 0 else "incomplete"
                 )
                 if status != scan["status"]:
-                    self.conn.execute(
-                        "UPDATE address_scans SET status=? WHERE id=?", (status, scan["id"])
-                    )
+                    scan_updates.append((status, int(scan["id"])))
                     changed += 1
-                self.conn.execute(
-                    "UPDATE contracts SET last_status=?,last_total_usd=? WHERE lower(address)=?",
-                    (status, total, scan["address"].lower()),
+                contract_updates.append((status, total, str(scan["address"]).lower()))
+            if scan_updates:
+                self.conn.executemany(
+                    "UPDATE address_scans SET status=? WHERE id=?", scan_updates
+                )
+            if contract_updates:
+                self.conn.executemany(
+                    "UPDATE contracts SET last_status=?,last_total_usd=? WHERE address=?",
+                    contract_updates,
                 )
             if changed:
                 self._bump_revision_locked()
@@ -5293,9 +5327,9 @@ async def run(args: argparse.Namespace) -> None:
     sui_revalued = sui_store.revalue_suspicious_projects(sui_cfg.tvl_anomaly_usd)
     if sui_revalued:
         log.info("quarantined %s historical Sui project valuations", sui_revalued)
-    reclassified = db.reclassify_latest_scans(cfg.min_usd)
-    if reclassified:
-        log.info("reclassified %s latest scans at threshold $%s", reclassified, cfg.min_usd)
+    # Both historical revaluation paths update their affected scans and contracts
+    # themselves. Reclassifying every latest scan here turns startup into an
+    # O(addresses × contracts) SQLite workload on a long-running instance.
     seed_tokens(db, load_token_seed(ROOT / "tokens.yaml"), list(balance_chains))
     cfg.export_dir.mkdir(parents=True, exist_ok=True)
     export_lock = asyncio.Lock()
