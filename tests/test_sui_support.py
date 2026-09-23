@@ -190,6 +190,26 @@ def test_blockberry_429_retries_without_leaking_key():
     assert calls == 3
 
 
+def test_blockberry_preflight_skips_non_object_transaction_rows():
+    async def run():
+        client = BlockberryClient("secret", SuiConfig(max_retries=1))
+
+        async def transactions(_page, _size):
+            return {"content": [None, "temporary-index-item", {"checkpoint": "123"}]}
+
+        async def dex_page(_page, _size):
+            return {"content": []}
+
+        client.transactions = transactions
+        client._dex_page = dex_page
+        report = await client.preflight()
+        assert report["ok"] is True
+        assert report["head"] == 123
+        assert report["discovery_ok"] is True
+
+    asyncio.run(run())
+
+
 def test_blockberry_dex_contract_and_pagination():
     requests = []
 

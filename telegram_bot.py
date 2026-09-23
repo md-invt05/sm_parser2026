@@ -908,8 +908,15 @@ class BotService:
                 and int(row["safe_head"] or 0) > int(baseline["safe_head"] or 0)
                 and timestamp_span(baseline["ts"], row["ts"]) >= 900
             )
+            # In steady critical-drain mode a network can be intentionally
+            # waiting for a fair live slot.  That is backlog pressure, not a
+            # broken RPC/indexer; opening a critical cursor incident here only
+            # creates noise.  A worker that owns a range remains eligible for
+            # the watchdog/stall alert.
+            worker = self.monitor.discovery_worker(row["chain"], "live")
+            waiting_for_slot = worker is not None and worker["stage"] == "queued"
+            stalled = stalled and not waiting_for_slot
             if stalled:
-                worker = self.monitor.discovery_worker(row["chain"], "live")
                 worker_details = dict(worker) if worker is not None else {}
                 self.monitor.open_incident(
                     fingerprint, "critical", "cursor_stall",

@@ -1409,8 +1409,12 @@ class DB:
                     SELECT 1 FROM address_chain_state s
                     WHERE s.address=lower(c.address) AND s.next_retry_at<=?
                 )
-                ORDER BY MIN(c.last_checked_at IS NOT NULL), MIN(COALESCE(c.last_checked_at,'')),
-                         lower(c.address)
+                -- New addresses must be drained in discovery order.  Sorting
+                -- them lexicographically by address made the oldest pending
+                -- item age forever even while the worker was busy.
+                ORDER BY MIN(c.last_checked_at IS NOT NULL),
+                         MIN(COALESCE(c.first_seen_at,'')),
+                         MIN(COALESCE(c.last_checked_at,'')), lower(c.address)
                 LIMIT ?
                 """,
                 (now_iso, limit),
@@ -5061,6 +5065,11 @@ async def run(args: argparse.Namespace) -> None:
     run_id = None if args.rpc_check else monitor.begin_run(
         mode, cfg.min_usd, profile, vars(args)
     )
+    # A container replacement can interrupt an XLSX run after it has set this
+    # flag.  There is no exporter process to resume on a fresh scanner run;
+    # leave an accurate status until the next scheduled/on-demand export.
+    if run_id is not None:
+        monitor.set_setting("exporter_state", "idle")
     global_rpc_sem = RoleRpcLimiter(
         cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency
     )

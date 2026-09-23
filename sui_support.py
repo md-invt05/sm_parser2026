@@ -450,8 +450,17 @@ class BlockberryClient:
 
     async def preflight(self) -> dict[str, Any]:
         page = await self.transactions(0, 1)
-        rows = page["content"]
-        head = int(rows[0].get("checkpoint") or 0) if rows else 0
+        # Blockberry's indexed feed can occasionally include a non-object
+        # placeholder in ``content``.  Discovery itself already skips such
+        # records, so preflight must do the same instead of turning one bad
+        # item into a TypeError that disables the whole Sui worker.
+        rows = [row for row in page["content"] if isinstance(row, dict)]
+        head = 0
+        for row in rows:
+            try:
+                head = max(head, int(row.get("checkpoint") or 0))
+            except (TypeError, ValueError):
+                continue
         defi_ok = False
         defi_error: str | None = None
         try:

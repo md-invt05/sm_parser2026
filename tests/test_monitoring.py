@@ -272,6 +272,21 @@ class MonitoringAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(store.active_incident("cursor:stalled:optimism"))
             store.close()
 
+    async def test_queued_live_worker_does_not_open_cursor_stall(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            now = datetime.now(timezone.utc)
+            store.set_discovery_worker("optimism", "live", "queued", 100, 101)
+            for age, head in ((960, 100), (0, 130)):
+                self._add_chain_sample(
+                    store, ts=(now - timedelta(seconds=age)).isoformat(),
+                    chain="optimism", role="live", cursor=50, safe_head=head,
+                    active_rpc="mainnet.optimism.io",
+                )
+            self._bot_with_store(store)._evaluate_chain_incidents(now)
+            self.assertIsNone(store.active_incident("cursor:stalled:optimism"))
+            store.close()
+
     async def test_cursor_recovery_requires_actual_cursor_progress(self):
         with tempfile.TemporaryDirectory() as folder:
             store = MonitorStore(Path(folder) / "monitoring.db")
