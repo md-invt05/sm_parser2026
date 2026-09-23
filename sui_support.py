@@ -16,6 +16,7 @@ import random
 import sqlite3
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -195,6 +196,23 @@ class BlockberryError(RuntimeError):
         self.endpoint = endpoint
 
 
+@asynccontextmanager
+async def _global_request_slot(limiter: Any):
+    """Accept an asyncio semaphore or the scanner's role-aware limiter.
+
+    Sui requests are balance/enrichment work, so RoleRpcLimiter.slot() assigns
+    them to the balance budget. Keeping this adapter here avoids importing the
+    EVM scanner module and creating a circular dependency.
+    """
+    slot = getattr(limiter, "slot", None)
+    if callable(slot):
+        async with slot():
+            yield
+        return
+    async with limiter:
+        yield
+
+
 class BlockberryClient:
     """Small, rate-limit-aware client. URLs/keys are never included in logs."""
 
@@ -245,7 +263,7 @@ class BlockberryClient:
                     if delay:
                         await asyncio.sleep(delay)
                     self._next_request_at = time.monotonic() + 1.0 / self.cfg.requests_per_second
-                async with self.global_sem, self.network_sem:
+                async with _global_request_slot(self.global_sem), self.network_sem:
                     response = await self.client.request(method, path, **kwargs)
                 latency = (time.perf_counter() - started) * 1000
                 if response.status_code in (401, 403):
@@ -408,7 +426,7 @@ class BlockberryClient:
         normalized = normalize_sui_id(object_id)
         for index, url in enumerate(self.fallback_urls):
             try:
-                async with self.global_sem, self.network_sem:
+                async with _global_request_slot(self.global_sem), self.network_sem:
                     response = await self.fallback_client.post(url, json={
                         "jsonrpc": "2.0", "id": index + 501,
                         "method": "sui_getObject",
@@ -431,7 +449,7 @@ class BlockberryClient:
         for index, url in enumerate(self.fallback_urls):
             started = time.perf_counter()
             try:
-                async with self.global_sem, self.network_sem:
+                async with _global_request_slot(self.global_sem), self.network_sem:
                     response = await self.fallback_client.post(url, json={
                         "jsonrpc": "2.0", "id": index + 1,
                         "method": "suix_getAllBalances", "params": [owner],
@@ -1231,7 +1249,8 @@ async def enrich_sui_once(store: SuiStore, client: BlockberryClient, cfg: SuiCon
             enriched += 1
         except (BlockberryError, ValueError, TypeError, KeyError) as exc:
             store.defer_enrichment(row["digest"], type(exc).__name__)
-            log.warning("[sui/enrichment] deferred %s: %s", row["digest"][:12], type(exc).__name__)
+            log.warning("[sui/enrichment] deferred %s: %s: %s", row["digest"][:12],
+                        type(exc).__name__, str(exc)[:160])
     if enriched:
         store.mark_dirty()
     return enriched
@@ -1417,7 +1436,7 @@ async def sui_balance_loop(
         except Exception as exc:
             failures += 1
             delay = min(cfg.defi_sync_sec, max(30, 30 * (2 ** min(failures - 1, 5))))
-            note = f"Sui balance sync failed: {type(exc).__name__}"
+            note = f"Sui balance sync failed: {type(exc).__name__}: {str(exc)[:160]}"
             store.mark_defi_sync_failed(note)
             log.warning("[sui/balances] %s; retry in %ss", note, delay)
             if once:

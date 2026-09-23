@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -499,3 +500,32 @@ def test_alchemy_balance_fallback_stays_unpriced_and_gets_no_blockberry_key():
 
     asyncio.run(run())
     assert "x-api-key" not in fallback_headers[0]
+
+
+def test_blockberry_uses_role_limiter_slot_for_sui_requests():
+    class RoleLimiter:
+        def __init__(self):
+            self.entered = 0
+
+        @asynccontextmanager
+        async def slot(self):
+            self.entered += 1
+            yield
+
+    async def run():
+        limiter = RoleLimiter()
+        client = BlockberryClient("test-key", SuiConfig(max_retries=1), limiter)
+        client.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"content": []})
+            ),
+            base_url="https://blockberry.invalid",
+        )
+        try:
+            page = await client.transactions(0, 1)
+            assert page == {"content": []}
+            assert limiter.entered == 1
+        finally:
+            await client.client.aclose()
+
+    asyncio.run(run())
