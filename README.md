@@ -181,6 +181,11 @@ Discovery scheduling is profile-driven: `conservative/low=4 live + 1 backfill`,
 FIFO starvation guard; backfill uses its own FIFO queue. Current queue/slot data
 is visible in `/status` and `logs/status.txt`.
 
+For continuous server operation use `/load steady`. It splits the ten-request RPC
+budget into discovery `4` and balances `6`, pauses backfill under queue pressure,
+and reduces live slots to `3` or `2` until the backlog recovers. Discovery ranges
+have a 180-second watchdog and retain their cursor on timeout.
+
 Основные настройки: `balance_concurrency`, `balance_chain_concurrency`,
 `balance_chain_timeout_sec`, `balance_address_timeout_sec`, `balance_retry_sec`,
 `discover_tx_to_contracts`, `code_cache_ttl_sec`, `rabby_fallback`,

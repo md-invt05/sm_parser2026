@@ -296,10 +296,12 @@ class ReportBuilder:
             f"Uptime: {human_duration(uptime)} | профиль: {runtime['load_profile']} | порог: ${float(runtime['min_usd'] or 0):,.0f}",
         ]
         lines.append(f"Exporter: {self.monitor.setting('exporter_state', 'idle')}")
+        runtime_note: dict[str, Any] = {}
         try:
             runtime_note = json.loads(runtime["note"] or "{}")
             scheduler = runtime_note.get("discovery_scheduler") or {}
         except (TypeError, ValueError, json.JSONDecodeError):
+            runtime_note = {}
             scheduler = {}
         if scheduler:
             lines.append(
@@ -310,6 +312,17 @@ class ReportBuilder:
                 f"backfill {scheduler.get('backfill_active', 0)}/{scheduler.get('backfill_slots', 0)}, "
                 f"wait {scheduler.get('backfill_waiting', 0)}, "
                 f"max {float(scheduler.get('backfill_max_wait_sec', 0)):.0f}s"
+            )
+        governor = runtime_note.get("load_governor") or {} if isinstance(runtime_note, dict) else {}
+        budgets = runtime_note.get("rpc_budgets") or {} if isinstance(runtime_note, dict) else {}
+        if governor:
+            lines.append(
+                f"Governor: {governor.get('state', 'unknown')} | {governor.get('reason', '')}"
+            )
+        if budgets:
+            lines.append(
+                f"RPC budget: discovery {budgets.get('discovery_limit', 0)}, "
+                f"balances {budgets.get('balance_limit', 0)}, total {budgets.get('total_limit', 0)}"
             )
         if aggregate:
             lines.append(
@@ -395,10 +408,20 @@ class ReportBuilder:
             return "Сетевых срезов пока нет."
         lines = ["Состояние сетей (discovery/balance):"]
         for row in rows:
+            worker = self.monitor.discovery_worker(row["chain"], row["role"])
+            worker_text = ""
+            if worker is not None and row["role"] in {"live", "backfill"}:
+                started = iso_to_dt(worker["started_at"])
+                age = (datetime.now(UTC) - started).total_seconds() if started else None
+                worker_text = (
+                    f"; worker {worker['stage']} {worker['range_start']}-{worker['range_end']} "
+                    f"age {human_duration(age)}, failures {worker['failures']}"
+                )
             lines.append(
                 f"• {row['chain']} [{row['role']}]: cursor {row['cursor']}, head {row['safe_head']}, lag {row['lag']}; "
                 f"RPC {row['active_rpc']}; cooldown {float(row['cooldown_sec'] or 0):.0f}s; "
                 f"p50/p95 {float(row['latency_p50_ms'] or 0):.0f}/{float(row['latency_p95_ms'] or 0):.0f}ms"
+                f"{worker_text}"
             )
         try:
             with sqlite3.connect(self.contracts_db, timeout=5) as conn:
@@ -614,7 +637,27 @@ class BotService:
                 "sui_qualifying|sui_below|sui_incomplete|sui_packages"
             )
             return
+        if key not in {"qualifying", "sui_qualifying"}:
+            await update.message.reply_text("Обновляю полный комплект отчётов…")
+            request_id = self.monitor.request_control(
+                "export", str(update.effective_chat.id), {"requested_file": key},
+            )
+            completed = await self.wait_control(request_id, 300)
+            if not completed:
+                await update.message.reply_text(
+                    "Экспорт ещё выполняется; файл можно запросить повторно позже."
+                )
+                return
         await self.send_file(update.effective_chat.id, ROOT / "reports" / mapping[key], context.bot)
+
+    async def wait_control(self, request_id: int, timeout_sec: float) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            row = self.monitor.control_request(request_id)
+            if row is not None and row["status"] != "pending":
+                return row["status"] == "complete"
+            await asyncio.sleep(1)
+        return False
 
     async def send_file(self, chat_id: int, path: Path, bot: Any) -> None:
         if not path.exists():
@@ -664,7 +707,7 @@ class BotService:
             return
         profile = context.args[0].lower()
         if profile not in LOAD_PROFILES:
-            await update.message.reply_text("Разрешены только conservative, low, normal, high.")
+            await update.message.reply_text("Разрешены только conservative, low, steady, normal, high.")
             return
         await self.ask_confirmation(update, "load", {"profile": profile}, f"Переключить профиль на {profile} и перезапустить scanner?")
 
@@ -744,7 +787,7 @@ class BotService:
             "/status\n/report 1h|6h|24h|7d\n/networks\n/resources 1h|6h|24h\n"
             "/errors 1h|6h|24h\n/files\n"
             "/file qualifying|below|incomplete|sui_qualifying|sui_below|sui_incomplete|sui_packages\n"
-            "/schedule 30m|1h|6h|12h|24h\n/load [conservative|low|normal|high]\n"
+            "/schedule 30m|1h|6h|12h|24h\n/load [conservative|low|steady|normal|high]\n"
             "/start /stop /restart\n/pause /resume\n/export /backup\n/history"
         )
 
@@ -753,9 +796,21 @@ class BotService:
             interval = int(self.monitor.setting("report_interval_sec", "21600") or 21600)
             last = float(self.monitor.setting("last_scheduled_report_at", "0") or 0)
             if time.time() - last >= interval:
+                export_id = self.monitor.request_control(
+                    "export_qualifying", "scheduled-report"
+                )
+                fresh = await self.wait_control(export_id, 60)
                 for chat_id in self.allowed_chats:
                     try:
                         await application.bot.send_message(chat_id, self.reporter.report(interval))
+                        if not fresh:
+                            path = ROOT / "reports" / "qualifying.xlsx"
+                            age = time.time() - path.stat().st_mtime if path.exists() else None
+                            await application.bot.send_message(
+                                chat_id,
+                                "Qualifying-export не завершился за 60 секунд; "
+                                f"отправляю предыдущий файл (возраст {human_duration(age)}).",
+                            )
                         await self.send_file(chat_id, ROOT / "reports" / "qualifying.xlsx", application.bot)
                         sui_report = ROOT / "reports" / "sui_qualifying.xlsx"
                         if sui_report.exists():
@@ -854,10 +909,12 @@ class BotService:
                 and timestamp_span(baseline["ts"], row["ts"]) >= 900
             )
             if stalled:
+                worker = self.monitor.discovery_worker(row["chain"], "live")
+                worker_details = dict(worker) if worker is not None else {}
                 self.monitor.open_incident(
                     fingerprint, "critical", "cursor_stall",
                     f"Cursor for {row['chain']} did not move for 15 minutes while head advanced",
-                    details={"opened_cursor": latest_cursor},
+                    details={"opened_cursor": latest_cursor, "worker": worker_details},
                 )
 
     async def evaluate_incidents(self) -> None:
@@ -925,9 +982,49 @@ class BotService:
         self._condition(wal_runaway, "database:wal_growth", "critical", "database_growth", "SQLite WAL grew sharply and exceeds 1 GiB")
 
     async def _evaluate_resource_thresholds(self, now: datetime) -> None:
+        def cpu_state(
+            fingerprint: str, threshold: float, minutes: int,
+            recovery_threshold: float, severity: str, message: str,
+        ) -> bool:
+            opened = self.monitor.active_incident(fingerprint)
+            if opened is None:
+                cutoff = (now - timedelta(minutes=minutes)).isoformat()
+                samples = self.monitor.rows(
+                    "SELECT cpu_percent value,ts FROM resource_samples "
+                    "WHERE ts>=? AND cpu_percent IS NOT NULL ORDER BY ts", (cutoff,),
+                )
+                span = timestamp_span(samples[0]["ts"], samples[-1]["ts"]) if samples else 0
+                if span >= minutes * 60 - 20 and all(
+                    float(sample["value"]) > threshold for sample in samples
+                ):
+                    self.monitor.open_incident(
+                        fingerprint, severity, "system_load", message,
+                    )
+                    return True
+                return False
+            recovery_cutoff = (now - timedelta(minutes=2)).isoformat()
+            recovery = self.monitor.rows(
+                "SELECT cpu_percent value,ts FROM resource_samples "
+                "WHERE ts>=? AND cpu_percent IS NOT NULL ORDER BY ts", (recovery_cutoff,),
+            )
+            span = timestamp_span(recovery[0]["ts"], recovery[-1]["ts"]) if recovery else 0
+            if span >= 100 and all(
+                float(sample["value"]) < recovery_threshold for sample in recovery
+            ):
+                self.monitor.resolve_incident(fingerprint)
+                return False
+            return True
+
+        critical_cpu = cpu_state(
+            "system:cpu:critical", 95, 5, 85, "critical",
+            "CPU above 95% for 5 minutes",
+        )
+        if not critical_cpu:
+            cpu_state(
+                "system:cpu:warning", 80, 10, 70, "warning",
+                "CPU above 80% for 10 minutes",
+            )
         rules = [
-            ("cpu_percent", 80, 10, "warning", "CPU above 80% for 10 minutes", "system:cpu:warning", False),
-            ("cpu_percent", 95, 5, "critical", "CPU above 95% for 5 minutes", "system:cpu:critical", False),
             ("ram_percent", 80, 5, "warning", "RAM above 80% for 5 minutes", "system:ram:warning", False),
             ("ram_percent", 92, 2, "critical", "RAM above 92% for 2 minutes", "system:ram:critical", False),
             ("io_wait_percent", 20, 5, "warning", "I/O wait above 20% for 5 minutes", "system:iowait", False),

@@ -1276,7 +1276,8 @@ async def sui_balance_loop(
 
 
 def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
-                    snapshot: bool = False) -> tuple[Path, Path, Path, Path]:
+                    snapshot: bool = False,
+                    mode: str = "full") -> tuple[Path, Path, Path, Path]:
     export_dir.mkdir(parents=True, exist_ok=True)
     if snapshot:
         folder = export_dir / "archive"
@@ -1310,6 +1311,8 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
         "Provider / notes",
     ]
     for path, status in zip(paths[:3], ("qualifying", "below", "incomplete")):
+        if mode == "qualifying" and status != "qualifying":
+            continue
         wb = Workbook()
         ws = wb.active
         ws.title = "Sui DeFi projects"
@@ -1341,6 +1344,9 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
         temporary = path.with_suffix(".tmp.xlsx")
         wb.save(temporary)
         temporary.replace(path)
+
+    if mode == "qualifying":
+        return paths
 
     technical = Workbook()
     ws = technical.active

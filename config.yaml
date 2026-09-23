@@ -9,6 +9,8 @@ recheck_interval_sec: 86400
 
 # Conservative defaults for public, best-effort RPC endpoints.
 global_rpc_concurrency: 6
+discovery_rpc_concurrency: 3
+balance_rpc_concurrency: 3
 rpc_concurrency: 1
 balance_concurrency: 2
 # Parallel network scans shared by all balance addresses; HTTP still uses 12/2 limits.
@@ -29,6 +31,7 @@ price_batch_size: 20
 # Discovery has independent fair queues; live capacity is intentionally larger.
 discovery_live_slots: 4
 discovery_backfill_slots: 1
+discovery_range_timeout_sec: 180
 http_timeout_sec: 40
 max_retries: 3
 cooldown_min_sec: 30
@@ -38,7 +41,7 @@ adaptive_batch: true
 
 # Structured heartbeat for monitoring.db and Telegram bot.
 heartbeat_sec: 60
-export_every_sec: 1800
+export_every_sec: 21600
 daily_snapshot: true
 task_restart_sec: 20
 run_indexer: true

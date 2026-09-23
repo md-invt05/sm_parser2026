@@ -297,6 +297,14 @@ class RabbyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(0, result["Total USD"])
                 self.assertEqual(600000, result["Rabby estimate USD"])
                 wb.close()
+                paths[1].unlink()
+                paths[2].unlink()
+                qualifying_only = s.export_xlsx(
+                    db, cfg, self.chains, 100000, mode="qualifying"
+                )
+                self.assertTrue(qualifying_only[0].exists())
+                self.assertFalse(qualifying_only[1].exists())
+                self.assertFalse(qualifying_only[2].exists())
         finally:
             db.close()
 

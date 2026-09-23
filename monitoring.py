@@ -41,6 +41,19 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
         "discovery_live_slots": 4,
         "discovery_backfill_slots": 1,
     },
+    "steady": {
+        "global_rpc_concurrency": 10,
+        "discovery_rpc_concurrency": 4,
+        "balance_rpc_concurrency": 6,
+        "rpc_concurrency": 2,
+        "balance_concurrency": 6,
+        "balance_chain_concurrency": 10,
+        "block_batch_size": 6,
+        "receipt_batch_size": 15,
+        "price_batch_size": 30,
+        "discovery_live_slots": 4,
+        "discovery_backfill_slots": 1,
+    },
     "normal": {
         "global_rpc_concurrency": 12,
         "rpc_concurrency": 2,
@@ -64,6 +77,13 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
         "discovery_backfill_slots": 2,
     },
 }
+
+for _profile in LOAD_PROFILES.values():
+    _total = _profile["global_rpc_concurrency"]
+    _profile.setdefault("discovery_rpc_concurrency", max(1, _total // 2))
+    _profile.setdefault(
+        "balance_rpc_concurrency", _total - _profile["discovery_rpc_concurrency"]
+    )
 
 
 MONITORING_SCHEMA = """
@@ -212,6 +232,19 @@ CREATE TABLE IF NOT EXISTS deliveries(
     reference_id TEXT,
     status TEXT NOT NULL,
     error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS discovery_workers(
+    worker_key TEXT PRIMARY KEY,
+    chain TEXT NOT NULL,
+    role TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    range_start INTEGER,
+    range_end INTEGER,
+    started_at TEXT,
+    updated_at TEXT NOT NULL,
+    failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
 );
 """
 
@@ -466,6 +499,45 @@ class MonitorStore:
                 "UPDATE control_requests SET status=?,handled_at=?,result=? WHERE id=?",
                 (status, utc_now(), result[:2000], request_id),
             )
+
+    def control_request(self, request_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM control_requests WHERE id=?", (request_id,)
+            ).fetchone()
+
+    def set_discovery_worker(
+        self, chain: str, role: str, stage: str,
+        range_start: int | None = None, range_end: int | None = None,
+        failures: int = 0, last_error: str | None = None,
+    ) -> None:
+        now = utc_now()
+        key = f"{chain}:{role}"
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO discovery_workers(
+                       worker_key,chain,role,stage,range_start,range_end,started_at,
+                       updated_at,failures,last_error)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(worker_key) DO UPDATE SET
+                       stage=excluded.stage,range_start=excluded.range_start,
+                       range_end=excluded.range_end,
+                       started_at=CASE
+                           WHEN discovery_workers.range_start IS NOT excluded.range_start
+                             OR discovery_workers.range_end IS NOT excluded.range_end
+                           THEN excluded.started_at ELSE discovery_workers.started_at END,
+                       updated_at=excluded.updated_at,failures=excluded.failures,
+                       last_error=excluded.last_error""",
+                (key, chain, role, stage, range_start, range_end, now, now,
+                 failures, last_error),
+            )
+
+    def discovery_worker(self, chain: str, role: str = "live") -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM discovery_workers WHERE worker_key=?",
+                (f"{chain}:{role}",),
+            ).fetchone()
 
     def audit(self, chat_id: str, user_id: str | None, command: str, allowed: bool, result: str = "") -> None:
         with self._lock, self.conn:

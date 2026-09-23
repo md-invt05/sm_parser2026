@@ -21,6 +21,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MonitoringStoreTests(unittest.TestCase):
+    def test_discovery_worker_state_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            store.set_discovery_worker("zksync", "live", "blocks", 100, 105, 1)
+            store.set_discovery_worker(
+                "zksync", "live", "timeout", 100, 105, 2, "blocks exceeded 180s"
+            )
+            row = store.discovery_worker("zksync", "live")
+            self.assertEqual("timeout", row["stage"])
+            self.assertEqual(2, row["failures"])
+            self.assertEqual(1, store.rows(
+                "SELECT COUNT(*) n FROM discovery_workers"
+            )[0]["n"])
+            store.close()
+
     def test_schema_is_idempotent_and_settings_persist(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "monitoring.db"
@@ -119,7 +134,18 @@ class MonitoringHelpersTests(unittest.TestCase):
             LOAD_PROFILES["high"]["discovery_live_slots"],
             LOAD_PROFILES["high"]["discovery_backfill_slots"],
         ))
-        self.assertEqual({"conservative", "low", "normal", "high"}, set(LOAD_PROFILES))
+        self.assertEqual((10, 4, 6, 6, 10, 4, 1), (
+            LOAD_PROFILES["steady"]["global_rpc_concurrency"],
+            LOAD_PROFILES["steady"]["discovery_rpc_concurrency"],
+            LOAD_PROFILES["steady"]["balance_rpc_concurrency"],
+            LOAD_PROFILES["steady"]["balance_concurrency"],
+            LOAD_PROFILES["steady"]["balance_chain_concurrency"],
+            LOAD_PROFILES["steady"]["discovery_live_slots"],
+            LOAD_PROFILES["steady"]["discovery_backfill_slots"],
+        ))
+        self.assertEqual(
+            {"conservative", "low", "steady", "normal", "high"}, set(LOAD_PROFILES)
+        )
 
     def test_period_and_percentile(self):
         self.assertEqual(21600, parse_period("6h"))
@@ -324,6 +350,20 @@ class MonitoringAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT fingerprint FROM incidents WHERE resolved_at IS NULL"
             )}
             self.assertIn("system:cpu:critical", fingerprints)
+            # One cool sample must not flap the incident closed.
+            store.add_resource_sample({
+                "ts": (now + timedelta(seconds=15)).isoformat(),
+                "cpu_percent": 50, "cpu_cores": 4, "load1": 1,
+            })
+            await service._evaluate_resource_thresholds(now + timedelta(seconds=15))
+            self.assertIsNotNone(store.active_incident("system:cpu:critical"))
+            for offset in range(30, 151, 15):
+                store.add_resource_sample({
+                    "ts": (now + timedelta(seconds=offset)).isoformat(),
+                    "cpu_percent": 80, "cpu_cores": 4, "load1": 1,
+                })
+            await service._evaluate_resource_thresholds(now + timedelta(seconds=150))
+            self.assertIsNone(store.active_incident("system:cpu:critical"))
             store.close()
 
     async def test_pause_waits_until_resumed(self):

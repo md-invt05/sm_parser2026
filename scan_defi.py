@@ -148,6 +148,8 @@ class AppCfg:
     monitoring_db_path: Path
     recheck_interval_sec: int
     global_rpc_concurrency: int
+    discovery_rpc_concurrency: int
+    balance_rpc_concurrency: int
     rpc_concurrency: int
     balance_concurrency: int
     balance_chain_concurrency: int
@@ -164,6 +166,7 @@ class AppCfg:
     price_batch_size: int
     discovery_live_slots: int
     discovery_backfill_slots: int
+    discovery_range_timeout_sec: float
     http_timeout_sec: int
     max_retries: int
     cooldown_min_sec: float
@@ -252,6 +255,8 @@ def load_config(path: Path) -> AppCfg:
         monitoring_db_path=(ROOT / raw.get("monitoring_db_path", "data/monitoring.db")).resolve(),
         recheck_interval_sec=int(raw.get("recheck_interval_sec", 86400)),
         global_rpc_concurrency=int(raw.get("global_rpc_concurrency", 12)),
+        discovery_rpc_concurrency=max(1, int(raw.get("discovery_rpc_concurrency", 6))),
+        balance_rpc_concurrency=max(1, int(raw.get("balance_rpc_concurrency", 6))),
         rpc_concurrency=int(raw.get("rpc_concurrency", 2)),
         balance_concurrency=max(1, int(raw.get("balance_concurrency", 8))),
         balance_chain_concurrency=max(1, int(raw.get("balance_chain_concurrency", 12))),
@@ -268,6 +273,9 @@ def load_config(path: Path) -> AppCfg:
         price_batch_size=int(raw.get("price_batch_size", 40)),
         discovery_live_slots=max(1, int(raw.get("discovery_live_slots", 4))),
         discovery_backfill_slots=max(1, int(raw.get("discovery_backfill_slots", 1))),
+        discovery_range_timeout_sec=max(
+            10.0, float(raw.get("discovery_range_timeout_sec", 180))
+        ),
         http_timeout_sec=int(raw.get("http_timeout_sec", 40)),
         max_retries=int(raw.get("max_retries", 8)),
         cooldown_min_sec=float(raw.get("cooldown_min_sec", 5)),
@@ -1782,6 +1790,41 @@ class DB:
                 )
             )
 
+    def latest_export_parts(self) -> tuple[
+        dict[int, list[sqlite3.Row]], dict[int, list[sqlite3.Row]],
+        dict[str, list[sqlite3.Row]], dict[str, sqlite3.Row],
+    ]:
+        latest = """SELECT a.id,a.address FROM address_scans a WHERE a.id=(
+            SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
+            ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
+        with self._lock:
+            chain_rows = self.conn.execute(
+                f"SELECT c.* FROM address_chain_scans c JOIN ({latest}) l ON l.id=c.scan_id "
+                "ORDER BY c.scan_id,c.chain"
+            ).fetchall()
+            token_rows = self.conn.execute(
+                f"SELECT t.* FROM address_token_scans t JOIN ({latest}) l ON l.id=t.scan_id "
+                "WHERE CAST(t.raw_amount AS INTEGER)>0 "
+                "ORDER BY t.scan_id,t.chain,COALESCE(t.usd_value,-1) DESC,t.token"
+            ).fetchall()
+            source_rows = self.conn.execute(
+                f"SELECT l.address,d.chain,d.source,d.observed_block,d.observed_tx,d.actor,d.first_seen_at "
+                f"FROM ({latest}) l JOIN contract_discoveries d ON lower(d.address)=lower(l.address) "
+                "ORDER BY l.address,d.first_seen_at,d.chain,d.source"
+            ).fetchall()
+            estimate_rows = self.conn.execute("SELECT * FROM rabby_estimates").fetchall()
+        chains: dict[int, list[sqlite3.Row]] = {}
+        tokens: dict[int, list[sqlite3.Row]] = {}
+        sources: dict[str, list[sqlite3.Row]] = {}
+        for row in chain_rows:
+            chains.setdefault(int(row["scan_id"]), []).append(row)
+        for row in token_rows:
+            tokens.setdefault(int(row["scan_id"]), []).append(row)
+        for row in source_rows:
+            sources.setdefault(str(row["address"]).lower(), []).append(row)
+        estimates = {str(row["address"]).lower(): row for row in estimate_rows}
+        return chains, tokens, sources, estimates
+
     def aggregate_counts(self) -> dict[str, int]:
         with self._lock:
             rows = self.conn.execute(
@@ -1795,6 +1838,16 @@ class DB:
                 """
             ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
+
+    def sui_enrichment_pending(self) -> int:
+        with self._lock:
+            try:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) FROM sui_seen_transactions WHERE enriched=0"
+                ).fetchone()
+                return int(row[0] or 0)
+            except sqlite3.Error:
+                return 0
 
     def monitoring_snapshot(self, min_usd: float) -> dict[str, Any]:
         """Return one cheap aggregate snapshot for monitoring.db."""
@@ -1999,6 +2052,7 @@ class Endpoint:
                 latency_ms if state.latency_ewma_ms is None
                 else (state.latency_ewma_ms * 0.8 + latency_ms * 0.2)
             )
+
         self.fail_streak = 0
         self.ok_streak += 1
         # cooldown_until is the legacy/global gate; successful calls must not
@@ -2031,6 +2085,29 @@ def rpc_method_group(method: str) -> str:
     return "head"
 
 
+class RoleRpcLimiter:
+    """Split the global RPC budget so balance backlog cannot be starved by discovery."""
+
+    def __init__(self, discovery: int, balance: int):
+        self.discovery_limit = max(1, int(discovery))
+        self.balance_limit = max(1, int(balance))
+        self.discovery = asyncio.Semaphore(self.discovery_limit)
+        self.balance = asyncio.Semaphore(self.balance_limit)
+
+    @asynccontextmanager
+    async def slot(self):
+        semaphore = self.balance if BALANCE_RPC.get() else self.discovery
+        async with semaphore:
+            yield
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "discovery_limit": self.discovery_limit,
+            "balance_limit": self.balance_limit,
+            "total_limit": self.discovery_limit + self.balance_limit,
+        }
+
+
 class RpcPool:
     def __init__(
         self,
@@ -2038,7 +2115,7 @@ class RpcPool:
         urls: list[str],
         cfg: AppCfg,
         expected_chain_id: int | None = None,
-        global_sem: asyncio.Semaphore | None = None,
+        global_sem: asyncio.Semaphore | RoleRpcLimiter | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         health_store: DB | None = None,
     ):
@@ -2058,7 +2135,9 @@ class RpcPool:
         self.timeout = cfg.http_timeout_sec
         self.retries = cfg.max_retries
         self.sem = asyncio.Semaphore(cfg.rpc_concurrency)
-        self.global_sem = global_sem or asyncio.Semaphore(cfg.global_rpc_concurrency)
+        self.global_sem = global_sem or RoleRpcLimiter(
+            cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency
+        )
         self.transport = transport
         self.health_store = health_store
         self.preflight_complete = False
@@ -2083,6 +2162,7 @@ class RpcPool:
         self.metric_latencies_ms: list[float] = []
         self.last_head: int | None = None
         self._batch_successes = {"block": 0, "receipt": 0, "call": 0}
+        self.last_endpoint_by_group: dict[str, Endpoint] = {}
         if health_store is not None:
             persisted = health_store.load_rpc_health(chain)
             by_fp = {endpoint.fingerprint: endpoint for endpoint in self.endpoints}
@@ -2218,6 +2298,7 @@ class RpcPool:
     ) -> Any:
         assert self._client
         started = time.monotonic()
+        self.last_endpoint_by_group[method_group] = ep
         self.metric_requests += 1
         try:
             try:
@@ -2229,7 +2310,12 @@ class RpcPool:
                     ep.next_request_at = time.monotonic() + interval
                 # Queued work for one chain must not reserve global slots.
                 async with self.sem:
-                    async with self.global_sem:
+                    limiter = (
+                        self.global_sem.slot()
+                        if isinstance(self.global_sem, RoleRpcLimiter)
+                        else self.global_sem
+                    )
+                    async with limiter:
                         if BALANCE_RPC.get() and not ep.available(method_group):
                             raise RpcError("cooldown", "endpoint became unavailable while queued")
                         response = await self._client.post(ep.url, json=payload)
@@ -2558,6 +2644,15 @@ class RpcPool:
         )
         return _short_url(ep.url) if ep else "none"
 
+    def force_failover(self, method_group: str, seconds: float = 60.0) -> None:
+        endpoint = self.last_endpoint_by_group.get(method_group)
+        if endpoint is None:
+            return
+        state = endpoint.health(method_group)
+        state.cooldown_until = max(state.cooldown_until, time.time() + max(1.0, seconds))
+        state.last_error = "range_timeout"
+        endpoint.last_error = "range_timeout"
+
     def usable(self) -> bool:
         return any(
             endpoint.permanent_error is None
@@ -2809,8 +2904,17 @@ class DiscoverySlots:
                 )
             return result
 
+    async def set_capacity(self, live: int, backfill: int) -> None:
+        async with self.lock:
+            self.capacity["live"] = max(1, int(live))
+            self.capacity["backfill"] = max(0, int(backfill))
+            self._dispatch_locked()
+
     @asynccontextmanager
-    async def slot(self, role: str, chain: str, lag: int = 0):
+    async def slot(
+        self, role: str, chain: str, lag: int = 0,
+        work_timeout_sec: float | None = None, timeout_handler: Any = None,
+    ):
         if role not in self.capacity:
             raise ValueError(f"unknown discovery role: {role}")
         loop = asyncio.get_running_loop()
@@ -2835,13 +2939,77 @@ class DiscoverySlots:
                 self._dispatch_locked()
             raise
         try:
-            yield
+            try:
+                if work_timeout_sec is None:
+                    yield
+                else:
+                    async with asyncio.timeout(work_timeout_sec):
+                        yield
+            except TimeoutError:
+                if timeout_handler is not None:
+                    result = timeout_handler()
+                    if hasattr(result, "__await__"):
+                        await result
         finally:
             async with self.lock:
                 if ticket.granted:
                     ticket.granted = False
                     self.active[role] -= 1
                 self._dispatch_locked()
+
+
+class LoadGovernor:
+    """Hysteretic backpressure for the steady server profile."""
+
+    def __init__(self, enabled: bool, base_live: int, base_backfill: int):
+        self.enabled = enabled
+        self.base_live = base_live
+        self.base_backfill = base_backfill
+        self.state = "normal"
+        self.reason = "profile limits"
+        self.recovery_since: float | None = None
+
+    def evaluate(
+        self, pending: int, oldest_sec: float, live_wait_sec: float,
+        now: float | None = None, sui_pending: int = 0,
+    ) -> tuple[int, int]:
+        now = time.monotonic() if now is None else now
+        if not self.enabled:
+            self.state, self.reason, self.recovery_since = "normal", "profile limits", None
+            return self.base_live, self.base_backfill
+        combined_pending = pending + sui_pending
+        critical = combined_pending >= 20_000 or oldest_sec >= 21_600
+        drain = combined_pending >= 5_000 or oldest_sec >= 3_600 or live_wait_sec >= 30
+        if critical:
+            self.state, self.recovery_since = "critical_drain", None
+        elif self.state == "critical_drain":
+            recovered = combined_pending < 15_000 and oldest_sec < 14_400
+            self.recovery_since = now if recovered and self.recovery_since is None else self.recovery_since
+            if not recovered:
+                self.recovery_since = None
+            elif now - self.recovery_since >= 600:
+                self.state, self.recovery_since = "drain", None
+        elif drain:
+            self.state, self.recovery_since = "drain", None
+        elif self.state == "drain":
+            recovered = combined_pending < 2_000 and oldest_sec < 1_800 and live_wait_sec < 15
+            self.recovery_since = now if recovered and self.recovery_since is None else self.recovery_since
+            if not recovered:
+                self.recovery_since = None
+            elif now - self.recovery_since >= 600:
+                self.state, self.recovery_since = "normal", None
+        self.reason = (
+            f"pending={pending}+sui:{sui_pending}, oldest={oldest_sec:.0f}s, "
+            f"live_wait={live_wait_sec:.0f}s"
+        )
+        if self.state == "critical_drain":
+            return min(self.base_live, 2), 0
+        if self.state == "drain":
+            return min(self.base_live, 3), 0
+        return self.base_live, self.base_backfill
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"state": self.state, "reason": self.reason, "enabled": self.enabled}
 
 
 async def collect_tx_to_contracts(
@@ -3074,12 +3242,45 @@ async def index_chain_cursor(
                 pass
             continue
         end = min(target, start + max(1, rpc.block_batch) - 1)
-        async with slots.slot(role, chain.key, max(0, target - start + 1)):
+        stage = "queued"
+
+        def update_stage(value: str, error: str | None = None) -> None:
+            nonlocal stage
+            stage = value
+            if monitor is not None:
+                monitor.set_discovery_worker(
+                    chain.key, role, value, start, end, failures, error,
+                )
+
+        async def range_timeout() -> None:
+            nonlocal failures
+            failures += 1
+            rpc.shrink_batch("block")
+            failed_stage = stage
+            method_group = {
+                "blocks": "blocks", "receipts": "receipts", "code": "code",
+                "logs": "logs", "commit": "blocks",
+            }.get(failed_stage, "blocks")
+            rpc.force_failover(method_group, 60 if failures < 2 else 300)
+            update_stage(
+                "timeout", f"{failed_stage} exceeded {cfg.discovery_range_timeout_sec:.0f}s"
+            )
+            log.warning(
+                "[%s/%s] range %s-%s timed out at %s; cursor unchanged",
+                chain.key, role, start, end, failed_stage,
+            )
+
+        update_stage("queued")
+        async with slots.slot(
+            role, chain.key, max(0, target - start + 1),
+            cfg.discovery_range_timeout_sec, range_timeout,
+        ):
             if stop.is_set():
                 return
             if monitor is not None and monitor.setting("scanner_paused", "0") == "1":
                 continue
             try:
+                update_stage("blocks")
                 numbers = list(range(start, end + 1))
                 blocks = await rpc.batch([
                     ("eth_getBlockByNumber", [hex(number), True]) for number in numbers
@@ -3100,6 +3301,7 @@ async def index_chain_cursor(
                             if address is not None and address not in known_active_calls:
                                 candidates.setdefault(address, (tx, number))
                 receipts: list[dict[str, Any]] = []
+                update_stage("receipts")
                 for offset in range(0, len(deployments), max(1, rpc.receipt_batch)):
                     chunk = deployments[offset:offset + max(1, rpc.receipt_batch)]
                     part = await rpc.batch([
@@ -3132,6 +3334,7 @@ async def index_chain_cursor(
                 found_active: set[str] = set()
                 code_checked = 0
                 if cfg.discover_tx_to_contracts:
+                    update_stage("code")
                     (active_contracts, active_discoveries, cache_rows,
                      found_active, code_checked) = await collect_tx_to_contracts(
                         db, chain, rpc, cfg, candidates, known_contracts,
@@ -3143,9 +3346,11 @@ async def index_chain_cursor(
                 tokens: list[tuple[Any, ...]] = []
                 relations: list[tuple[Any, ...]] = []
                 if cfg.discover_tokens_from_transfers:
+                    update_stage("logs")
                     tokens, relations = await collect_transfers(
                         chain, rpc, start, end, known_contracts | range_contracts,
                     )
+                update_stage("commit")
                 inserted, source_inserted = db.commit_index_range(
                     chain.key, role, end, [*direct_contracts, *active_contracts],
                     [*direct_discoveries, *active_discoveries], cache_rows,
@@ -3154,6 +3359,7 @@ async def index_chain_cursor(
                 known_contracts.update(range_contracts)
                 known_active_calls.update(found_active)
                 failures = 0
+                update_stage("idle")
                 rpc.grow_batch("block")
                 log.info(
                     "[%s/%s] idx %s..%s head=%s new=%s sources=%s code=%s",
@@ -3162,12 +3368,28 @@ async def index_chain_cursor(
             except Exception as exc:
                 failures += 1
                 rpc.shrink_batch("block")
+                if failures >= 2:
+                    method_group = {
+                        "blocks": "blocks", "receipts": "receipts", "code": "code",
+                        "logs": "logs", "commit": "blocks",
+                    }.get(stage, "blocks")
+                    rpc.force_failover(method_group, 300)
+                update_stage(
+                    "error", exc.kind if isinstance(exc, RpcError) else type(exc).__name__,
+                )
                 log.warning(
                     "[%s/%s] range %s-%s not committed: %s",
                     chain.key, role, start, end,
                     exc.kind if isinstance(exc, RpcError) else type(exc).__name__,
                 )
-                await asyncio.sleep(min(120, cfg.cooldown_min_sec * max(1, failures)))
+        if failures and not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=min(120, cfg.cooldown_min_sec * max(1, failures)),
+                )
+            except asyncio.TimeoutError:
+                pass
 
 
 async def index_chain(
@@ -4083,6 +4305,7 @@ def export_xlsx(
     chains: dict[str, ChainCfg],
     min_usd: float,
     snapshot: bool = False,
+    mode: str = "full",
 ) -> tuple[Path, Path, Path]:
     cfg.export_dir.mkdir(parents=True, exist_ok=True)
     if snapshot:
@@ -4124,10 +4347,12 @@ def export_xlsx(
         "Rabby notes",
     ]
 
+    chain_map, token_map, source_map, estimate_map = db.latest_export_parts()
+
     def prepared(row: sqlite3.Row) -> list[Any]:
-        chain_parts = db.address_scan_chains(row["id"])
-        token_parts = db.address_scan_tokens(row["id"])
-        sources = db.address_sources(row["address"])
+        chain_parts = chain_map.get(int(row["id"]), [])
+        token_parts = token_map.get(int(row["id"]), [])
+        sources = source_map.get(str(row["address"]).lower(), [])
         with_code = [
             chains[item["chain"]].display_name if item["chain"] in chains else item["chain"]
             for item in chain_parts
@@ -4163,7 +4388,7 @@ def export_xlsx(
             for item in sources
         ]
         seen = [item["first_seen_at"] for item in sources if item["first_seen_at"]]
-        estimate = db.rabby_estimate(row["address"])
+        estimate = estimate_map.get(str(row["address"]).lower())
         estimate_values: list[Any] = [None] * 8
         if estimate is not None:
             summary = "; ".join(
@@ -4246,8 +4471,9 @@ def export_xlsx(
         if row["status"] == "incomplete" and float(row["total_usd"] or 0.0) < min_usd
     ]
     build(paths[0], qualifying, "Qualifying", OK_FILL)
-    build(paths[1], below, "Below threshold", BELOW_FILL)
-    build(paths[2], incomplete, "Incomplete", INCOMPLETE_FILL)
+    if mode == "full":
+        build(paths[1], below, "Below threshold", BELOW_FILL)
+        build(paths[2], incomplete, "Incomplete", INCOMPLETE_FILL)
     log.info(
         "xlsx qualifying=%s below=%s incomplete=%s",
         len(qualifying),
@@ -4259,13 +4485,22 @@ def export_xlsx(
 
 def export_bundle_process(
     db_path: Path, cfg: AppCfg, chains: dict[str, ChainCfg], min_usd: float,
+    mode: str = "full",
 ) -> None:
     """Spawn target: export from query-only connections, never the scanner connection."""
     db = DB(db_path, read_only=True)
     sui_store = SuiStore(db_path, read_only=True)
     try:
-        export_xlsx(db, cfg, chains, min_usd, snapshot=False)
-        export_sui_xlsx(sui_store, cfg.export_dir, min_usd, snapshot=False)
+        if os.name == "posix":
+            try:
+                os.nice(10)
+            except OSError:
+                pass
+        export_xlsx(db, cfg, chains, min_usd, snapshot=False, mode=mode)
+        export_sui_xlsx(
+            sui_store, cfg.export_dir, min_usd, snapshot=False,
+            mode="qualifying" if mode == "qualifying" else "full",
+        )
     finally:
         sui_store.close()
         db.close()
@@ -4273,25 +4508,28 @@ def export_bundle_process(
 
 async def run_export_process(
     db: DB, cfg: AppCfg, chains: dict[str, ChainCfg], lock: asyncio.Lock,
+    mode: str = "full",
 ) -> tuple[Path, ...]:
     async with lock:
         context = multiprocessing.get_context("spawn")
         process = context.Process(
             target=export_bundle_process,
-            args=(db.path, cfg, chains, cfg.min_usd),
+            args=(db.path, cfg, chains, cfg.min_usd, mode),
             name="xlsx-export",
         )
         process.start()
         await asyncio.to_thread(process.join)
         if process.exitcode != 0:
             raise RuntimeError(f"XLSX export process exited with {process.exitcode}")
-        return tuple(
-            cfg.export_dir / name for name in (
+        names = (
+            ("qualifying.xlsx", "sui_qualifying.xlsx")
+            if mode == "qualifying" else (
                 "qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx",
                 "sui_qualifying.xlsx", "sui_below_threshold.xlsx",
                 "sui_incomplete.xlsx", "sui_packages.xlsx",
             )
         )
+        return tuple(cfg.export_dir / name for name in names)
 
 
 def copy_daily_report_snapshot(export_dir: Path, now: datetime | None = None) -> list[Path]:
@@ -4410,6 +4648,8 @@ async def heartbeat_loop(
     monitor: MonitorStore,
     run_id: str,
     discovery_slots: DiscoverySlots,
+    governor: LoadGovernor,
+    rpc_limiter: RoleRpcLimiter,
 ) -> None:
     status_path = cfg.log_dir / "status.txt"
     previous: dict[str, tuple[float, int]] = {}
@@ -4424,9 +4664,14 @@ async def heartbeat_loop(
         sampled_at = datetime.now(timezone.utc)
         paused = monitor.setting("scanner_paused", "0") == "1"
         slot_stats = await discovery_slots.snapshot()
+        governor_stats = governor.snapshot()
         monitor.heartbeat(
             run_id, "paused" if paused else "running",
-            json.dumps({"discovery_scheduler": slot_stats}, separators=(",", ":")),
+            json.dumps({
+                "discovery_scheduler": slot_stats,
+                "load_governor": governor_stats,
+                "rpc_budgets": rpc_limiter.snapshot(),
+            }, separators=(",", ":")),
         )
         lines = [
             f"updated_utc {sampled_at.isoformat()}",
@@ -4439,6 +4684,7 @@ async def heartbeat_loop(
                 f"waiting={slot_stats['backfill_waiting']} "
                 f"max_wait={slot_stats['backfill_max_wait_sec']:.1f}s"
             ),
+            f"load_governor state={governor_stats['state']} reason={governor_stats['reason']}",
             f"{'chain':<14} {'last':>12} {'safe_head':>12} {'lag':>10} {'contracts':>10} {'rpc':<30} {'cooldown':>9} {'error'}",
         ]
         for key, pool in pools.items():
@@ -4567,6 +4813,25 @@ async def heartbeat_loop(
         )
 
 
+async def governor_loop(
+    db: DB, slots: DiscoverySlots, governor: LoadGovernor, stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        snapshot = db.monitoring_snapshot(0.0)
+        slot_stats = await slots.snapshot()
+        live, backfill = governor.evaluate(
+            int(snapshot.get("balance_pending") or 0),
+            float(snapshot.get("balance_oldest_age_sec") or 0.0),
+            float(slot_stats.get("live_max_wait_sec") or 0.0),
+            sui_pending=db.sui_enrichment_pending(),
+        )
+        await slots.set_capacity(live, backfill)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def export_loop(
     db: DB,
     cfg: AppCfg,
@@ -4589,10 +4854,15 @@ async def export_loop(
             pass
         try:
             revision = db.data_revision()
+            if monitor:
+                last_export_revision = int(
+                    monitor.setting("last_export_revision", str(last_export_revision))
+                    or last_export_revision
+                )
             if revision != last_export_revision:
                 if monitor:
                     monitor.set_setting("exporter_state", "running")
-                await run_export_process(db, cfg, mapping, export_lock)
+                await run_export_process(db, cfg, mapping, export_lock, mode="qualifying")
                 last_export_revision = revision
                 if monitor:
                     monitor.set_setting("last_export_revision", revision)
@@ -4637,8 +4907,16 @@ async def control_loop(
                 elif request.action == "resume":
                     monitor.set_setting("scanner_paused", "0")
                     result = "scanner resumed"
-                elif request.action == "export":
-                    paths = await run_export_process(db, cfg, chains, export_lock)
+                elif request.action in {"export", "export_qualifying"}:
+                    mode = "full" if request.action == "export" else "qualifying"
+                    monitor.set_setting("exporter_state", f"running:{mode}")
+                    paths = await run_export_process(
+                        db, cfg, chains, export_lock, mode=mode,
+                    )
+                    monitor.set_setting("exporter_state", "idle")
+                    monitor.set_setting(f"last_{mode}_export_at", time.time())
+                    if mode == "qualifying":
+                        monitor.set_setting("last_export_revision", db.data_revision())
                     result = "exported: " + ", ".join(path.name for path in paths)
                 elif request.action == "backup":
                     path = await asyncio.to_thread(backup_database, db, ROOT / "backups", 7)
@@ -4648,6 +4926,8 @@ async def control_loop(
                 monitor.resolve_incident(f"control:{request.action}")
                 monitor.finish_control(request.id, "complete", result)
             except Exception as exc:
+                if request.action in {"export", "export_qualifying"}:
+                    monitor.set_setting("exporter_state", "failed")
                 monitor.finish_control(request.id, "failed", f"{type(exc).__name__}: {exc}")
                 monitor.open_incident(
                     f"control:{request.action}", "critical", "control_failure",
@@ -4781,7 +5061,9 @@ async def run(args: argparse.Namespace) -> None:
     run_id = None if args.rpc_check else monitor.begin_run(
         mode, cfg.min_usd, profile, vars(args)
     )
-    global_rpc_sem = asyncio.Semaphore(cfg.global_rpc_concurrency)
+    global_rpc_sem = RoleRpcLimiter(
+        cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency
+    )
     prices = PriceBook(cfg.http_timeout_sec, cfg.price_batch_size)
     pools: dict[str, RpcPool] = {}
     sui_client: BlockberryClient | None = None
@@ -4928,6 +5210,11 @@ async def run(args: argparse.Namespace) -> None:
             live_slots=cfg.discovery_live_slots,
             backfill_slots=cfg.discovery_backfill_slots,
         )
+        governor = LoadGovernor(
+            enabled=profile == "steady",
+            base_live=cfg.discovery_live_slots,
+            base_backfill=cfg.discovery_backfill_slots,
+        )
         if cfg.run_indexer and not args.balances_only:
             for chain in discovery_ready:
                 pool = pools[chain.key]
@@ -5004,11 +5291,14 @@ async def run(args: argparse.Namespace) -> None:
             asyncio.create_task(
                 heartbeat_loop(
                     db, cfg, discovery_ready, pools, stop, monitor, run_id,
-                    discovery_slots,
+                    discovery_slots, governor, global_rpc_sem,
                 ),
                 name="heartbeat",
             )
         )
+        tasks.append(asyncio.create_task(
+            governor_loop(db, discovery_slots, governor, stop), name="load-governor"
+        ))
         tasks.append(
             asyncio.create_task(
                 control_loop(db, cfg, balance_chains, monitor, stop, export_lock),
@@ -5027,7 +5317,9 @@ async def run(args: argparse.Namespace) -> None:
         stop.set()
         if should_export:
             try:
-                await run_export_process(db, cfg, balance_chains, export_lock)
+                await run_export_process(
+                    db, cfg, balance_chains, export_lock, mode="qualifying"
+                )
             except Exception as exc:
                 log.warning("final export: %s", exc)
         for pool in pools.values():

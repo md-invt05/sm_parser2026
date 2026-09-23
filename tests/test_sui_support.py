@@ -16,6 +16,7 @@ from sui_support import (
     parse_raw_transaction,
     scan_sui_package,
     discover_sui_once,
+    export_sui_xlsx,
     sui_balance_loop,
 )
 
@@ -426,6 +427,23 @@ def test_project_tvl_is_not_increased_by_verified_pool_liquidity(tmp_path: Path)
     row = store.latest_projects()[0]
     assert row["indexed_tvl"] == 1_250_000
     assert row["verified_pool_tvl"] == 500_000
+    store.close()
+
+
+def test_qualifying_export_does_not_build_full_sui_bundle(tmp_path: Path):
+    store = SuiStore(tmp_path / "db.sqlite")
+    package = "0x" + "a" * 64
+    store.sync_defi_projects([{
+        "projectName": "Cetus", "currTvl": 1_250_000,
+        "packages": [{"packageAddress": package}],
+    }], 500_000)
+    paths = export_sui_xlsx(
+        store, tmp_path / "reports", 500_000, mode="qualifying"
+    )
+    assert paths[0].exists()
+    assert not paths[1].exists()
+    assert not paths[2].exists()
+    assert not paths[3].exists()
     store.close()
 
 

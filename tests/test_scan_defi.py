@@ -371,6 +371,9 @@ class FakeIndexRpc:
     def grow_batch(self, kind="block"):
         return None
 
+    def force_failover(self, method_group, seconds=60):
+        return None
+
 
 class FakePrices:
     def __init__(self, values):
@@ -608,6 +611,66 @@ class MultichainBalanceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
+    def test_steady_governor_hysteresis(self):
+        governor = scan_defi.LoadGovernor(True, 4, 1)
+        self.assertEqual((2, 0), governor.evaluate(25_000, 30_000, 5, now=0))
+        self.assertEqual("critical_drain", governor.state)
+        self.assertEqual((2, 0), governor.evaluate(10_000, 3_000, 5, now=100))
+        self.assertEqual((3, 0), governor.evaluate(10_000, 3_000, 5, now=701))
+        self.assertEqual((3, 0), governor.evaluate(1_000, 100, 5, now=800))
+        self.assertEqual((4, 1), governor.evaluate(1_000, 100, 5, now=1401))
+
+    async def test_role_rpc_limiter_keeps_separate_budgets(self):
+        limiter = scan_defi.RoleRpcLimiter(2, 3)
+        discovery_active = balance_active = 0
+        discovery_peak = balance_peak = 0
+
+        async def work(balance):
+            nonlocal discovery_active, balance_active, discovery_peak, balance_peak
+            token = scan_defi.BALANCE_RPC.set(balance)
+            try:
+                async with limiter.slot():
+                    if balance:
+                        balance_active += 1
+                        balance_peak = max(balance_peak, balance_active)
+                    else:
+                        discovery_active += 1
+                        discovery_peak = max(discovery_peak, discovery_active)
+                    await asyncio.sleep(0.01)
+                    if balance:
+                        balance_active -= 1
+                    else:
+                        discovery_active -= 1
+            finally:
+                scan_defi.BALANCE_RPC.reset(token)
+
+        await asyncio.gather(*(work(False) for _ in range(6)), *(work(True) for _ in range(8)))
+        self.assertEqual((2, 3), (discovery_peak, balance_peak))
+
+    async def test_dynamic_capacity_pauses_backfill_and_timeout_releases_slot(self):
+        slots = scan_defi.DiscoverySlots(live_slots=1, backfill_slots=1)
+        await slots.set_capacity(1, 0)
+        entered = asyncio.Event()
+
+        async def backfill():
+            async with slots.slot("backfill", "ethereum"):
+                entered.set()
+
+        waiting = asyncio.create_task(backfill())
+        await asyncio.sleep(0.02)
+        self.assertFalse(entered.is_set())
+        await slots.set_capacity(1, 1)
+        await asyncio.wait_for(waiting, 1)
+        timed_out = []
+        async with slots.slot(
+            "live", "zksync", work_timeout_sec=0.02,
+            timeout_handler=lambda: timed_out.append(True),
+        ):
+            await asyncio.sleep(1)
+        snapshot = await slots.snapshot()
+        self.assertEqual([True], timed_out)
+        self.assertEqual(0, snapshot["live_active"])
+
     async def _wait_for(self, predicate, timeout=1.0):
         deadline = asyncio.get_running_loop().time() + timeout
         while not predicate():
@@ -778,6 +841,32 @@ class CursorBulkTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(99, db.last_indexed("ethereum"))
             db.close()
+
+    async def test_range_watchdog_releases_slot_without_advancing_cursor(self):
+        class HangingRpc(FakeIndexRpc):
+            async def batch(self, calls):
+                if calls[0][0] == "eth_getBlockByNumber":
+                    await asyncio.sleep(1)
+                return await super().batch(calls)
+
+        cfg = replace(self.cfg, discovery_range_timeout_sec=0.02)
+        rpc = HangingRpc({100: {"number": hex(100), "transactions": []}})
+        stop = asyncio.Event()
+        slots = scan_defi.DiscoverySlots(1, 1)
+        with tempfile.TemporaryDirectory() as folder:
+            db = scan_defi.DB(Path(folder) / "db.sqlite")
+            db.init_chain("ethereum", 100, True)
+            try:
+                db.init_chain_cursors("ethereum", 100, 99, lookback=0)
+                asyncio.get_running_loop().call_later(0.08, stop.set)
+                await scan_defi.index_chain_cursor(
+                    db, self.chain, rpc, cfg, stop, "live", slots,
+                )
+                self.assertEqual(99, int(db.cursor("ethereum", "live")["last_committed"]))
+                snapshot = await slots.snapshot()
+                self.assertEqual(0, snapshot["live_active"])
+            finally:
+                db.close()
 
 
 if __name__ == "__main__":

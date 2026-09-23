@@ -39,11 +39,16 @@ Available commands: `/status`, `/report`, `/networks`, `/resources`, `/errors`,
 `/files`, `/file`, `/schedule`, `/load`, `/start`, `/stop`, `/restart`, `/pause`,
 `/resume`, `/export`, `/backup`, `/history`, `/help`.
 
-The scanner reads the persisted `conservative`, `low`, `normal` or `high` profile on startup.
+The scanner reads the persisted `conservative`, `low`, `steady`, `normal` or `high` profile on startup.
+`steady` is the recommended 24/7 server profile: it reserves four RPC requests for
+discovery and six for balances. Its governor reduces live slots and pauses backfill
+while the EVM/Sui queues are large, then restores capacity after ten stable minutes.
 Discovery uses separate fair live/backfill queues. Profile capacities are `4/1` for
 `conservative` and `low`, `6/1` for `normal`, and `10/2` for `high`. Live waiters
 older than 30 seconds take FIFO priority; otherwise the largest lag is served first.
 `/status` shows active slots, queued networks, and the oldest wait time.
+Automatic exports run every six hours and rebuild only the qualifying EVM/Sui files.
+`/export` and non-qualifying `/file` requests build the complete report bundle.
 Pause is cooperative: no new block range or address starts while current SQLite
 transactions finish. SIGTERM has a 35-second Compose grace period and performs a
 final export. Online SQLite backups are created daily; the newest seven are kept.
