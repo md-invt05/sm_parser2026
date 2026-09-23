@@ -401,7 +401,7 @@ def test_incomplete_dex_pagination_is_rejected():
     asyncio.run(run())
 
 
-def test_partial_defi_sync_preserves_tvl_and_marks_snapshot_incomplete(tmp_path: Path):
+def test_partial_defi_sync_preserves_last_trusted_tvl_and_records_error(tmp_path: Path):
     store = SuiStore(tmp_path / "db.sqlite")
     package = "0x" + "a" * 64
     store.sync_defi_projects([{
@@ -427,8 +427,9 @@ def test_partial_defi_sync_preserves_tvl_and_marks_snapshot_incomplete(tmp_path:
     asyncio.run(run())
     row = store.latest_projects()[0]
     assert row["indexed_tvl"] == 1_250_000
-    assert row["provider_complete"] == 0
-    assert "failed" in row["note"].lower()
+    assert row["provider_complete"] == 1
+    assert row["status"] == "qualifying"
+    assert "failed" in store.sync_value("last_defi_error").lower()
     store.close()
 
 

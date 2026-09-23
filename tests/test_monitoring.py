@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import json
 import threading
 import time
 import unittest
@@ -26,11 +27,13 @@ class MonitoringStoreTests(unittest.TestCase):
             store = MonitorStore(Path(folder) / "monitoring.db")
             store.set_discovery_worker("zksync", "live", "blocks", 100, 105, 1)
             store.set_discovery_worker(
-                "zksync", "live", "timeout", 100, 105, 2, "blocks exceeded 180s"
+                "zksync", "live", "timeout", 100, 105, 2, "blocks exceeded 180s",
+                endpoint="rpc.example.org",
             )
             row = store.discovery_worker("zksync", "live")
             self.assertEqual("timeout", row["stage"])
             self.assertEqual(2, row["failures"])
+            self.assertEqual("rpc.example.org", row["endpoint"])
             self.assertEqual(1, store.rows(
                 "SELECT COUNT(*) n FROM discovery_workers"
             )[0]["n"])
@@ -282,6 +285,24 @@ class MonitoringAsyncTests(unittest.IsolatedAsyncioTestCase):
                     store, ts=(now - timedelta(seconds=age)).isoformat(),
                     chain="optimism", role="live", cursor=50, safe_head=head,
                     active_rpc="mainnet.optimism.io",
+                )
+            self._bot_with_store(store)._evaluate_chain_incidents(now)
+            self.assertIsNone(store.active_incident("cursor:stalled:optimism"))
+            store.close()
+
+    async def test_intentional_balance_only_does_not_open_cursor_stall(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            run_id = store.begin_run("full", 500000, "steady", {})
+            store.heartbeat(run_id, note=json.dumps({
+                "load_governor": {"state": "balance_only"},
+            }))
+            now = datetime.now(timezone.utc)
+            for age, head in ((960, 100), (0, 130)):
+                self._add_chain_sample(
+                    store, ts=(now - timedelta(seconds=age)).isoformat(),
+                    run_id=run_id, chain="optimism", role="live", cursor=50,
+                    safe_head=head, active_rpc="mainnet.optimism.io",
                 )
             self._bot_with_store(store)._evaluate_chain_incidents(now)
             self.assertIsNone(store.active_incident("cursor:stalled:optimism"))

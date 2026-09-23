@@ -54,6 +54,7 @@ from sui_support import (
     export_sui_xlsx,
     sui_balance_loop,
     sui_discovery_loop,
+    sui_enrichment_loop,
 )
 
 load_dotenv()
@@ -183,6 +184,7 @@ class AppCfg:
     discover_tx_to_contracts: bool
     code_cache_ttl_sec: int
     native_anomaly_usd: float
+    token_anomaly_usd: float
     rabby_token_discovery_after_sec: int
     valuation_policies: list[dict[str, Any]]
     default_chains: list[str]
@@ -206,6 +208,15 @@ DRPC_FALLBACK_SLUGS = {
     "metis": "metis", "harmony": "harmony-0",
 }
 
+MAINNET_CHAIN_IDS = {
+    "ethereum": 1, "bsc": 56, "polygon": 137, "arbitrum": 42161,
+    "optimism": 10, "base": 8453, "zk": 1101, "zksync": 324,
+    "robinhood": 4663, "hyperliquid": 999, "linea": 59144,
+    "scroll": 534352, "mantle": 5000, "blast": 81457,
+    "celo": 42220, "gnosis": 100, "cronos": 25, "kava": 2222,
+    "metis": 1088, "harmony": 1666600000,
+}
+
 
 def _drpc_fallback_rpcs(chain_key: str) -> list[str]:
     """Build secondary keyed dRPC URLs without duplicating every network URL in .env."""
@@ -227,6 +238,9 @@ def load_config(path: Path) -> AppCfg:
         raise ValueError("rabby_uncertainty must be between 0 and 1")
     chains: dict[str, ChainCfg] = {}
     for key, c in raw["chains"].items():
+        expected_id = MAINNET_CHAIN_IDS.get(key)
+        if expected_id is None or int(c["chain_id"]) != expected_id:
+            raise ValueError(f"{key}: unsupported or non-mainnet chain ID")
         # Keyed/private endpoints have priority, public endpoints stay as fallback.
         rpcs = list(dict.fromkeys(
             _env_rpcs(key) + _drpc_fallback_rpcs(key) + list(c.get("rpc") or [])
@@ -292,6 +306,7 @@ def load_config(path: Path) -> AppCfg:
         discover_tx_to_contracts=bool(raw.get("discover_tx_to_contracts", True)),
         code_cache_ttl_sec=max(1, int(raw.get("code_cache_ttl_sec", 86400))),
         native_anomaly_usd=max(0.0, float(raw.get("native_anomaly_usd", 100_000_000))),
+        token_anomaly_usd=max(1.0, float(raw.get("token_anomaly_usd", 100_000_000))),
         rabby_token_discovery_after_sec=max(
             60, int(raw.get("rabby_token_discovery_after_sec", 900))
         ),
@@ -723,8 +738,10 @@ class DB:
             if address is None:
                 raise ValueError(f"invalid valuation policy address: {row.get('address')}")
             policy = str(row.get("policy") or "").strip()
-            if policy not in {"include", "exclude_from_total", "quarantine"}:
+            if policy not in {"include", "include_verified", "exclude_from_total", "quarantine"}:
                 raise ValueError(f"invalid valuation policy: {policy}")
+            if policy == "include_verified" and not str(row.get("reason") or "").strip():
+                raise ValueError("include_verified valuation policy requires a reason")
             values.append((
                 str(row["chain"]), address, str(row.get("asset") or "native").lower(),
                 policy, str(row.get("reason") or "manual policy"), row.get("source"), now,
@@ -806,6 +823,148 @@ class DB:
             if touched:
                 self._bump_revision_locked()
             return len(touched)
+
+    def revalue_token_balances(self, threshold_usd: float, min_usd: float) -> int:
+        """Quarantine old ERC-20 outliers without destroying raw observations."""
+        touched_scans: set[int] = set()
+        touched_state: set[tuple[str, str]] = set()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            for table in ("address_token_scans", "address_token_state"):
+                rows = self.conn.execute(
+                    f"SELECT * FROM {table} WHERE token!='native' "
+                    "AND valuation_status='included' AND usd_value>=?",
+                    (threshold_usd,),
+                ).fetchall()
+                for row in rows:
+                    scan_id = int(row["scan_id"]) if table == "address_token_scans" else None
+                    address = (
+                        str(self.conn.execute(
+                            "SELECT address FROM address_scans WHERE id=?", (scan_id,),
+                        ).fetchone()[0]) if scan_id is not None else str(row["address"])
+                    ).lower()
+                    chain, token = str(row["chain"]), str(row["token"]).lower()
+                    policy = self.conn.execute(
+                        "SELECT policy FROM asset_valuation_policies "
+                        "WHERE chain=? AND address=? AND asset=?",
+                        (chain, address, token),
+                    ).fetchone()
+                    if policy is not None and policy["policy"] == "include_verified":
+                        continue
+                    valuation = (
+                        "exclude_from_total" if policy is not None
+                        and policy["policy"] == "exclude_from_total"
+                        else "anomalous_balance"
+                    )
+                    key_column = "scan_id" if scan_id is not None else "address"
+                    key_value = scan_id if scan_id is not None else address
+                    self.conn.execute(
+                        f"UPDATE {table} SET valuation_status=? "
+                        f"WHERE {key_column}=? AND chain=? AND token=?",
+                        (valuation, key_value, chain, token),
+                    )
+                    self.conn.execute(
+                        """INSERT INTO anomalous_balances(
+                             chain,address,asset,detected_at,last_seen_at,raw_amount,
+                             observed_usd,second_rpc_match,early_block_raw,status,evidence_json
+                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(chain,address,asset) DO UPDATE SET
+                             last_seen_at=excluded.last_seen_at,raw_amount=excluded.raw_amount,
+                             observed_usd=excluded.observed_usd,status=excluded.status,
+                             evidence_json=excluded.evidence_json""",
+                        (chain, address, token, now, now, str(row["raw_amount"]),
+                         float(row["usd_value"]), None, None,
+                         "excluded_policy" if valuation == "exclude_from_total" else "quarantined",
+                         json.dumps({"threshold_usd": threshold_usd,
+                                     "source": "historical_revaluation"})),
+                    )
+                    if scan_id is not None:
+                        touched_scans.add(scan_id)
+                    else:
+                        touched_state.add((address, chain))
+            for scan_id in touched_scans:
+                for chain_row in self.conn.execute(
+                    "SELECT chain,status,included_native_usd,observed_native_usd "
+                    "FROM address_chain_scans WHERE scan_id=?",
+                    (scan_id,),
+                ).fetchall():
+                    chain = str(chain_row["chain"])
+                    tokens_usd = float(self.conn.execute(
+                        "SELECT COALESCE(SUM(usd_value),0) FROM address_token_scans "
+                        "WHERE scan_id=? AND chain=? AND token!='native' "
+                        "AND valuation_status='included'",
+                        (scan_id, chain),
+                    ).fetchone()[0])
+                    excluded_tokens = float(self.conn.execute(
+                        "SELECT COALESCE(SUM(usd_value),0) FROM address_token_scans "
+                        "WHERE scan_id=? AND chain=? AND token!='native' "
+                        "AND valuation_status!='included'",
+                        (scan_id, chain),
+                    ).fetchone()[0])
+                    anomalous = bool(self.conn.execute(
+                        "SELECT 1 FROM address_token_scans WHERE scan_id=? AND chain=? "
+                        "AND token!='native' AND valuation_status IN ('anomalous_balance','quarantine') LIMIT 1",
+                        (scan_id, chain),
+                    ).fetchone())
+                    native = float(chain_row["included_native_usd"] or 0)
+                    excluded = excluded_tokens + max(0.0, float(chain_row["observed_native_usd"] or 0) - native)
+                    status = "anomalous_balance" if chain_row["status"] == "complete" and anomalous else chain_row["status"]
+                    self.conn.execute(
+                        "UPDATE address_chain_scans SET tokens_usd=?,total_usd=?,excluded_usd=?,status=? "
+                        "WHERE scan_id=? AND chain=?",
+                        (tokens_usd, native + tokens_usd, excluded, status, scan_id, chain),
+                    )
+                total = float(self.conn.execute(
+                    "SELECT COALESCE(SUM(total_usd),0) FROM address_chain_scans WHERE scan_id=?",
+                    (scan_id,),
+                ).fetchone()[0])
+                parts = self.conn.execute(
+                    "SELECT status FROM address_chain_scans WHERE scan_id=?", (scan_id,),
+                ).fetchall()
+                status = "qualifying" if total >= min_usd else (
+                    "below" if parts and all(p["status"] in {"complete", "absent"} for p in parts)
+                    else "incomplete"
+                )
+                self.conn.execute(
+                    "UPDATE address_scans SET total_usd=?,status=?,note=TRIM("
+                    "COALESCE(note,'') || ', token_balance_quarantined',', ') WHERE id=?",
+                    (total, status, scan_id),
+                )
+            for address, chain in touched_state:
+                tokens_usd = float(self.conn.execute(
+                    "SELECT COALESCE(SUM(usd_value),0) FROM address_token_state "
+                    "WHERE address=? AND chain=? AND token!='native' AND valuation_status='included'",
+                    (address, chain),
+                ).fetchone()[0])
+                state = self.conn.execute(
+                    "SELECT status,included_native_usd FROM address_chain_state "
+                    "WHERE address=? AND chain=?", (address, chain),
+                ).fetchone()
+                if state is not None:
+                    total = tokens_usd + float(state["included_native_usd"] or 0)
+                    excluded_tokens = float(self.conn.execute(
+                        "SELECT COALESCE(SUM(usd_value),0) FROM address_token_state "
+                        "WHERE address=? AND chain=? AND token!='native' "
+                        "AND valuation_status!='included'",
+                        (address, chain),
+                    ).fetchone()[0])
+                    anomalous = bool(self.conn.execute(
+                        "SELECT 1 FROM address_token_state WHERE address=? AND chain=? "
+                        "AND token!='native' AND valuation_status IN ('anomalous_balance','quarantine') LIMIT 1",
+                        (address, chain),
+                    ).fetchone())
+                    status = "anomalous_balance" if state["status"] == "complete" and anomalous else state["status"]
+                    self.conn.execute(
+                        "UPDATE address_chain_state SET tokens_usd=?,total_usd=?,excluded_usd=?,status=?,"
+                        "valuation_status=?,next_retry_at=? "
+                        "WHERE address=? AND chain=?",
+                        (tokens_usd, total, excluded_tokens, status,
+                         "anomalous_balance" if anomalous else "exclude_from_total",
+                         now, address, chain),
+                    )
+            if touched_scans or touched_state:
+                self._bump_revision_locked()
+        return len(touched_scans) + len(touched_state)
 
     def reclassify_latest_scans(self, min_usd: float) -> int:
         changed = 0
@@ -1536,11 +1695,19 @@ class DB:
                              AND valuation_status='included'""",
                         (address, chain),
                     ).fetchone()[0])
+                    excluded_tokens = float(self.conn.execute(
+                        """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
+                           WHERE address=? AND chain=? AND token!='native'
+                             AND valuation_status!='included'""",
+                        (address, chain),
+                    ).fetchone()[0])
                     included_native = float(observed("included_native_usd", 0.0) or 0.0)
                     self.conn.execute(
-                        """UPDATE address_chain_state SET tokens_usd=?,total_usd=?
+                        """UPDATE address_chain_state SET tokens_usd=?,total_usd=?,excluded_usd=?
                            WHERE address=? AND chain=?""",
-                        (token_total, token_total + included_native, address, chain),
+                        (token_total, token_total + included_native,
+                         excluded_tokens + max(0.0, float(observed("observed_native_usd", 0.0) or 0.0) - included_native),
+                         address, chain),
                     )
             self._bump_revision_locked()
 
@@ -1676,7 +1843,7 @@ class DB:
                     address, scanned_at, status, total_usd, coverage, total_networks, note
                 ) VALUES (?,?,?,?,?,?,?)
                 """,
-                (address, now, status, total_usd, coverage, total_networks, note),
+                (address, now, status, float(total_usd), coverage, total_networks, note),
             )
             scan_id = int(cur.lastrowid)
             self.conn.executemany(
@@ -1693,15 +1860,15 @@ class DB:
                         row["chain"],
                         row.get("has_code"),
                         row["status"],
-                        row.get("native_amount"),
-                        row.get("native_usd"),
-                        row.get("tokens_usd"),
-                        row.get("total_usd"),
+                        float(row["native_amount"]) if row.get("native_amount") is not None else None,
+                        float(row["native_usd"]) if row.get("native_usd") is not None else None,
+                        float(row["tokens_usd"]) if row.get("tokens_usd") is not None else None,
+                        float(row["total_usd"]) if row.get("total_usd") is not None else None,
                         row.get("note"),
                         row.get("native_raw"),
-                        row.get("observed_native_usd", row.get("native_usd")),
-                        row.get("included_native_usd", row.get("native_usd")),
-                        row.get("excluded_usd", 0.0),
+                        float(row.get("observed_native_usd", row.get("native_usd"))) if row.get("observed_native_usd", row.get("native_usd")) is not None else None,
+                        float(row.get("included_native_usd", row.get("native_usd"))) if row.get("included_native_usd", row.get("native_usd")) is not None else None,
+                        float(row.get("excluded_usd", 0.0)),
                         row.get("valuation_status"),
                     )
                     for row in chain_rows
@@ -1721,9 +1888,9 @@ class DB:
                         row["token"],
                         row.get("symbol"),
                         str(row.get("raw_amount", "0")),
-                        row.get("amount"),
-                        row.get("price_usd"),
-                        row.get("usd_value"),
+                        float(row["amount"]) if row.get("amount") is not None else None,
+                        float(row["price_usd"]) if row.get("price_usd") is not None else None,
+                        float(row["usd_value"]) if row.get("usd_value") is not None else None,
                         1 if row.get("priced") else 0,
                         row.get("valuation_status", "included"),
                     )
@@ -1736,7 +1903,7 @@ class DB:
                 SET last_checked_at=?, last_total_usd=?, last_status=?
                 WHERE lower(address)=?
                 """,
-                (now, total_usd, status, address),
+                (now, float(total_usd), status, address),
             )
             self._bump_revision_locked()
             self.conn.commit()
@@ -1875,9 +2042,15 @@ class DB:
                                 AND strftime('%s',s.next_retry_at)<=strftime('%s','now'))"""
             ).fetchone()[0])
             oldest_age = self.conn.execute(
-                """SELECT MAX(strftime('%s','now')-strftime('%s',c.first_seen_at))
-                   FROM contracts c WHERE NOT EXISTS(
-                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))"""
+                """SELECT MAX(age) FROM (
+                     SELECT strftime('%s','now')-strftime('%s',c.first_seen_at) AS age
+                     FROM contracts c WHERE NOT EXISTS(
+                       SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
+                     UNION ALL
+                     SELECT strftime('%s','now')-strftime('%s',s.next_retry_at) AS age
+                     FROM address_chain_state s
+                     WHERE strftime('%s',s.next_retry_at)<=strftime('%s','now')
+                   )"""
             ).fetchone()[0]
             completed = int(self.conn.execute(
                 "SELECT COUNT(DISTINCT address) FROM address_scans"
@@ -2154,6 +2327,10 @@ class RpcPool:
         self.block_batch = cfg.block_batch_size
         self.receipt_batch = cfg.receipt_batch_size
         self.call_batch = max(1, cfg.eth_call_batch_size)
+        self.log_range_limit = 1
+        self.log_holder_batch = 50
+        self.log_success_streak = 0
+        self.log_failure_streak = 0
         if self.endpoints and (urlparse(self.endpoints[0].url).hostname or "") == "lb.drpc.live":
             # dRPC free endpoints reject JSON-RPC batches larger than three.
             self.block_batch = min(self.block_batch, 3)
@@ -2637,11 +2814,11 @@ class RpcPool:
         self.preflight_complete = True
         return report
 
-    def active_endpoint(self) -> str:
-        ep = next(
+    def active_endpoint(self, method_group: str = "head") -> str:
+        ep = self._pick(method_group) or next(
             (
                 candidate for candidate in self.endpoints
-                if candidate.available("head")
+                if candidate.available(method_group)
                 and (not self.preflight_complete or candidate.chain_verified)
             ),
             None,
@@ -2736,6 +2913,20 @@ def decode_uint(data: str | None) -> int:
     if not data or data == "0x":
         return 0
     return int(data, 16)
+
+
+def decode_abi_uint256(data: str | None) -> int:
+    """ERC-20 uint256 responses must be exactly one 32-byte ABI word."""
+    if not isinstance(data, str) or not data.startswith("0x") or len(data) != 66:
+        raise ValueError("malformed ABI uint256")
+    try:
+        return int(data[2:], 16)
+    except ValueError as exc:
+        raise ValueError("malformed ABI uint256") from exc
+
+
+def suspicious_usd(value: float | None, threshold: float) -> bool:
+    return value is not None and (not math.isfinite(value) or value >= threshold)
 
 
 def decode_string(data: str | None) -> str | None:
@@ -2854,7 +3045,7 @@ class DiscoverySlots:
         starvation_sec: float = 30.0,
     ):
         self.capacity = {
-            "live": max(1, live_slots),
+            "live": max(0, live_slots),
             "backfill": max(1, backfill_slots),
         }
         self.starvation_sec = max(0.0, starvation_sec)
@@ -2910,7 +3101,7 @@ class DiscoverySlots:
 
     async def set_capacity(self, live: int, backfill: int) -> None:
         async with self.lock:
-            self.capacity["live"] = max(1, int(live))
+            self.capacity["live"] = max(0, int(live))
             self.capacity["backfill"] = max(0, int(backfill))
             self._dispatch_locked()
 
@@ -2985,9 +3176,9 @@ class LoadGovernor:
         critical = combined_pending >= 20_000 or oldest_sec >= 21_600
         drain = combined_pending >= 5_000 or oldest_sec >= 3_600 or live_wait_sec >= 30
         if critical:
-            self.state, self.recovery_since = "critical_drain", None
-        elif self.state == "critical_drain":
-            recovered = combined_pending < 15_000 and oldest_sec < 14_400
+            self.state, self.recovery_since = "balance_only", None
+        elif self.state == "balance_only":
+            recovered = combined_pending < 5_000 and oldest_sec < 3_600
             self.recovery_since = now if recovered and self.recovery_since is None else self.recovery_since
             if not recovered:
                 self.recovery_since = None
@@ -3006,8 +3197,8 @@ class LoadGovernor:
             f"pending={pending}+sui:{sui_pending}, oldest={oldest_sec:.0f}s, "
             f"live_wait={live_wait_sec:.0f}s"
         )
-        if self.state == "critical_drain":
-            return min(self.base_live, 2), 0
+        if self.state == "balance_only":
+            return 0, 0
         if self.state == "drain":
             return min(self.base_live, 3), 0
         return self.base_live, self.base_backfill
@@ -3071,7 +3262,7 @@ async def collect_transfers(
 ) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
     if not known:
         return [], []
-    step = max(1, min(chain.logs_max_range, end - start + 1))
+    step = max(1, min(rpc.log_range_limit, chain.logs_max_range, end - start + 1))
     token_rows: dict[str, tuple[Any, ...]] = {}
     relation_rows: dict[tuple[str, str], tuple[Any, ...]] = {}
     known_list = sorted(known)
@@ -3080,20 +3271,38 @@ async def collect_transfers(
         range_end = min(end, cursor + step - 1)
         try:
             logs: list[dict[str, Any]] = []
-            for offset in range(0, len(known_list), 50):
-                holders = known_list[offset:offset + 50]
-                topics = ["0x" + pad_addr(holder) for holder in holders]
-                part = await rpc.call("eth_getLogs", [{
-                    "fromBlock": hex(cursor), "toBlock": hex(range_end),
-                    "topics": [TRANSFER_TOPIC, None, topics[0] if len(topics) == 1 else topics],
-                }])
-                if not isinstance(part, list):
-                    raise RpcError("malformed", "eth_getLogs did not return a list")
-                logs.extend(part)
+            for offset in range(0, len(known_list), 2 * rpc.log_holder_batch):
+                chunks = [
+                    known_list[i:i + rpc.log_holder_batch]
+                    for i in range(offset, min(len(known_list), offset + 2 * rpc.log_holder_batch), rpc.log_holder_batch)
+                ]
+                requests = []
+                for holders in chunks:
+                    topics = ["0x" + pad_addr(holder) for holder in holders]
+                    requests.append(rpc.call("eth_getLogs", [{
+                        "fromBlock": hex(cursor), "toBlock": hex(range_end),
+                        "topics": [TRANSFER_TOPIC, None, topics[0] if len(topics) == 1 else topics],
+                    }]))
+                parts = await asyncio.gather(*requests, return_exceptions=True)
+                for part in parts:
+                    if isinstance(part, BaseException):
+                        raise part
+                    if not isinstance(part, list):
+                        raise RpcError("malformed", "eth_getLogs did not return a list")
+                    logs.extend(part)
         except RpcError as exc:
-            if exc.kind in {"range", "rate_limit"} and step > 1:
-                step = max(1, step // 2)
-                continue
+            rpc.log_success_streak = 0
+            rpc.log_failure_streak += 1
+            if exc.kind in {"range", "rate_limit", "timeout", "network", "rpc", "http"}:
+                if step > 1:
+                    step = max(1, step // 2)
+                    rpc.log_range_limit = min(rpc.log_range_limit, step)
+                    continue
+                if rpc.log_holder_batch > 1:
+                    rpc.log_holder_batch = max(1, rpc.log_holder_batch // 2)
+                    continue
+                if rpc.log_failure_streak >= 2:
+                    rpc.force_failover("logs", 300)
             raise
         for item in logs:
             topics = item.get("topics") or []
@@ -3109,8 +3318,13 @@ async def collect_transfers(
                 chain.key, holder, token, "transfer_log", block_number,
             )
         cursor = range_end + 1
-        if step < chain.logs_max_range:
-            step = min(chain.logs_max_range, step * 2)
+        rpc.log_failure_streak = 0
+        rpc.log_success_streak += 1
+        if rpc.log_success_streak >= 100:
+            rpc.log_range_limit = min(chain.logs_max_range, rpc.log_range_limit + 1)
+            rpc.log_holder_batch = min(50, rpc.log_holder_batch + 1)
+            rpc.log_success_streak = 0
+        step = max(1, min(rpc.log_range_limit, chain.logs_max_range))
     return list(token_rows.values()), list(relation_rows.values())
 
 
@@ -3250,10 +3464,14 @@ async def index_chain_cursor(
 
         def update_stage(value: str, error: str | None = None) -> None:
             nonlocal stage
+            group = value if value in {"blocks", "receipts", "code", "logs"} else stage
+            endpoint = getattr(rpc, "last_endpoint_by_group", {}).get(group)
+            endpoint_name = _short_url(endpoint.url) if endpoint is not None else None
             stage = value
             if monitor is not None:
                 monitor.set_discovery_worker(
                     chain.key, role, value, start, end, failures, error,
+                    endpoint=endpoint_name,
                 )
 
         async def range_timeout() -> None:
@@ -3757,7 +3975,7 @@ async def _scan_address_chain(
                             "eth_call",
                             [{"to": token["address"], "data": DECIMALS_SEL}, "latest"],
                         )
-                        value = decode_uint(raw_decimals)
+                        value = decode_abi_uint256(raw_decimals)
                         decimals = value if 0 <= value <= 36 else None
                     if symbol is None:
                         raw_symbol = await rpc.call(
@@ -3805,7 +4023,7 @@ async def _scan_address_chain(
             elif (
                 observed_native_usd is not None
                 and observed_native_usd >= cfg.native_anomaly_usd
-                and not (policy is not None and policy["policy"] == "include")
+                and not (policy is not None and policy["policy"] in {"include", "include_verified"})
             ):
                 match, second_value = await rpc.confirmed_call(
                     "eth_getBalance", [address, "latest"], raw_native
@@ -3878,7 +4096,7 @@ async def _scan_address_chain(
                         failed_tokens.append(token["address"])
                         continue
                     try:
-                        raw_amount = decode_uint(result)
+                        raw_amount = decode_abi_uint256(result)
                     except Exception:
                         token_rpc_error = True
                         failed_tokens.append(token["address"])
@@ -3891,10 +4109,35 @@ async def _scan_address_chain(
                     price = book.get(llama_key(chain, token["address"]))
                     priced = amount is not None and price is not None
                     usd_value = amount * price if priced else None
-                    if usd_value is not None:
+                    nonfinite_value = usd_value is not None and not math.isfinite(usd_value)
+                    if nonfinite_value:
+                        usd_value = None
+                        priced = False
+                        anomaly = True
+                        anomaly_note = "non-finite ERC-20 valuation quarantined"
+                    policy = db.valuation_policy(chain.key, address, token["address"])
+                    valuation = "included"
+                    if policy is not None and policy["policy"] in {"exclude_from_total", "quarantine"}:
+                        valuation = str(policy["policy"])
+                        anomaly = valuation == "quarantine" or anomaly
+                    elif (nonfinite_value or suspicious_usd(usd_value, cfg.token_anomaly_usd)) and not (
+                        policy is not None and policy["policy"] == "include_verified"
+                    ):
+                        valuation = "anomalous_balance"
+                        anomaly = True
+                        anomaly_note = "large ERC-20 balance quarantined pending valuation policy"
+                        db.save_anomaly(
+                            chain.key, address, token["address"], raw_amount,
+                            usd_value, None, None, "quarantined",
+                            {"threshold_usd": cfg.token_anomaly_usd,
+                             "price_source": "DefiLlama", "token": token["address"]},
+                        )
+                    if usd_value is not None and valuation == "included":
                         tokens_usd += usd_value
-                    else:
+                    elif usd_value is None:
                         unpriced_positive = True
+                    if valuation != "included" and usd_value is not None:
+                        excluded_usd += usd_value
                     token_rows.append(
                         {
                             "chain": chain.key,
@@ -3905,10 +4148,11 @@ async def _scan_address_chain(
                             "price_usd": price,
                             "usd_value": usd_value,
                             "priced": priced,
+                            "valuation_status": valuation,
                         }
                     )
                 base_row.update(
-                    tokens_usd=tokens_usd,
+                    tokens_usd=tokens_usd, excluded_usd=excluded_usd,
                     total_usd=(included_native_usd or 0.0) + tokens_usd,
                 )
 
@@ -4385,7 +4629,9 @@ def export_xlsx(
                 )
             else:
                 amount = item["amount"] if item["amount"] is not None else item["raw_amount"]
-                token_values.append(f"{item['chain']}:{label}={amount} (unpriced)")
+                valuation = item["valuation_status"] if "valuation_status" in item.keys() else "included"
+                suffix = ", " + valuation if valuation != "included" else ""
+                token_values.append(f"{item['chain']}:{label}={amount} (unpriced{suffix})")
         source_values = [
             f"{item['chain']}:{item['source']}:{item['observed_block']}:"
             f"{item['observed_tx'] or ''}"
@@ -4717,13 +4963,16 @@ async def heartbeat_loop(
             if last is not None:
                 previous[f"{c.key}:live"] = (sampled_at.timestamp(), last)
             metrics = pool.take_metrics()
+            worker = monitor.discovery_worker(c.key, "live") if live_cursor is not None else None
+            stage = str(worker["stage"]) if worker is not None else "head"
+            method_group = stage if stage in {"blocks", "receipts", "code", "logs"} else "head"
             monitor.add_chain_sample(
                 run_id=run_id, chain=c.key, role=role, cursor=last,
                 safe_head=head, lag=lag, blocks_per_hour=blocks_per_hour,
                 contracts=cnt["contracts"],
                 direct_deploy=db.discovery_count(c.key, "direct_deploy"),
                 active_call=db.discovery_count(c.key, "active_call"),
-                active_rpc=pool.active_endpoint(), cooldown_sec=cooldown,
+                active_rpc=pool.active_endpoint(method_group), cooldown_sec=cooldown,
                 rpc_requests=metrics["requests"], rpc_successes=metrics["successes"],
                 rpc_errors=metrics["errors"], latency_p50_ms=metrics["latency_p50_ms"],
                 latency_p95_ms=metrics["latency_p95_ms"],
@@ -5034,9 +5283,16 @@ async def run(args: argparse.Namespace) -> None:
     db = DB(cfg.db_path)
     sui_store = SuiStore(cfg.db_path)
     db.seed_valuation_policies(cfg.valuation_policies)
+    sui_store.seed_tvl_policies(list(cfg.sui.get("valuation_policies") or []))
     revalued = db.revalue_system_balances(cfg.min_usd)
     if revalued:
         log.info("revalued %s historical address scans using asset policies", revalued)
+    token_revalued = db.revalue_token_balances(cfg.token_anomaly_usd, cfg.min_usd)
+    if token_revalued:
+        log.info("quarantined %s historical token valuations", token_revalued)
+    sui_revalued = sui_store.revalue_suspicious_projects(sui_cfg.tvl_anomaly_usd)
+    if sui_revalued:
+        log.info("quarantined %s historical Sui project valuations", sui_revalued)
     reclassified = db.reclassify_latest_scans(cfg.min_usd)
     if reclassified:
         log.info("reclassified %s latest scans at threshold $%s", reclassified, cfg.min_usd)
@@ -5154,8 +5410,8 @@ async def run(args: argparse.Namespace) -> None:
                     log.warning("[sui] Blockberry preflight failed: %s", type(exc).__name__)
                     if args.rpc_check:
                         console.info(f"sui: ERROR {type(exc).__name__}")
-                    await sui_client.__aexit__(None, None, None)
-                    sui_client = None
+                    # A transient indexed-API failure must not disable both Sui
+                    # workers for the lifetime of a long-running scanner.
 
         if args.rpc_check:
             return
@@ -5224,6 +5480,14 @@ async def run(args: argparse.Namespace) -> None:
             base_live=cfg.discovery_live_slots,
             base_backfill=cfg.discovery_backfill_slots,
         )
+        initial_queue = db.monitoring_snapshot(cfg.min_usd)
+        initial_live, initial_backfill = governor.evaluate(
+            int(initial_queue.get("balance_pending") or 0),
+            float(initial_queue.get("balance_oldest_age_sec") or 0),
+            0.0,
+            sui_pending=db.sui_enrichment_pending(),
+        )
+        await discovery_slots.set_capacity(initial_live, initial_backfill)
         if cfg.run_indexer and not args.balances_only:
             for chain in discovery_ready:
                 pool = pools[chain.key]
@@ -5249,11 +5513,21 @@ async def run(args: argparse.Namespace) -> None:
                             sui_store, sui_client, sui_cfg, stop,
                             from_checkpoint=args.from_block, to_checkpoint=args.to_block,
                             monitor=monitor, run_id=run_id,
+                            discovery_allowed=lambda: governor.state != "balance_only",
                         ),
                         stop, cfg.task_restart_sec, monitor,
                     ),
                     name="idx-sui",
                 ))
+        if sui_client is not None and not args.index_only:
+            tasks.append(asyncio.create_task(
+                supervised(
+                    "enrich-sui",
+                    lambda: sui_enrichment_loop(sui_store, sui_client, sui_cfg, stop),
+                    stop, cfg.task_restart_sec, monitor,
+                ),
+                name="enrich-sui",
+            ))
         if cfg.run_balance_checker and not args.index_only:
             tasks.append(
                 asyncio.create_task(

@@ -182,9 +182,22 @@ FIFO starvation guard; backfill uses its own FIFO queue. Current queue/slot data
 is visible in `/status` and `logs/status.txt`.
 
 For continuous server operation use `/load steady`. It splits the ten-request RPC
-budget into discovery `4` and balances `6`, pauses backfill under queue pressure,
-and reduces live slots to `3` or `2` until the backlog recovers. Discovery ranges
-have a 180-second watchdog and retain their cursor on timeout.
+budget into discovery `4` and balances `6`. At 20,000 pending EVM+Sui jobs, or
+when the oldest EVM balance job is six hours old, `balance_only` lets in-flight
+discovery ranges finish and then pauses new EVM and Sui discovery. EVM balance,
+Sui enrichment and Sui TVL synchronization continue. Discovery resumes after
+ten stable minutes below 5,000 jobs and one hour oldest age. `/status` shows the
+governor state; manual `--balances-only` remains available. Discovery ranges
+retain their cursor on timeout.
+
+ERC-20 valuations of at least $100M and Sui project TVL of at least $10B are
+quarantined by default. Their raw quantities and observed prices/TVL stay in
+SQLite and reports, but are excluded from confirmed totals. A reviewed EVM
+exception is a `valuation_policies` entry in `config.yaml` with chain, address,
+asset (token contract address), `policy: include_verified`, and a nonempty
+reason. Sui exceptions use `sui.valuation_policies` with project_key, policy
+and reason. Back up `contracts.db` before deploying: startup idempotently
+revalues existing suspicious observations and reports must be regenerated.
 
 Основные настройки: `balance_concurrency`, `balance_chain_concurrency`,
 `balance_chain_timeout_sec`, `balance_address_timeout_sec`, `balance_retry_sec`,

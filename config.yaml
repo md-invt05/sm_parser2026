@@ -53,6 +53,7 @@ discover_tx_to_contracts: true
 code_cache_ttl_sec: 86400
 
 native_anomaly_usd: 100000000
+token_anomaly_usd: 100000000
 rabby_token_discovery_after_sec: 900
 valuation_policies:
   - chain: zk
@@ -84,6 +85,7 @@ sui:
   pool_verify_sec: 21600
   pool_limit: 5000
   pool_min_liquidity_usd: 25000
+  tvl_anomaly_usd: 10000000000
 
 chains:
   ethereum:

@@ -238,7 +238,7 @@ class ReportBuilder:
         parsed = iso_to_dt(value)
         return parsed.astimezone(self.tz).strftime("%d.%m %H:%M:%S") if parsed else "n/a"
 
-    def _sui_summary(self, cutoff: str | None = None) -> dict[str, int] | None:
+    def _sui_summary(self, cutoff: str | None = None) -> dict[str, Any] | None:
         if not self.contracts_db.exists():
             return None
         try:
@@ -260,13 +260,20 @@ class ReportBuilder:
                 ).fetchall())
                 statuses = dict(conn.execute(
                     """SELECT CASE
-                         WHEN provider_complete=0 OR packages_json='[]'
+                         WHEN status='incomplete' OR provider_complete=0 OR packages_json='[]'
                            OR strftime('%s','now')-strftime('%s',synced_at)>1800 THEN 'incomplete'
                          WHEN COALESCE(indexed_tvl,0)>=? THEN 'qualifying'
                          ELSE 'below' END AS current_status,COUNT(*)
                        FROM sui_defi_projects GROUP BY current_status""",
                     (min_usd,),
                 ).fetchall())
+                sync_row = conn.execute(
+                    "SELECT value FROM sui_sync_state WHERE key='last_defi_sync'"
+                ).fetchone()
+                last_sync = float(sync_row[0]) if sync_row else 0.0
+                error_row = conn.execute(
+                    "SELECT value FROM sui_sync_state WHERE key='last_defi_error'"
+                ).fetchone()
             return {
                 "packages": package_total, "new_packages": new_packages,
                 "objects": objects, "pending": pending,
@@ -275,6 +282,8 @@ class ReportBuilder:
                 "qualifying": int(statuses.get("qualifying", 0)),
                 "below": int(statuses.get("below", 0)),
                 "incomplete": int(statuses.get("incomplete", 0)),
+                "snapshot_age_sec": max(0.0, time.time() - last_sync) if last_sync else None,
+                "last_error": str(error_row[0]) if error_row and error_row[0] else None,
             }
         except sqlite3.Error:
             return None
@@ -335,7 +344,10 @@ class ReportBuilder:
         if sui:
             lines.append(
                 f"Sui: packages {sui['packages']:,} | >= threshold {sui['qualifying']:,} | "
-                f"incomplete {sui['incomplete']:,} | enrichment queue {sui['pending']:,}"
+                f"incomplete {sui['incomplete']:,} | enrichment queue {sui['pending']:,} | "
+                f"TVL snapshot {human_duration(sui['snapshot_age_sec'])} old"
+                f"{' (stale)' if sui['snapshot_age_sec'] is None or sui['snapshot_age_sec'] > 1800 else ''}"
+                f"{'; provider error: ' + sui['last_error'] if sui['last_error'] else ''}"
             )
         return "\n".join(lines)
 
@@ -416,6 +428,7 @@ class ReportBuilder:
                 worker_text = (
                     f"; worker {worker['stage']} {worker['range_start']}-{worker['range_end']} "
                     f"age {human_duration(age)}, failures {worker['failures']}"
+                    f", endpoint {worker['endpoint'] or 'none'}"
                 )
             lines.append(
                 f"• {row['chain']} [{row['role']}]: cursor {row['cursor']}, head {row['safe_head']}, lag {row['lag']}; "
@@ -841,6 +854,15 @@ class BotService:
 
     def _evaluate_chain_incidents(self, now: datetime) -> None:
         fifteen = (now - timedelta(minutes=15)).isoformat()
+        runtime = self.monitor.runtime()
+        try:
+            runtime_note = json.loads(runtime["note"] or "{}") if runtime is not None else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            runtime_note = {}
+        if not isinstance(runtime_note, dict):
+            runtime_note = {}
+        governor_note = runtime_note.get("load_governor")
+        discovery_held = isinstance(governor_note, dict) and governor_note.get("state") == "balance_only"
         latest_chains = self.monitor.rows(
             "SELECT chain,run_id,active_rpc,cooldown_sec,cursor,safe_head,ts FROM chain_samples WHERE id IN "
             "(SELECT MAX(id) FROM chain_samples WHERE role IN ('live','balance','discovery+balance') GROUP BY chain)"
@@ -915,7 +937,7 @@ class BotService:
             # the watchdog/stall alert.
             worker = self.monitor.discovery_worker(row["chain"], "live")
             waiting_for_slot = worker is not None and worker["stage"] == "queued"
-            stalled = stalled and not waiting_for_slot
+            stalled = stalled and not waiting_for_slot and not discovery_held
             if stalled:
                 worker_details = dict(worker) if worker is not None else {}
                 self.monitor.open_incident(

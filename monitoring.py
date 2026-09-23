@@ -244,7 +244,8 @@ CREATE TABLE IF NOT EXISTS discovery_workers(
     started_at TEXT,
     updated_at TEXT NOT NULL,
     failures INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    endpoint TEXT
 );
 """
 
@@ -272,6 +273,11 @@ class MonitorStore:
         }
         if "balance_oldest_age_sec" not in aggregate_columns:
             self.conn.execute("ALTER TABLE aggregate_samples ADD COLUMN balance_oldest_age_sec REAL")
+        worker_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(discovery_workers)")
+        }
+        if "endpoint" not in worker_columns:
+            self.conn.execute("ALTER TABLE discovery_workers ADD COLUMN endpoint TEXT")
         with self.conn:
             previous_version_row = self.conn.execute(
                 "SELECT version FROM schema_meta LIMIT 1"
@@ -296,6 +302,7 @@ class MonitorStore:
                     (utc_now(),),
                 )
                 self.conn.execute("UPDATE schema_meta SET version=2 WHERE version<2")
+            self.conn.execute("UPDATE schema_meta SET version=3 WHERE version<3")
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                 ("scanner_paused", "0", utc_now()),
@@ -510,6 +517,7 @@ class MonitorStore:
         self, chain: str, role: str, stage: str,
         range_start: int | None = None, range_end: int | None = None,
         failures: int = 0, last_error: str | None = None,
+        endpoint: str | None = None,
     ) -> None:
         now = utc_now()
         key = f"{chain}:{role}"
@@ -517,8 +525,8 @@ class MonitorStore:
             self.conn.execute(
                 """INSERT INTO discovery_workers(
                        worker_key,chain,role,stage,range_start,range_end,started_at,
-                       updated_at,failures,last_error)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                       updated_at,failures,last_error,endpoint)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(worker_key) DO UPDATE SET
                        stage=excluded.stage,range_start=excluded.range_start,
                        range_end=excluded.range_end,
@@ -527,9 +535,9 @@ class MonitorStore:
                              OR discovery_workers.range_end IS NOT excluded.range_end
                            THEN excluded.started_at ELSE discovery_workers.started_at END,
                        updated_at=excluded.updated_at,failures=excluded.failures,
-                       last_error=excluded.last_error""",
+                       last_error=excluded.last_error,endpoint=excluded.endpoint""",
                 (key, chain, role, stage, range_start, range_end, now, now,
-                 failures, last_error),
+                 failures, last_error, endpoint),
             )
 
     def discovery_worker(self, chain: str, role: str = "live") -> sqlite3.Row | None:

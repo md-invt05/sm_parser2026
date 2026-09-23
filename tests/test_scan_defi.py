@@ -401,10 +401,10 @@ class FakeBalanceRpc:
             target = params[0]["to"].lower()
             selector = params[0]["data"]
             if selector == scan_defi.DECIMALS_SEL:
-                return hex(18)
+                return "0x" + format(18, "064x")
             if selector == scan_defi.SYMBOL_SEL:
                 return "0x" + b"TOK".ljust(32, b"\0").hex()
-            return hex(self.token_balances.get(target, 0))
+            return "0x" + format(self.token_balances.get(target, 0), "064x")
         raise AssertionError(method)
 
     async def batch_partial(self, calls):
@@ -613,10 +613,10 @@ class MultichainBalanceTests(unittest.IsolatedAsyncioTestCase):
 class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
     def test_steady_governor_hysteresis(self):
         governor = scan_defi.LoadGovernor(True, 4, 1)
-        self.assertEqual((2, 0), governor.evaluate(25_000, 30_000, 5, now=0))
-        self.assertEqual("critical_drain", governor.state)
-        self.assertEqual((2, 0), governor.evaluate(10_000, 3_000, 5, now=100))
-        self.assertEqual((3, 0), governor.evaluate(10_000, 3_000, 5, now=701))
+        self.assertEqual((0, 0), governor.evaluate(25_000, 30_000, 5, now=0))
+        self.assertEqual("balance_only", governor.state)
+        self.assertEqual((0, 0), governor.evaluate(4_000, 3_000, 5, now=100))
+        self.assertEqual((3, 0), governor.evaluate(4_000, 3_000, 5, now=701))
         self.assertEqual((3, 0), governor.evaluate(1_000, 100, 5, now=800))
         self.assertEqual((4, 1), governor.evaluate(1_000, 100, 5, now=1401))
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import logging
 import os
 import random
@@ -155,6 +156,7 @@ class SuiConfig:
     pool_verify_sec: int = 21600
     pool_limit: int = 5000
     pool_min_liquidity_usd: float = 25000.0
+    tvl_anomaly_usd: float = 10_000_000_000.0
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any] | None) -> "SuiConfig":
@@ -177,6 +179,7 @@ class SuiConfig:
             pool_min_liquidity_usd=max(
                 0.0, float(raw.get("pool_min_liquidity_usd", 25000))
             ),
+            tvl_anomaly_usd=max(1.0, float(raw.get("tvl_anomaly_usd", 10_000_000_000))),
         )
 
 
@@ -517,7 +520,9 @@ CREATE TABLE IF NOT EXISTS sui_discoveries(
 );
 CREATE TABLE IF NOT EXISTS sui_seen_transactions(
   digest TEXT PRIMARY KEY, checkpoint INTEGER NOT NULL, timestamp_ms INTEGER,
-  enriched INTEGER NOT NULL DEFAULT 0, seen_at TEXT NOT NULL
+  enriched INTEGER NOT NULL DEFAULT 0, seen_at TEXT NOT NULL,
+  failure_streak INTEGER NOT NULL DEFAULT 0, next_retry_at REAL NOT NULL DEFAULT 0,
+  last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS sui_package_objects(
   package_id TEXT NOT NULL, object_id TEXT NOT NULL, object_type TEXT,
@@ -545,7 +550,12 @@ CREATE INDEX IF NOT EXISTS idx_sui_scans_latest ON sui_package_scans(package_id,
 CREATE TABLE IF NOT EXISTS sui_defi_projects(
   project_key TEXT PRIMARY KEY, project_name TEXT NOT NULL, indexed_tvl REAL,
   status TEXT NOT NULL, packages_json TEXT NOT NULL, synced_at TEXT NOT NULL,
-  provider_complete INTEGER NOT NULL DEFAULT 1, note TEXT
+  provider_complete INTEGER NOT NULL DEFAULT 1, note TEXT,
+  raw_tvl TEXT, valuation_status TEXT NOT NULL DEFAULT 'included'
+);
+CREATE TABLE IF NOT EXISTS sui_tvl_policies(
+  project_key TEXT PRIMARY KEY, policy TEXT NOT NULL, reason TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sui_project_packages(
   project_key TEXT NOT NULL, package_id TEXT NOT NULL, first_seen_at TEXT NOT NULL,
@@ -581,6 +591,34 @@ class SuiStore:
         else:
             with self.conn:
                 self.conn.executescript(SUI_SCHEMA)
+                columns = {row["name"] for row in self.conn.execute(
+                    "PRAGMA table_info(sui_defi_projects)"
+                )}
+                if "raw_tvl" not in columns:
+                    self.conn.execute("ALTER TABLE sui_defi_projects ADD COLUMN raw_tvl TEXT")
+                if "valuation_status" not in columns:
+                    self.conn.execute(
+                        "ALTER TABLE sui_defi_projects ADD COLUMN valuation_status TEXT "
+                        "NOT NULL DEFAULT 'included'"
+                    )
+                self.conn.execute(
+                    "UPDATE sui_defi_projects SET raw_tvl=CAST(indexed_tvl AS TEXT) "
+                    "WHERE raw_tvl IS NULL AND indexed_tvl IS NOT NULL"
+                )
+                seen_columns = {row["name"] for row in self.conn.execute(
+                    "PRAGMA table_info(sui_seen_transactions)"
+                )}
+                if "failure_streak" not in seen_columns:
+                    self.conn.execute(
+                        "ALTER TABLE sui_seen_transactions ADD COLUMN failure_streak INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "next_retry_at" not in seen_columns:
+                    self.conn.execute(
+                        "ALTER TABLE sui_seen_transactions ADD COLUMN next_retry_at REAL NOT NULL DEFAULT 0"
+                    )
+                if "last_error" not in seen_columns:
+                    self.conn.execute("ALTER TABLE sui_seen_transactions ADD COLUMN last_error TEXT")
+                self.conn.execute("UPDATE sui_schema_meta SET version=3 WHERE version<3")
 
     def close(self) -> None:
         self.conn.close()
@@ -602,6 +640,23 @@ class SuiStore:
     def mark_dirty(self) -> None:
         with self._lock, self.conn:
             self._bump_revision_locked()
+
+    def seed_tvl_policies(self, policies: list[dict[str, Any]]) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            for item in policies:
+                policy = str(item.get("policy") or "")
+                reason = str(item.get("reason") or "").strip()
+                key = str(item.get("project_key") or "").strip().lower()
+                if not key or not reason or policy not in {"include_verified", "quarantine"}:
+                    raise ValueError("Sui TVL policy requires project_key, policy and reason")
+                self.conn.execute(
+                    """INSERT INTO sui_tvl_policies(project_key,policy,reason,updated_at)
+                       VALUES(?,?,?,?) ON CONFLICT(project_key) DO UPDATE SET
+                         policy=excluded.policy,reason=excluded.reason,
+                         updated_at=excluded.updated_at""",
+                    (key, policy, reason, now),
+                )
 
     def seen(self, digest: str) -> bool:
         with self._lock:
@@ -677,9 +732,25 @@ class SuiStore:
     def pending_enrichment(self, limit: int) -> list[sqlite3.Row]:
         with self._lock:
             return list(self.conn.execute(
-                "SELECT * FROM sui_seen_transactions WHERE enriched=0 ORDER BY checkpoint DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM sui_seen_transactions WHERE enriched=0 AND next_retry_at<=? "
+                "ORDER BY checkpoint ASC,digest LIMIT ?",
+                (time.time(), limit),
             ))
+
+    def defer_enrichment(self, digest: str, error: str) -> None:
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT failure_streak FROM sui_seen_transactions WHERE digest=?", (digest,),
+            ).fetchone()
+            if row is None:
+                return
+            streak = int(row[0]) + 1
+            delay = min(3600, 30 * 2 ** min(streak - 1, 7))
+            self.conn.execute(
+                "UPDATE sui_seen_transactions SET failure_streak=?,next_retry_at=?,"
+                "last_error=? WHERE digest=?",
+                (streak, time.time() + delay, error[:120], digest),
+            )
 
     def finish_enrichment(self, digest: str) -> None:
         with self._lock, self.conn:
@@ -779,7 +850,10 @@ class SuiStore:
                 (package_id,),
             ))
 
-    def sync_defi_projects(self, rows: list[dict[str, Any]], min_usd: float) -> int:
+    def sync_defi_projects(
+        self, rows: list[dict[str, Any]], min_usd: float,
+        tvl_anomaly_usd: float = 10_000_000_000.0,
+    ) -> int:
         now = utc_now()
         seen: set[str] = set()
         with self._lock, self.conn:
@@ -795,6 +869,9 @@ class SuiStore:
                     tvl = float(tvl_raw) if tvl_raw is not None else None
                 except (TypeError, ValueError):
                     tvl = None
+                invalid_tvl = tvl is not None and not math.isfinite(tvl)
+                if invalid_tvl:
+                    tvl = None
                 packages: list[str] = []
                 for item in raw.get("packages") or raw.get("projectPackages") or []:
                     candidate = (
@@ -806,22 +883,37 @@ class SuiStore:
                     except (TypeError, ValueError):
                         continue
                 packages = sorted(set(packages))
+                policy = self.conn.execute(
+                    "SELECT policy,reason FROM sui_tvl_policies WHERE project_key=?", (key,),
+                ).fetchone()
+                quarantine = (
+                    policy is not None and policy["policy"] == "quarantine"
+                ) or (
+                    (invalid_tvl or (tvl is not None and tvl >= tvl_anomaly_usd))
+                    and not (policy is not None and policy["policy"] == "include_verified" and not invalid_tvl)
+                )
                 status = (
-                    "incomplete" if tvl is None or not packages
+                    "incomplete" if tvl is None or not packages or quarantine
                     else "qualifying" if tvl >= min_usd else "below"
                 )
-                note = None if packages else "Blockberry project has no package mapping"
+                note = (
+                    f"indexed TVL quarantined (invalid, >= ${tvl_anomaly_usd:,.0f}, or policy)"
+                    if quarantine else None if packages else "Blockberry project has no package mapping"
+                )
+                valuation_status = "anomalous_balance" if quarantine else "included"
                 self.conn.execute(
                     """INSERT INTO sui_defi_projects(
                          project_key,project_name,indexed_tvl,status,packages_json,synced_at,
-                         provider_complete,note
-                       ) VALUES(?,?,?,?,?,?,?,?)
+                         provider_complete,note,raw_tvl,valuation_status
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(project_key) DO UPDATE SET
                          project_name=excluded.project_name,indexed_tvl=excluded.indexed_tvl,
                          status=excluded.status,packages_json=excluded.packages_json,
                          synced_at=excluded.synced_at,provider_complete=excluded.provider_complete,
-                         note=excluded.note""",
-                    (key, name, tvl, status, json.dumps(packages), now, 1, note),
+                         note=excluded.note,raw_tvl=excluded.raw_tvl,
+                         valuation_status=excluded.valuation_status""",
+                    (key, name, tvl, status, json.dumps(packages), now, 1, note,
+                     str(tvl_raw) if tvl_raw is not None else None, valuation_status),
                 )
                 self.conn.execute(
                     "DELETE FROM sui_project_packages WHERE project_key=?", (key,)
@@ -936,19 +1028,36 @@ class SuiStore:
             )
 
     def mark_defi_sync_failed(self, note: str) -> None:
-        """Keep the last known TVL, but make its incomplete coverage explicit."""
+        """Record the outage without mutating the last valid TVL snapshot."""
         safe_note = str(note or "Blockberry DeFi sync failed")[:500]
         with self._lock, self.conn:
-            self.conn.execute(
-                "UPDATE sui_defi_projects SET provider_complete=0,note=?",
-                (safe_note,),
-            )
             self.conn.execute(
                 """INSERT INTO sui_sync_state(key,value,updated_at) VALUES('last_defi_error',?,?)
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
                 (safe_note, utc_now()),
             )
-            self._bump_revision_locked()
+
+    def revalue_suspicious_projects(self, threshold_usd: float) -> int:
+        """Idempotently quarantine existing huge TVL, preserving indexed_tvl."""
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                """SELECT p.project_key FROM sui_defi_projects p
+                   LEFT JOIN sui_tvl_policies v ON v.project_key=p.project_key
+                   WHERE p.valuation_status!='anomalous_balance'
+                     AND (v.policy='quarantine' OR
+                          (p.indexed_tvl>=? AND COALESCE(v.policy,'')!='include_verified'))""",
+                (threshold_usd,),
+            ).fetchall()
+            for row in rows:
+                self.conn.execute(
+                    "UPDATE sui_defi_projects SET status='incomplete',"
+                    "valuation_status='anomalous_balance',note=? WHERE project_key=?",
+                    (f"indexed TVL quarantined (>= ${threshold_usd:,.0f} or policy)",
+                     row["project_key"]),
+                )
+            if rows:
+                self._bump_revision_locked()
+        return len(rows)
 
     def pool_summary(self) -> dict[str, int]:
         with self._lock:
@@ -994,6 +1103,7 @@ def _package_from_metadata(row: dict[str, Any]) -> tuple[str, dict[str, Any]] | 
 async def discover_sui_once(
     store: SuiStore, client: BlockberryClient, cfg: SuiConfig,
     from_checkpoint: int | None = None, to_checkpoint: int | None = None,
+    *, enrich: bool = True,
 ) -> dict[str, Any]:
     packages_before = int(store.conn.execute("SELECT COUNT(*) FROM sui_packages").fetchone()[0])
     cutoff_ms = int((datetime.now(UTC) - timedelta(days=cfg.discovery_days)).timestamp() * 1000)
@@ -1009,6 +1119,8 @@ async def discover_sui_once(
             stopped_at_cutoff = True
             break
         for tx in rows:
+            if not isinstance(tx, dict):
+                continue
             if str(tx.get("txStatus") or "").upper() != "SUCCESS":
                 continue
             checkpoint = int(tx.get("checkpoint") or 0)
@@ -1085,19 +1197,7 @@ async def discover_sui_once(
             catalog_complete = True
             break
 
-    enriched = 0
-    for row in store.pending_enrichment(cfg.raw_enrich_per_pass):
-        raw = await client.raw_transaction(row["digest"])
-        parsed = parse_raw_transaction(raw)
-        result = raw["result"]
-        actor = (((result.get("transaction") or {}).get("data") or {}).get("sender"))
-        for package_id in parsed["calls"]:
-            store.upsert_package(package_id, "active_call", row["checkpoint"], row["digest"], actor)
-        for package_id in parsed["published"]:
-            store.upsert_package(package_id, "publish", row["checkpoint"], row["digest"], actor)
-        store.add_objects(parsed["objects"], int(row["checkpoint"]))
-        store.finish_enrichment(row["digest"])
-        enriched += 1
+    enriched = await enrich_sui_once(store, client, cfg) if enrich else 0
 
     limited = not (stopped_at_cutoff or reached_saved_cursor)
     note = (
@@ -1112,6 +1212,43 @@ async def discover_sui_once(
         store.mark_dirty()
     return {"head": maximum_checkpoint, "new_transactions": new_txs,
             "enriched": enriched, "window_limited": limited, "oldest_ms": oldest_ms}
+
+
+async def enrich_sui_once(store: SuiStore, client: BlockberryClient, cfg: SuiConfig) -> int:
+    enriched = 0
+    for row in store.pending_enrichment(cfg.raw_enrich_per_pass):
+        try:
+            raw = await client.raw_transaction(row["digest"])
+            parsed = parse_raw_transaction(raw)
+            result = raw["result"]
+            actor = (((result.get("transaction") or {}).get("data") or {}).get("sender"))
+            for package_id in parsed["calls"]:
+                store.upsert_package(package_id, "active_call", row["checkpoint"], row["digest"], actor)
+            for package_id in parsed["published"]:
+                store.upsert_package(package_id, "publish", row["checkpoint"], row["digest"], actor)
+            store.add_objects(parsed["objects"], int(row["checkpoint"]))
+            store.finish_enrichment(row["digest"])
+            enriched += 1
+        except (BlockberryError, ValueError, TypeError, KeyError) as exc:
+            store.defer_enrichment(row["digest"], type(exc).__name__)
+            log.warning("[sui/enrichment] deferred %s: %s", row["digest"][:12], type(exc).__name__)
+    if enriched:
+        store.mark_dirty()
+    return enriched
+
+
+async def sui_enrichment_loop(
+    store: SuiStore, client: BlockberryClient, cfg: SuiConfig, stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        enriched = await enrich_sui_once(store, client, cfg)
+        if enriched:
+            log.info("[sui/enrichment] enriched=%s pending=%s", enriched,
+                     store.summary()["enrichment_pending"])
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1 if enriched else cfg.poll_sec)
+        except asyncio.TimeoutError:
+            pass
 
 
 def _balance_item(owner: str, row: dict[str, Any]) -> dict[str, Any] | None:
@@ -1166,7 +1303,7 @@ async def balance_sui_once(
     limit: int = 100, stop: asyncio.Event | None = None,
 ) -> list[dict[str, Any]]:
     projects = await client.defi_projects()
-    store.sync_defi_projects(projects, min_usd)
+    store.sync_defi_projects(projects, min_usd, cfg.tvl_anomaly_usd)
     store.set_sync_value("last_defi_sync", time.time())
     store.set_sync_value("last_defi_error", "")
 
@@ -1220,9 +1357,19 @@ async def sui_discovery_loop(
     store: SuiStore, client: BlockberryClient, cfg: SuiConfig, stop: asyncio.Event,
     *, once: bool = False, from_checkpoint: int | None = None,
     to_checkpoint: int | None = None, monitor: Any = None, run_id: int | None = None,
+    discovery_allowed: Any = None,
 ) -> None:
     while not stop.is_set():
-        result = await discover_sui_once(store, client, cfg, from_checkpoint, to_checkpoint)
+        if discovery_allowed is not None and not discovery_allowed():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        result = await discover_sui_once(
+            store, client, cfg, from_checkpoint, to_checkpoint,
+            enrich=discovery_allowed is None,
+        )
         summary = store.summary()
         metrics = client.take_metrics()
         if monitor is not None:
@@ -1309,7 +1456,7 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
             age = float("inf")
         tvl = float(row["indexed_tvl"] or 0.0)
         status = (
-            "incomplete" if age > 1800 or not row["provider_complete"]
+            "incomplete" if age > 1800 or row["status"] == "incomplete" or not row["provider_complete"]
             or not json.loads(row["packages_json"] or "[]")
             else "qualifying" if tvl >= min_usd else "below"
         )
