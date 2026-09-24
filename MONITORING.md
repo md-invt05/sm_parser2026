@@ -48,7 +48,10 @@ Discovery uses separate fair live/backfill queues. Profile capacities are `4/1` 
 older than 30 seconds take FIFO priority; otherwise the largest lag is served first.
 `/status` shows active slots, queued networks, and the oldest wait time.
 Automatic exports run every six hours and rebuild only the qualifying EVM/Sui files.
-`/export` and non-qualifying `/file` requests build the complete report bundle.
+`/export` forces the complete report bundle. `/file` sends a nonempty report
+immediately when it was generated within the last six hours; otherwise it
+queues only that report. Repeated requests for the same pending export share
+the same job. The bot shows new and due-for-recheck EVM work separately.
 Pause is cooperative: no new block range or address starts while current SQLite
 transactions finish. SIGTERM has a 35-second Compose grace period and performs a
 final export. Online SQLite backups are created daily; the newest seven are kept.

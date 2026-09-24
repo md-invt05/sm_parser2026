@@ -37,6 +37,7 @@ load_dotenv(ROOT / ".env")
 log = logging.getLogger("telegram-monitor")
 UTC = timezone.utc
 TELEGRAM_SAFE_FILE_BYTES = 45 * 1024 * 1024
+FILE_FRESH_SEC = 6 * 3600
 
 
 def human_bytes(value: float | int | None) -> str:
@@ -82,6 +83,15 @@ def iso_to_dt(value: str | None) -> datetime | None:
 def timestamp_span(first: str | None, last: str | None) -> float:
     first_dt, last_dt = iso_to_dt(first), iso_to_dt(last)
     return max(0.0, (last_dt - first_dt).total_seconds()) if first_dt and last_dt else 0.0
+
+
+def balance_scans_stalled(sample: Any) -> bool:
+    return bool(
+        int(sample["pending"] or 0) > 0
+        and sample["min_done"] is not None
+        and sample["min_done"] == sample["max_done"]
+        and timestamp_span(sample["first_ts"], sample["last_ts"]) >= 540
+    )
 
 
 def parse_prometheus(text: str) -> dict[str, list[tuple[dict[str, str], float]]]:
@@ -338,6 +348,11 @@ class ReportBuilder:
                 f"Адреса: {aggregate['unique_addresses']:,} | очередь: {aggregate['balance_pending']:,}"
             )
             lines.append(
+                f"Balance queue: new {aggregate['balance_new_pending']:,}, "
+                f"retry {aggregate['balance_retry_pending']:,}; "
+                f"completed scans {aggregate['balance_scans_total']:,}"
+            )
+            lines.append(
                 f"≥ порога: {aggregate['qualifying']:,} | below: {aggregate['below_count']:,} | incomplete: {aggregate['incomplete']:,}"
             )
         sui = self._sui_summary()
@@ -366,12 +381,18 @@ class ReportBuilder:
         if not aggregates:
             return self.status() + "\n\nЗа выбранный период минутных срезов пока нет."
         first, last = aggregates[0], aggregates[-1]
+        scan_delta = (
+            f"+{max(0, last['balance_scans_total'] - first['balance_scans_total']):,}"
+            if first["balance_scans_total"] and first["run_id"] == last["run_id"]
+            else "n/a after restart or metrics migration"
+        )
         lines = [
             f"Отчёт за {human_duration(seconds)} (МСК)", self.status(), "",
             f"Новых уникальных адресов: {max(0, last['unique_addresses'] - first['unique_addresses']):,}",
             f"Новых instances: {max(0, last['contract_instances'] - first['contract_instances']):,}",
             f"Источники: direct +{max(0, last['direct_deploy'] - first['direct_deploy']):,}, active_call +{max(0, last['active_call'] - first['active_call']):,}",
-            f"Обработано balance: +{max(0, last['balance_completed'] - first['balance_completed']):,}",
+            f"Balance scans: {scan_delta}; "
+            f"first-time addresses: +{max(0, last['balance_completed'] - first['balance_completed']):,}",
             f"≥ порога: +{max(0, last['qualifying'] - first['qualifying']):,}, сейчас {last['qualifying']:,}",
             f"below/incomplete: {last['below_count']:,}/{last['incomplete']:,}; очередь {last['balance_pending']:,}, oldest {human_duration(last['balance_oldest_age_sec'])}",
             "Coverage: " + ", ".join(
@@ -409,6 +430,13 @@ class ReportBuilder:
         return "\n".join(lines)[:4000]
 
     def networks(self) -> str:
+        runtime = self.monitor.runtime()
+        try:
+            runtime_note = json.loads(runtime["note"] or "{}") if runtime else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            runtime_note = {}
+        governor = runtime_note.get("load_governor") or {} if isinstance(runtime_note, dict) else {}
+        paused_by_governor = governor.get("state") == "balance_only"
         rows = self.monitor.rows(
             """
             SELECT c.* FROM chain_samples c JOIN(
@@ -425,11 +453,14 @@ class ReportBuilder:
             if worker is not None and row["role"] in {"live", "backfill"}:
                 started = iso_to_dt(worker["started_at"])
                 age = (datetime.now(UTC) - started).total_seconds() if started else None
-                worker_text = (
-                    f"; worker {worker['stage']} {worker['range_start']}-{worker['range_end']} "
-                    f"age {human_duration(age)}, failures {worker['failures']}"
-                    f", endpoint {worker['endpoint'] or 'none'}"
-                )
+                if paused_by_governor and worker["stage"] == "queued":
+                    worker_text = "; worker paused_by_balance_only (range preserved)"
+                else:
+                    worker_text = (
+                        f"; worker {worker['stage']} {worker['range_start']}-{worker['range_end']} "
+                        f"age {human_duration(age)}, failures {worker['failures']}"
+                        f", endpoint {worker['endpoint'] or 'none'}"
+                    )
             lines.append(
                 f"• {row['chain']} [{row['role']}]: cursor {row['cursor']}, head {row['safe_head']}, lag {row['lag']}; "
                 f"RPC {row['active_rpc']}; cooldown {float(row['cooldown_sec'] or 0):.0f}s; "
@@ -650,18 +681,23 @@ class BotService:
                 "sui_qualifying|sui_below|sui_incomplete|sui_packages"
             )
             return
-        if key not in {"qualifying", "sui_qualifying"}:
-            await update.message.reply_text("Обновляю полный комплект отчётов…")
-            request_id = self.monitor.request_control(
-                "export", str(update.effective_chat.id), {"requested_file": key},
+        path = ROOT / "reports" / mapping[key]
+        age = time.time() - path.stat().st_mtime if path.exists() and path.stat().st_size else None
+        if age is None or age > FILE_FRESH_SEC:
+            await update.message.reply_text(
+                "Отчёт старше 6 часов или отсутствует; обновляю только запрошенный файл…"
             )
+            request_id = self.monitor.request_export_once(str(update.effective_chat.id), key)
             completed = await self.wait_control(request_id, 300)
             if not completed:
+                if not path.exists():
+                    await update.message.reply_text("Экспорт ещё выполняется; готового файла пока нет.")
+                    return
                 await update.message.reply_text(
-                    "Экспорт ещё выполняется; файл можно запросить повторно позже."
+                    f"Экспорт ещё выполняется; отправляю предыдущий файл "
+                    f"(возраст {human_duration(time.time() - path.stat().st_mtime)})."
                 )
-                return
-        await self.send_file(update.effective_chat.id, ROOT / "reports" / mapping[key], context.bot)
+        await self.send_file(update.effective_chat.id, path, context.bot)
 
     async def wait_control(self, request_id: int, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
@@ -963,6 +999,7 @@ class BotService:
             self.monitor.resolve_incident("monitor:docker_unavailable")
 
         now = datetime.now(UTC)
+        migrating = bool(runtime and runtime["state"] == "migrating")
         five = (now - timedelta(minutes=5)).isoformat()
         ten = (now - timedelta(minutes=10)).isoformat()
         rpc_rows = self.monitor.rows(
@@ -973,21 +1010,18 @@ class BotService:
         self._condition(req >= 50 and err / req > .20, "rpc:error_rate", "critical", "rpc_error_rate",
                         f"RPC error rate is {err / req:.1%} ({err}/{req})" if req else "RPC error rate high")
 
-        self._evaluate_chain_incidents(now)
+        if not migrating:
+            self._evaluate_chain_incidents(now)
 
         balances = self.monitor.rows(
-            "SELECT MIN(balance_completed) min_done,MAX(balance_completed) max_done,MAX(balance_pending) pending,"
+            "SELECT MIN(balance_scans_total) min_done,MAX(balance_scans_total) max_done,MAX(balance_pending) pending,"
             "MIN(ts) first_ts,MAX(ts) last_ts "
             "FROM aggregate_samples WHERE ts>=?", (ten,),
         )[0]
-        balance_stalled = (
-            int(balances["pending"] or 0) > 0
-            and balances["min_done"] is not None
-            and balances["min_done"] == balances["max_done"]
-            and timestamp_span(balances["first_ts"], balances["last_ts"]) >= 540
-        )
-        self._condition(balance_stalled, "balance:stalled", "critical", "balance_stall",
-                        "Balance queue is non-empty and no address completed for 10 minutes")
+        balance_stalled = balance_scans_stalled(balances)
+        if not migrating:
+            self._condition(balance_stalled, "balance:stalled", "critical", "balance_stall",
+                            "Balance queue is non-empty and no balance scan completed for 10 minutes")
 
         restart_rows = self.monitor.rows(
             "SELECT MIN(restart_count) first_count,MAX(restart_count) last_count "

@@ -141,8 +141,11 @@ CREATE TABLE IF NOT EXISTS aggregate_samples(
     direct_deploy INTEGER NOT NULL DEFAULT 0,
     active_call INTEGER NOT NULL DEFAULT 0,
     balance_pending INTEGER NOT NULL DEFAULT 0,
+    balance_new_pending INTEGER NOT NULL DEFAULT 0,
+    balance_retry_pending INTEGER NOT NULL DEFAULT 0,
     balance_oldest_age_sec REAL,
     balance_completed INTEGER NOT NULL DEFAULT 0,
+    balance_scans_total INTEGER NOT NULL DEFAULT 0,
     qualifying INTEGER NOT NULL DEFAULT 0,
     below_count INTEGER NOT NULL DEFAULT 0,
     incomplete INTEGER NOT NULL DEFAULT 0,
@@ -273,6 +276,11 @@ class MonitorStore:
         }
         if "balance_oldest_age_sec" not in aggregate_columns:
             self.conn.execute("ALTER TABLE aggregate_samples ADD COLUMN balance_oldest_age_sec REAL")
+        for name in ("balance_new_pending", "balance_retry_pending", "balance_scans_total"):
+            if name not in aggregate_columns:
+                self.conn.execute(
+                    f"ALTER TABLE aggregate_samples ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                )
         worker_columns = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(discovery_workers)")
         }
@@ -395,11 +403,14 @@ class MonitorStore:
         columns = [
             "ts", "run_id", "unique_addresses", "contract_instances", "direct_deploy",
             "active_call", "balance_pending", "balance_completed", "qualifying",
+            "balance_new_pending", "balance_retry_pending", "balance_scans_total",
             "balance_oldest_age_sec",
             "below_count", "incomplete", "coverage_json", "db_bytes", "wal_bytes",
             "reports_json", "last_export_at",
         ]
         values.setdefault("ts", utc_now())
+        for name in ("balance_new_pending", "balance_retry_pending", "balance_scans_total"):
+            values.setdefault(name, 0)
         for key in ("coverage_json", "reports_json"):
             values[key] = json.dumps(values.get(key, {}), ensure_ascii=False)
         with self._lock, self.conn:
@@ -490,6 +501,36 @@ class MonitorStore:
             cur = self.conn.execute(
                 "INSERT INTO control_requests(action,payload_json,requested_by,requested_at) VALUES(?,?,?,?)",
                 (action, json.dumps(payload or {}, ensure_ascii=False), requested_by, utc_now()),
+            )
+            return int(cur.lastrowid)
+
+    def request_export_once(
+        self, requested_by: str, file_key: str,
+    ) -> int:
+        """Join a pending full/target export instead of queuing a duplicate."""
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT id,action,payload_json FROM control_requests "
+                "WHERE status='pending' AND action IN ('export','export_file','export_qualifying') "
+                "ORDER BY id"
+            ).fetchall()
+            for row in rows:
+                if row["action"] == "export":
+                    return int(row["id"])
+                if row["action"] == "export_qualifying" and file_key in {
+                    "qualifying", "sui_qualifying"
+                }:
+                    return int(row["id"])
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                if payload.get("file_key") == file_key:
+                    return int(row["id"])
+            cur = self.conn.execute(
+                "INSERT INTO control_requests(action,payload_json,requested_by,requested_at) "
+                "VALUES('export_file',?,?,?)",
+                (json.dumps({"file_key": file_key}), requested_by, utc_now()),
             )
             return int(cur.lastrowid)
 

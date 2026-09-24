@@ -68,6 +68,28 @@ ZERO = "0x0000000000000000000000000000000000000000"
 LLAMA_PRICES = "https://coins.llama.fi/prices/current/"
 # Task-local policy: balance probes must not inherit the indexer's long retries.
 BALANCE_RPC = ContextVar("balance_rpc", default=False)
+BALANCE_SCHEDULE_REVISION = "2"
+
+
+def balance_retry_delay(status: str, has_code: int | None, usd: float | None,
+                        threshold: float, failure_streak: int = 0) -> int:
+    """Seconds until this chain needs another probe; never discard an address."""
+    if status in {"rpc_error", "partial", "timeout"}:
+        return (600, 1800, 7200, 21600, 86400)[min(max(failure_streak - 1, 0), 4)]
+    if status == "price_missing":
+        return 21600
+    if status == "anomalous_balance":
+        return 86400
+    if has_code == 0 or status == "absent":
+        return 30 * 86400
+    amount = float(usd or 0)
+    if amount >= threshold:
+        return 21600
+    if amount >= threshold * 0.1:
+        return 86400
+    if amount > 0:
+        return 3 * 86400
+    return 7 * 86400
 
 RATE_HINTS = (
     "rate limit",
@@ -1544,20 +1566,33 @@ class DB:
     def upsert_contract_tokens(self, rows: list[tuple[str, str, str, str, int]]) -> None:
         if not rows:
             return
-        with self._lock:
-            self.conn.executemany(
-                """
-                INSERT INTO contract_tokens(
-                    chain, contract, token, source, first_seen_block, last_seen_block
-                ) VALUES (?,?,?,?,?,?)
-                ON CONFLICT(chain, contract, token) DO UPDATE SET
-                    last_seen_block=CASE
-                        WHEN excluded.last_seen_block > contract_tokens.last_seen_block
-                        THEN excluded.last_seen_block ELSE contract_tokens.last_seen_block END
-                """,
-                [(*row, row[4]) for row in rows],
-            )
-            self.conn.commit()
+        with self._lock, self.conn:
+            now = datetime.now(timezone.utc).isoformat()
+            for chain, contract, token, source, block in rows:
+                contract = contract.lower()
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO contract_tokens"
+                    "(chain,contract,token,source,first_seen_block,last_seen_block) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (chain, contract, token, source, block, block),
+                )
+                if cur.rowcount:
+                    # A newly observed token can turn a previously empty contract
+                    # valuable.  Probe only this chain again, without resetting all
+                    # other cross-chain schedules.
+                    self.conn.execute(
+                        "UPDATE address_chain_state SET next_retry_at=? "
+                        "WHERE address=? AND chain=? AND next_retry_at>?",
+                        (now, contract, chain, now),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE contract_tokens SET last_seen_block=CASE "
+                        "WHEN last_seen_block IS NULL OR last_seen_block<? THEN ? "
+                        "ELSE last_seen_block END "
+                        "WHERE chain=? AND contract=? AND token=?",
+                        (block, block, chain, contract, token),
+                    )
 
     def tokens_for_contract(self, chain: str, contract: str) -> list[sqlite3.Row]:
         with self._lock:
@@ -1584,35 +1619,36 @@ class DB:
 
     def pending_addresses(
         self, recheck_sec: int, limit: int = 200, retry_sec: int | None = None,
-        as_of: float | None = None,
+        as_of: float | None = None, min_usd: float = 500_000,
     ) -> list[str]:
         now_iso = datetime.fromtimestamp(
             time.time() if as_of is None else as_of, timezone.utc
         ).isoformat()
         with self._lock:
-            rows = self.conn.execute(
-                """
-                SELECT lower(c.address) AS address
-                FROM contracts c
-                GROUP BY lower(c.address)
-                HAVING NOT EXISTS (
-                    SELECT 1 FROM address_chain_state s
-                    WHERE s.address=lower(c.address)
-                ) OR EXISTS (
-                    SELECT 1 FROM address_chain_state s
-                    WHERE s.address=lower(c.address) AND s.next_retry_at<=?
-                )
-                -- New addresses must be drained in discovery order.  Sorting
-                -- them lexicographically by address made the oldest pending
-                -- item age forever even while the worker was busy.
-                ORDER BY MIN(c.last_checked_at IS NOT NULL),
-                         MIN(COALESCE(c.first_seen_at,'')),
-                         MIN(COALESCE(c.last_checked_at,'')), lower(c.address)
-                LIMIT ?
-                """,
-                (now_iso, limit),
+            # New addresses first.  Existing work comes directly from the
+            # next_retry_at index, not a GROUP BY over every contract on each poll.
+            new_rows = self.conn.execute(
+                """SELECT lower(c.address) address,MIN(c.first_seen_at) due_at
+                   FROM contracts c WHERE NOT EXISTS(
+                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
+                   GROUP BY lower(c.address) ORDER BY due_at,address LIMIT ?""",
+                (limit,),
             ).fetchall()
-            return [row["address"] for row in rows]
+            addresses = [str(row["address"]) for row in new_rows]
+            if len(addresses) >= limit:
+                return addresses
+            due_rows = self.conn.execute(
+                """SELECT s.address,MIN(s.next_retry_at) due_at,
+                          EXISTS(SELECT 1 FROM contracts c WHERE c.address=s.address
+                                 AND c.last_total_usd>=?) priority
+                   FROM address_chain_state s
+                   WHERE s.next_retry_at<=?
+                   GROUP BY s.address
+                   ORDER BY priority DESC,due_at,s.address LIMIT ?""",
+                (min_usd, now_iso, limit - len(addresses)),
+            ).fetchall()
+            addresses.extend(str(row["address"]) for row in due_rows)
+            return addresses
 
     def due_address_chains(
         self, address: str, chain_keys: list[str], as_of: float | None = None,
@@ -1649,14 +1685,10 @@ class DB:
             ).fetchone()
             failed = status in {"rpc_error", "partial", "timeout"}
             failure_streak = (int(previous["failure_streak"]) if previous else 0) + 1 if failed else 0
-            if failed:
-                delay = min(21_600, 600 * (2 ** min(max(0, failure_streak - 1), 6)))
-            elif status in {"price_missing", "anomalous_balance"}:
-                delay = 3_600
-            elif status == "complete" and float(row.get("total_usd") or 0) >= min_usd:
-                delay = 21_600
-            else:
-                delay = 86_400
+            delay = balance_retry_delay(
+                status, row.get("has_code"), row.get("total_usd"), min_usd,
+                failure_streak,
+            )
             next_retry = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
             has_observation = row.get("has_code") is not None and row.get("total_usd") is not None
             def observed(name: str, fallback: Any = None) -> Any:
@@ -1775,17 +1807,87 @@ class DB:
                 chain_rows.append(row)
         return chain_rows, tokens
 
-    def apply_address_schedule(self, address: str, status: str) -> None:
-        if status != "qualifying":
+    def apply_address_schedule(
+        self, address: str, status: str, total_usd: float = 0,
+        min_usd: float = 500_000,
+    ) -> None:
+        # A cross-chain sum can be near/above threshold even when every
+        # individual chain is below it.  Bring healthy bytecode chains forward.
+        if status != "qualifying" and total_usd < min_usd * 0.1:
             return
-        target = datetime.fromtimestamp(time.time() + 21_600, timezone.utc).isoformat()
+        delay = 21_600 if status == "qualifying" else 86_400
+        target = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat()
         with self._lock, self.conn:
             self.conn.execute(
                 """UPDATE address_chain_state SET next_retry_at=CASE
                      WHEN next_retry_at>? THEN ? ELSE next_retry_at END
-                   WHERE address=? AND status NOT IN ('rpc_error','partial','price_missing','anomalous_balance')""",
+                   WHERE address=? AND has_code=1 AND status='complete' AND total_usd>0""",
                 (target, target, address.lower()),
             )
+
+    def needs_balance_schedule_rephase(self) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='balance_schedule_revision'"
+            ).fetchone()
+            return row is None or row[0] != BALANCE_SCHEDULE_REVISION
+
+    def rephase_balance_schedule(self, min_usd: float) -> int:
+        """One-time, deterministic schedule migration; never changes scans/cursors."""
+        if not self.needs_balance_schedule_rephase():
+            return 0
+        with self._lock, self.conn:
+            latest = {
+                str(row["address"]): (str(row["status"]), float(row["total_usd"] or 0))
+                for row in self.conn.execute(
+                    """SELECT a.address,a.status,a.total_usd FROM address_scans a
+                       WHERE a.id=(SELECT a2.id FROM address_scans a2
+                         WHERE a2.address=a.address
+                         ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
+                )
+            }
+            changed = 0
+            cursor = self.conn.execute(
+                "SELECT address,chain,checked_at,status,has_code,total_usd,failure_streak "
+                "FROM address_chain_state ORDER BY address,chain"
+            )
+            while batch := cursor.fetchmany(2000):
+                updates = []
+                for row in batch:
+                    try:
+                        checked = datetime.fromisoformat(row["checked_at"])
+                        if checked.tzinfo is None:
+                            checked = checked.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        continue
+                    delay = balance_retry_delay(
+                        row["status"], row["has_code"], row["total_usd"],
+                        min_usd, int(row["failure_streak"] or 0),
+                    )
+                    aggregate = latest.get(row["address"])
+                    if (row["has_code"] == 1 and row["status"] == "complete"
+                            and float(row["total_usd"] or 0) > 0 and aggregate):
+                        aggregate_status, aggregate_usd = aggregate
+                        if aggregate_status == "qualifying" or aggregate_usd >= min_usd:
+                            delay = min(delay, 21600)
+                        elif aggregate_usd >= min_usd * 0.1:
+                            delay = min(delay, 86400)
+                    next_retry = datetime.fromtimestamp(
+                        checked.timestamp() + delay, timezone.utc
+                    ).isoformat()
+                    updates.append((next_retry, row["address"], row["chain"]))
+                self.conn.executemany(
+                    "UPDATE address_chain_state SET next_retry_at=? WHERE address=? AND chain=?",
+                    updates,
+                )
+                changed += len(updates)
+            self.conn.execute(
+                "INSERT INTO runtime_meta(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                ("balance_schedule_revision", BALANCE_SCHEDULE_REVISION,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            return changed
 
     def ingest_indexed_tokens(
         self, address: str, rows: list[dict[str, Any]], source: str,
@@ -1943,11 +2045,21 @@ class DB:
             self.conn.commit()
             return scan_id
 
-    def latest_address_scans(self) -> list[sqlite3.Row]:
+    def latest_address_scans(
+        self, report_kind: str | None = None, min_usd: float = 0,
+    ) -> list[sqlite3.Row]:
+        where = ""
+        params: tuple[Any, ...] = ()
+        if report_kind == "qualifying":
+            where, params = "AND a.total_usd>=?", (min_usd,)
+        elif report_kind == "below":
+            where, params = "AND a.status='below' AND a.total_usd>0 AND a.total_usd<?", (min_usd,)
+        elif report_kind == "incomplete":
+            where, params = "AND a.status='incomplete' AND a.total_usd<?", (min_usd,)
         with self._lock:
             return list(
                 self.conn.execute(
-                    """
+                    f"""
                     SELECT a.*
                     FROM address_scans a
                     WHERE a.id=(
@@ -1955,8 +2067,9 @@ class DB:
                         WHERE a2.address=a.address
                         ORDER BY a2.scanned_at DESC, a2.id DESC LIMIT 1
                     )
+                    {where}
                     ORDER BY a.total_usd DESC, a.address
-                    """
+                    """, params
                 )
             )
 
@@ -1995,29 +2108,41 @@ class DB:
                 )
             )
 
-    def latest_export_parts(self) -> tuple[
+    def latest_export_parts(self, selected: list[sqlite3.Row] | None = None) -> tuple[
         dict[int, list[sqlite3.Row]], dict[int, list[sqlite3.Row]],
         dict[str, list[sqlite3.Row]], dict[str, sqlite3.Row],
     ]:
-        latest = """SELECT a.id,a.address FROM address_scans a WHERE a.id=(
-            SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
-            ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
+        if selected is None:
+            selected = self.latest_address_scans()
+        if not selected:
+            return {}, {}, {}, {}
+        chain_rows: list[sqlite3.Row] = []
+        token_rows: list[sqlite3.Row] = []
+        source_rows: list[sqlite3.Row] = []
+        estimate_rows: list[sqlite3.Row] = []
         with self._lock:
-            chain_rows = self.conn.execute(
-                f"SELECT c.* FROM address_chain_scans c JOIN ({latest}) l ON l.id=c.scan_id "
-                "ORDER BY c.scan_id,c.chain"
-            ).fetchall()
-            token_rows = self.conn.execute(
-                f"SELECT t.* FROM address_token_scans t JOIN ({latest}) l ON l.id=t.scan_id "
-                "WHERE CAST(t.raw_amount AS INTEGER)>0 "
-                "ORDER BY t.scan_id,t.chain,COALESCE(t.usd_value,-1) DESC,t.token"
-            ).fetchall()
-            source_rows = self.conn.execute(
-                f"SELECT l.address,d.chain,d.source,d.observed_block,d.observed_tx,d.actor,d.first_seen_at "
-                f"FROM ({latest}) l JOIN contract_discoveries d ON lower(d.address)=lower(l.address) "
-                "ORDER BY l.address,d.first_seen_at,d.chain,d.source"
-            ).fetchall()
-            estimate_rows = self.conn.execute("SELECT * FROM rabby_estimates").fetchall()
+            for offset in range(0, len(selected), 400):
+                chunk = selected[offset:offset + 400]
+                ids = [int(row["id"]) for row in chunk]
+                addresses = [str(row["address"]).lower() for row in chunk]
+                id_marks = ",".join("?" for _ in ids)
+                address_marks = ",".join("?" for _ in addresses)
+                chain_rows.extend(self.conn.execute(
+                    f"SELECT * FROM address_chain_scans WHERE scan_id IN ({id_marks}) "
+                    "ORDER BY scan_id,chain", ids,
+                ))
+                token_rows.extend(self.conn.execute(
+                    f"SELECT * FROM address_token_scans WHERE scan_id IN ({id_marks}) "
+                    "AND CAST(raw_amount AS INTEGER)>0 "
+                    "ORDER BY scan_id,chain,COALESCE(usd_value,-1) DESC,token", ids,
+                ))
+                source_rows.extend(self.conn.execute(
+                    f"SELECT * FROM contract_discoveries WHERE address IN ({address_marks}) "
+                    "ORDER BY address,first_seen_at,chain,source", addresses,
+                ))
+                estimate_rows.extend(self.conn.execute(
+                    f"SELECT * FROM rabby_estimates WHERE address IN ({address_marks})", addresses,
+                ))
         chains: dict[int, list[sqlite3.Row]] = {}
         tokens: dict[int, list[sqlite3.Row]] = {}
         sources: dict[str, list[sqlite3.Row]] = {}
@@ -2054,8 +2179,41 @@ class DB:
             except sqlite3.Error:
                 return 0
 
+    def balance_queue_snapshot(self) -> dict[str, Any]:
+        """Only due work; cheap enough for the 15-second load governor."""
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        with self._lock:
+            new = self.conn.execute(
+                """SELECT COUNT(DISTINCT lower(c.address)) n,MIN(c.first_seen_at) oldest
+                   FROM contracts c WHERE NOT EXISTS(
+                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))"""
+            ).fetchone()
+            retry = self.conn.execute(
+                """SELECT COUNT(DISTINCT address) n,MIN(next_retry_at) oldest
+                   FROM address_chain_state WHERE next_retry_at<=?""", (now_iso,)
+            ).fetchone()
+        ages = []
+        for row in (new, retry):
+            if row["oldest"]:
+                try:
+                    oldest = datetime.fromisoformat(row["oldest"])
+                    if oldest.tzinfo is None:
+                        oldest = oldest.replace(tzinfo=timezone.utc)
+                    ages.append(max(0.0, (now - oldest).total_seconds()))
+                except (TypeError, ValueError):
+                    pass
+        new_count, retry_count = int(new["n"] or 0), int(retry["n"] or 0)
+        return {
+            "balance_new_pending": new_count,
+            "balance_retry_pending": retry_count,
+            "balance_pending": new_count + retry_count,
+            "balance_oldest_age_sec": max(ages, default=0.0),
+        }
+
     def monitoring_snapshot(self, min_usd: float) -> dict[str, Any]:
         """Return one cheap aggregate snapshot for monitoring.db."""
+        queue = self.balance_queue_snapshot()
         with self._lock:
             unique_addresses = int(self.conn.execute(
                 "SELECT COUNT(DISTINCT lower(address)) FROM contracts"
@@ -2069,42 +2227,26 @@ class DB:
                     "SELECT source,COUNT(*) AS n FROM contract_discoveries GROUP BY source"
                 )
             }
-            pending = int(self.conn.execute(
-                """SELECT COUNT(DISTINCT lower(c.address)) FROM contracts c
-                   WHERE NOT EXISTS(SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
-                      OR EXISTS(SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address)
-                                AND strftime('%s',s.next_retry_at)<=strftime('%s','now'))"""
-            ).fetchone()[0])
-            oldest_age = self.conn.execute(
-                """SELECT MAX(age) FROM (
-                     SELECT strftime('%s','now')-strftime('%s',c.first_seen_at) AS age
-                     FROM contracts c WHERE NOT EXISTS(
-                       SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
-                     UNION ALL
-                     SELECT strftime('%s','now')-strftime('%s',s.next_retry_at) AS age
-                     FROM address_chain_state s
-                     WHERE strftime('%s',s.next_retry_at)<=strftime('%s','now')
-                   )"""
-            ).fetchone()[0]
             completed = int(self.conn.execute(
                 "SELECT COUNT(DISTINCT address) FROM address_scans"
             ).fetchone()[0])
-            latest = list(self.conn.execute(
-                """SELECT a.* FROM address_scans a
-                   WHERE a.id=(SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
-                               ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)"""
-            ))
-            statuses = {
-                "qualifying": sum(float(row["total_usd"] or 0) >= min_usd for row in latest),
-                "below": sum(
-                    row["status"] == "below" and 0 < float(row["total_usd"] or 0) < min_usd
-                    for row in latest
-                ),
-                "incomplete": sum(
-                    row["status"] == "incomplete" and float(row["total_usd"] or 0) < min_usd
-                    for row in latest
-                ),
-            }
+            scans_total = int(self.conn.execute(
+                "SELECT COALESCE(MAX(id),0) FROM address_scans"
+            ).fetchone()[0])
+            status_row = self.conn.execute(
+                """SELECT
+                     COUNT(*) FILTER (WHERE a.total_usd>=?) qualifying,
+                     COUNT(*) FILTER (WHERE a.status='below' AND a.total_usd>0
+                                      AND a.total_usd<?) below,
+                     COUNT(*) FILTER (WHERE a.status='incomplete' AND a.total_usd<?) incomplete
+                   FROM address_scans a WHERE a.id=(
+                     SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
+                     ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)""",
+                (min_usd, min_usd, min_usd),
+            ).fetchone()
+            statuses = {key: int(status_row[key] or 0) for key in (
+                "qualifying", "below", "incomplete"
+            )}
             coverage = {
                 f"{int(row['coverage'])}/{int(row['total_networks'])}": int(row["n"])
                 for row in self.conn.execute(
@@ -2121,9 +2263,9 @@ class DB:
             "contract_instances": contract_instances,
             "direct_deploy": sources.get("direct_deploy", 0),
             "active_call": sources.get("active_call", 0),
-            "balance_pending": pending,
-            "balance_oldest_age_sec": float(oldest_age) if oldest_age is not None else None,
+            **queue,
             "balance_completed": completed,
+            "balance_scans_total": scans_total,
             "qualifying": statuses.get("qualifying", 0),
             "below_count": statuses.get("below", 0),
             "incomplete": statuses.get("incomplete", 0),
@@ -4494,7 +4636,7 @@ async def check_multichain_balances(
             address, status, total_usd, coverage, len(chains),
             chain_rows, token_rows, ", ".join(notes) or None,
         )
-        db.apply_address_schedule(address, status)
+        db.apply_address_schedule(address, status, total_usd, min_usd)
         log.info(
             "[balances] %s $%.2f %s coverage=%s/%s refreshed=%s elapsed=%.2fs",
             address, total_usd, status, coverage, len(chains), len(due_keys),
@@ -4511,7 +4653,7 @@ async def check_multichain_balances(
                 break
             pending = db.pending_addresses(
                 cfg.recheck_interval_sec, limit=max(80, cfg.balance_concurrency * 2),
-                retry_sec=cfg.balance_retry_sec, as_of=snapshot_at,
+                retry_sec=cfg.balance_retry_sec, as_of=snapshot_at, min_usd=min_usd,
             )
             in_flight = set(active.values())
             for address in pending:
@@ -4564,6 +4706,15 @@ THIN = Border(
     bottom=Side(style="thin", color="BFBFBF"),
 )
 MONEY = '#,##0.00"$"'
+EXPORT_FILE_NAMES = {
+    "qualifying": "qualifying.xlsx",
+    "below": "below_threshold.xlsx",
+    "incomplete": "incomplete.xlsx",
+    "sui_qualifying": "sui_qualifying.xlsx",
+    "sui_below": "sui_below_threshold.xlsx",
+    "sui_incomplete": "sui_incomplete.xlsx",
+    "sui_packages": "sui_packages.xlsx",
+}
 
 
 def _style_header(ws) -> None:
@@ -4629,7 +4780,20 @@ def export_xlsx(
         "Rabby notes",
     ]
 
-    chain_map, token_map, source_map, estimate_map = db.latest_export_parts()
+    report_kind = mode.removeprefix("file:") if mode.startswith("file:") else None
+    if report_kind not in {None, "qualifying", "below", "incomplete"}:
+        raise ValueError("unsupported EVM report kind")
+    if mode == "qualifying":
+        report_kind = "qualifying"
+    latest = db.latest_address_scans(report_kind, min_usd)
+    # Only gather joined details for rows that will actually be written.
+    selected = latest if report_kind is not None else [
+        row for row in latest
+        if float(row["total_usd"] or 0) >= min_usd
+        or (row["status"] == "below" and 0 < float(row["total_usd"] or 0) < min_usd)
+        or (row["status"] == "incomplete" and float(row["total_usd"] or 0) < min_usd)
+    ]
+    chain_map, token_map, source_map, estimate_map = db.latest_export_parts(selected)
 
     def prepared(row: sqlite3.Row) -> list[Any]:
         chain_parts = chain_map.get(int(row["id"]), [])
@@ -4738,7 +4902,6 @@ def export_xlsx(
         wb.save(tmp)
         tmp.replace(path)
 
-    latest = db.latest_address_scans()
     # A database can contain scans made with a different --min-usd value.
     # Classify exports from the actual latest total, not the historic status label.
     qualifying = [
@@ -4754,9 +4917,11 @@ def export_xlsx(
         row for row in latest
         if row["status"] == "incomplete" and float(row["total_usd"] or 0.0) < min_usd
     ]
-    build(paths[0], qualifying, "Qualifying", OK_FILL)
-    if mode == "full":
+    if mode in {"full", "qualifying", "file:qualifying"}:
+        build(paths[0], qualifying, "Qualifying", OK_FILL)
+    if mode in {"full", "file:below"}:
         build(paths[1], below, "Below threshold", BELOW_FILL)
+    if mode in {"full", "file:incomplete"}:
         build(paths[2], incomplete, "Incomplete", INCOMPLETE_FILL)
     log.info(
         "xlsx qualifying=%s below=%s incomplete=%s",
@@ -4769,7 +4934,7 @@ def export_xlsx(
 
 def export_bundle_process(
     db_path: Path, cfg: AppCfg, chains: dict[str, ChainCfg], min_usd: float,
-    mode: str = "full",
+    mode: str = "full", file_key: str | None = None,
 ) -> None:
     """Spawn target: export from query-only connections, never the scanner connection."""
     db = DB(db_path, read_only=True)
@@ -4780,11 +4945,20 @@ def export_bundle_process(
                 os.nice(10)
             except OSError:
                 pass
-        export_xlsx(db, cfg, chains, min_usd, snapshot=False, mode=mode)
-        export_sui_xlsx(
-            sui_store, cfg.export_dir, min_usd, snapshot=False,
-            mode="qualifying" if mode == "qualifying" else "full",
-        )
+        if mode == "file":
+            if file_key not in EXPORT_FILE_NAMES:
+                raise ValueError("unsupported export file")
+            if file_key in {"qualifying", "below", "incomplete"}:
+                export_xlsx(db, cfg, chains, min_usd, mode=f"file:{file_key}")
+            elif file_key in {"sui_qualifying", "sui_below", "sui_incomplete", "sui_packages"}:
+                sui_mode = file_key.removeprefix("sui_")
+                export_sui_xlsx(sui_store, cfg.export_dir, min_usd, mode=sui_mode)
+        else:
+            export_xlsx(db, cfg, chains, min_usd, snapshot=False, mode=mode)
+            export_sui_xlsx(
+                sui_store, cfg.export_dir, min_usd, snapshot=False,
+                mode="qualifying" if mode == "qualifying" else "full",
+            )
     finally:
         sui_store.close()
         db.close()
@@ -4792,27 +4966,29 @@ def export_bundle_process(
 
 async def run_export_process(
     db: DB, cfg: AppCfg, chains: dict[str, ChainCfg], lock: asyncio.Lock,
-    mode: str = "full",
+    mode: str = "full", file_key: str | None = None,
 ) -> tuple[Path, ...]:
     async with lock:
         context = multiprocessing.get_context("spawn")
         process = context.Process(
             target=export_bundle_process,
-            args=(db.path, cfg, chains, cfg.min_usd, mode),
+            args=(db.path, cfg, chains, cfg.min_usd, mode, file_key),
             name="xlsx-export",
         )
         process.start()
         await asyncio.to_thread(process.join)
         if process.exitcode != 0:
             raise RuntimeError(f"XLSX export process exited with {process.exitcode}")
-        names = (
-            ("qualifying.xlsx", "sui_qualifying.xlsx")
-            if mode == "qualifying" else (
+        if mode == "file":
+            names = (EXPORT_FILE_NAMES[file_key],)
+        elif mode == "qualifying":
+            names = ("qualifying.xlsx", "sui_qualifying.xlsx")
+        else:
+            names = (
                 "qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx",
                 "sui_qualifying.xlsx", "sui_below_threshold.xlsx",
                 "sui_incomplete.xlsx", "sui_packages.xlsx",
             )
-        )
         return tuple(cfg.export_dir / name for name in names)
 
 
@@ -5104,7 +5280,7 @@ async def governor_loop(
     db: DB, slots: DiscoverySlots, governor: LoadGovernor, stop: asyncio.Event,
 ) -> None:
     while not stop.is_set():
-        snapshot = db.monitoring_snapshot(0.0)
+        snapshot = db.balance_queue_snapshot()
         slot_stats = await slots.snapshot()
         live, backfill = governor.evaluate(
             int(snapshot.get("balance_pending") or 0),
@@ -5194,11 +5370,14 @@ async def control_loop(
                 elif request.action == "resume":
                     monitor.set_setting("scanner_paused", "0")
                     result = "scanner resumed"
-                elif request.action in {"export", "export_qualifying"}:
-                    mode = "full" if request.action == "export" else "qualifying"
-                    monitor.set_setting("exporter_state", f"running:{mode}")
+                elif request.action in {"export", "export_qualifying", "export_file"}:
+                    mode = "full" if request.action == "export" else (
+                        "qualifying" if request.action == "export_qualifying" else "file"
+                    )
+                    file_key = request.payload.get("file_key") if mode == "file" else None
+                    monitor.set_setting("exporter_state", f"running:{file_key or mode}")
                     paths = await run_export_process(
-                        db, cfg, chains, export_lock, mode=mode,
+                        db, cfg, chains, export_lock, mode=mode, file_key=file_key,
                     )
                     monitor.set_setting("exporter_state", "idle")
                     monitor.set_setting(f"last_{mode}_export_at", time.time())
@@ -5213,7 +5392,7 @@ async def control_loop(
                 monitor.resolve_incident(f"control:{request.action}")
                 monitor.finish_control(request.id, "complete", result)
             except Exception as exc:
-                if request.action in {"export", "export_qualifying"}:
+                if request.action in {"export", "export_qualifying", "export_file"}:
                     monitor.set_setting("exporter_state", "failed")
                 monitor.finish_control(request.id, "failed", f"{type(exc).__name__}: {exc}")
                 monitor.open_incident(
@@ -5316,6 +5495,27 @@ async def run(args: argparse.Namespace) -> None:
 
     db = DB(cfg.db_path)
     sui_store = SuiStore(cfg.db_path)
+    if not args.rpc_check and not args.export_only and db.needs_balance_schedule_rephase():
+        def migrate_balance_schedule() -> int:
+            state_rows = db.conn.execute("SELECT COUNT(*) FROM address_chain_state").fetchone()[0]
+            if state_rows:
+                # Keep the pre-migration snapshot outside daily rotation.
+                backup_path = backup_database(
+                    db, ROOT / "backups" / "pre_balance_schedule_v2", keep=1,
+                )
+                log.info("balance schedule backup: %s", backup_path.name)
+            return db.rephase_balance_schedule(cfg.min_usd)
+
+        migration = asyncio.create_task(asyncio.to_thread(migrate_balance_schedule))
+        while True:
+            monitor.set_runtime_state("migrating", "rephasing EVM balance schedules")
+            try:
+                changed = await asyncio.wait_for(asyncio.shield(migration), timeout=30)
+                break
+            except asyncio.TimeoutError:
+                continue
+        if changed:
+            log.info("rephased %s existing chain balance schedules", changed)
     db.seed_valuation_policies(cfg.valuation_policies)
     sui_store.seed_tvl_policies(list(cfg.sui.get("valuation_policies") or []))
     revalued = db.revalue_system_balances(cfg.min_usd)

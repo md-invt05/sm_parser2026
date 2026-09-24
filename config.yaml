@@ -5,6 +5,8 @@ db_path: data/contracts.db
 monitoring_db_path: data/monitoring.db
 export_dir: reports
 log_dir: logs
+# Legacy compatibility setting; actual EVM chain rechecks now use the tiered
+# schedule documented in README.md (6h/24h/72h/7d/30d).
 recheck_interval_sec: 86400
 
 # Conservative defaults for public, best-effort RPC endpoints.

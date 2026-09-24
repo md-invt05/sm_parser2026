@@ -1486,7 +1486,7 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
         "Provider / notes",
     ]
     for path, status in zip(paths[:3], ("qualifying", "below", "incomplete")):
-        if mode == "qualifying" and status != "qualifying":
+        if mode != "full" and status != mode:
             continue
         wb = Workbook()
         ws = wb.active
@@ -1520,7 +1520,7 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
         wb.save(temporary)
         temporary.replace(path)
 
-    if mode == "qualifying":
+    if mode != "full" and mode != "packages":
         return paths
 
     technical = Workbook()
