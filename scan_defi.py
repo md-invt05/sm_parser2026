@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import hashlib
 import json
 import logging
@@ -69,6 +70,7 @@ LLAMA_PRICES = "https://coins.llama.fi/prices/current/"
 # Task-local policy: balance probes must not inherit the indexer's long retries.
 BALANCE_RPC = ContextVar("balance_rpc", default=False)
 BALANCE_SCHEDULE_REVISION = "2"
+TOKEN_LOG_QUEUE_REVISION = "1"
 
 
 def balance_retry_delay(status: str, has_code: int | None, usd: float | None,
@@ -187,6 +189,8 @@ class AppCfg:
     receipt_batch_size: int
     eth_call_batch_size: int
     price_batch_size: int
+    token_log_global_per_minute: int
+    token_log_chain_per_minute: int
     discovery_live_slots: int
     discovery_backfill_slots: int
     discovery_range_timeout_sec: float
@@ -307,6 +311,8 @@ def load_config(path: Path) -> AppCfg:
         receipt_batch_size=int(raw.get("receipt_batch_size", 20)),
         eth_call_batch_size=int(raw.get("eth_call_batch_size", 10)),
         price_batch_size=int(raw.get("price_batch_size", 40)),
+        token_log_global_per_minute=max(1, int(raw.get("token_log_global_per_minute", 30))),
+        token_log_chain_per_minute=max(1, int(raw.get("token_log_chain_per_minute", 4))),
         discovery_live_slots=max(1, int(raw.get("discovery_live_slots", 4))),
         discovery_backfill_slots=max(1, int(raw.get("discovery_backfill_slots", 1))),
         discovery_range_timeout_sec=max(
@@ -512,6 +518,23 @@ CREATE TABLE IF NOT EXISTS address_token_scans (
 
 CREATE INDEX IF NOT EXISTS idx_contract_tokens_holder
     ON contract_tokens(chain, contract);
+CREATE TABLE IF NOT EXISTS token_log_tasks (
+    chain            TEXT NOT NULL,
+    address          TEXT NOT NULL,
+    first_block      INTEGER NOT NULL,
+    next_block       INTEGER NOT NULL,
+    history_limited  INTEGER NOT NULL DEFAULT 0,
+    priority         INTEGER NOT NULL DEFAULT 10,
+    window_size      INTEGER NOT NULL DEFAULT 16,
+    due_at           TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    completed_at     TEXT,
+    failures         INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT,
+    PRIMARY KEY (chain, address)
+);
+CREATE INDEX IF NOT EXISTS idx_token_log_tasks_due
+    ON token_log_tasks(due_at, priority);
 CREATE INDEX IF NOT EXISTS idx_address_scans_latest
     ON address_scans(address, scanned_at);
 CREATE INDEX IF NOT EXISTS idx_address_scans_latest_id
@@ -728,9 +751,9 @@ class DB:
             """
         )
         self.conn.execute(
-            "INSERT INTO schema_meta(version) SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
+            "INSERT INTO schema_meta(version) SELECT 8 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
         )
-        self.conn.execute("UPDATE schema_meta SET version=7 WHERE version < 7")
+        self.conn.execute("UPDATE schema_meta SET version=8 WHERE version < 8")
         self.conn.execute(
             "INSERT OR IGNORE INTO runtime_meta(key,value,updated_at) VALUES('data_revision','0',?)",
             (datetime.now(timezone.utc).isoformat(),),
@@ -1148,6 +1171,7 @@ class DB:
         cache_rows: list[tuple[Any, ...]],
         token_rows: list[tuple[Any, ...]],
         relation_rows: list[tuple[Any, ...]],
+        enqueue_token_logs: bool = False,
     ) -> tuple[int, int]:
         """Commit all derived data and the matching cursor in one transaction."""
         now = datetime.now(timezone.utc).isoformat()
@@ -1201,6 +1225,8 @@ class DB:
                      last_seen_block=MAX(contract_tokens.last_seen_block,excluded.last_seen_block)""",
                 [(*row, row[4]) for row in relation_rows],
             )
+            if enqueue_token_logs:
+                self._enqueue_discovered_token_tasks_locked(contract_rows, discovery_rows, now)
             anchor = int(cursor["anchor_block"])
             status = "complete" if role == "backfill" and range_end >= anchor else "active"
             self.conn.execute(
@@ -1215,6 +1241,268 @@ class DB:
                 )
             self._bump_revision_locked()
             return int(inserted), int(sources_inserted)
+
+    def _enqueue_discovered_token_tasks_locked(
+        self, contract_rows: list[tuple[Any, ...]],
+        discovery_rows: list[tuple[Any, ...]], now: str,
+    ) -> None:
+        sources: dict[tuple[str, str], tuple[int, int]] = {}
+        for row in discovery_rows:
+            if row[3] is None:
+                continue
+            key = (str(row[0]), str(row[1]).lower())
+            block = int(row[3])
+            direct = row[2] == "direct_deploy"
+            previous = sources.get(key)
+            if previous is None or (direct and previous[1]) or block < previous[0]:
+                sources[key] = (block, 0 if direct else 1)
+        for row in contract_rows:
+            key = (str(row[0]), str(row[1]).lower())
+            if row[2] is not None:
+                sources[key] = (int(row[2]), 0)
+        self.conn.executemany(
+            """INSERT INTO token_log_tasks(
+                   chain,address,first_block,next_block,history_limited,priority,
+                   due_at,updated_at)
+               VALUES(?,?,?,?,?,100,?,?)
+               ON CONFLICT(chain,address) DO UPDATE SET
+                   first_block=MIN(token_log_tasks.first_block,excluded.first_block),
+                   next_block=CASE WHEN excluded.first_block<token_log_tasks.first_block
+                       THEN excluded.first_block ELSE token_log_tasks.next_block END,
+                   history_limited=MIN(token_log_tasks.history_limited,excluded.history_limited),
+                   due_at=CASE WHEN excluded.first_block<token_log_tasks.first_block
+                       THEN excluded.due_at ELSE token_log_tasks.due_at END,
+                   completed_at=CASE WHEN excluded.first_block<token_log_tasks.first_block
+                       THEN NULL ELSE token_log_tasks.completed_at END""",
+            [(chain, address, block, block, limited, now, now)
+             for (chain, address), (block, limited) in sources.items()],
+        )
+
+    def commit_legacy_index_range(
+        self, chain: str, end: int,
+        contracts: list[tuple[Any, ...]],
+        discoveries: list[tuple[Any, ...]],
+        cache: list[tuple[Any, ...]],
+        enqueue_token_logs: bool,
+    ) -> tuple[int, int]:
+        """Finite --once pass uses the same atomic discovery/log-task boundary."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            before = self.conn.total_changes
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO contracts(
+                     chain,address,created_block,created_tx,creator,first_seen_at)
+                   VALUES(?,?,?,?,?,?)""",
+                contracts,
+            )
+            inserted = self.conn.total_changes - before
+            self.conn.executemany(
+                """UPDATE contracts SET created_block=COALESCE(created_block,?),
+                     created_tx=COALESCE(created_tx,?),creator=COALESCE(creator,?)
+                   WHERE chain=? AND address=? AND ? IS NOT NULL""",
+                [(r[2], r[3], r[4], r[0], r[1], r[2]) for r in contracts],
+            )
+            before = self.conn.total_changes
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO contract_discoveries(
+                     chain,address,source,observed_block,observed_tx,actor,first_seen_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                discoveries,
+            )
+            sources = self.conn.total_changes - before
+            self.conn.executemany(
+                """INSERT INTO contract_code_cache(chain,address,has_code,checked_at,checked_block)
+                   VALUES(?,?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET
+                     has_code=excluded.has_code,checked_at=excluded.checked_at,
+                     checked_block=excluded.checked_block""",
+                cache,
+            )
+            if enqueue_token_logs:
+                self._enqueue_discovered_token_tasks_locked(contracts, discoveries, now)
+            self.conn.execute(
+                "UPDATE chain_state SET last_indexed=MAX(last_indexed,?) WHERE chain=?",
+                (end, chain),
+            )
+            self._bump_revision_locked()
+            return int(inserted), int(sources)
+
+    def needs_token_log_queue_seed(self) -> bool:
+        with self._lock:
+            marker = self.conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='token_log_queue_revision'"
+            ).fetchone()
+            return marker is None or marker[0] != TOKEN_LOG_QUEUE_REVISION
+
+    def seed_priority_token_log_tasks(self, min_usd: float) -> int:
+        """One-time queue migration; leave existing scans and cursors intact."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            marker = self.conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='token_log_queue_revision'"
+            ).fetchone()
+            if marker is not None and marker[0] == TOKEN_LOG_QUEUE_REVISION:
+                return 0
+            before = self.conn.total_changes
+            self.conn.execute(
+                """INSERT OR IGNORE INTO token_log_tasks(
+                       chain,address,first_block,next_block,history_limited,priority,
+                       due_at,updated_at)
+                   SELECT c.chain,lower(c.address),
+                          MAX(s.start_block,COALESCE(c.created_block,
+                              (SELECT MIN(d.observed_block) FROM contract_discoveries d
+                               WHERE d.chain=c.chain AND d.address=lower(c.address)
+                                 AND d.observed_block IS NOT NULL),s.last_indexed)),
+                          MAX(s.start_block,COALESCE(c.created_block,
+                              (SELECT MIN(d.observed_block) FROM contract_discoveries d
+                               WHERE d.chain=c.chain AND d.address=lower(c.address)
+                                 AND d.observed_block IS NOT NULL),s.last_indexed)),
+                          CASE WHEN c.created_block IS NULL THEN 1 ELSE 0 END,
+                          50,?,?
+                   FROM contracts c JOIN chain_state s ON s.chain=c.chain
+                   WHERE c.last_total_usd>=?""",
+                (now, now, min_usd * 0.1),
+            )
+            inserted = self.conn.total_changes - before
+            self.conn.execute(
+                """INSERT INTO runtime_meta(key,value,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                     updated_at=excluded.updated_at""",
+                ("token_log_queue_revision", TOKEN_LOG_QUEUE_REVISION, now),
+            )
+            return inserted
+
+    def token_log_task(self, chain: str, address: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM token_log_tasks WHERE chain=? AND address=?",
+                (chain, address.lower()),
+            ).fetchone()
+
+    def next_token_log_task(self, chains: list[str]) -> sqlite3.Row | None:
+        if not chains:
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        placeholders = ",".join("?" for _ in chains)
+        with self._lock:
+            return self.conn.execute(
+                f"""SELECT * FROM token_log_tasks
+                    WHERE chain IN ({placeholders}) AND due_at<=?
+                    ORDER BY priority DESC,due_at,updated_at LIMIT 1""",
+                (*chains, now),
+            ).fetchone()
+
+    def token_log_queue_snapshot(self) -> dict[str, dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT chain,COUNT(*) total,
+                          SUM(CASE WHEN due_at<=? THEN 1 ELSE 0 END) due,
+                          SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) failed,
+                          SUM(CASE WHEN completed_at IS NULL OR history_limited=1
+                              THEN 1 ELSE 0 END) partial,
+                          MIN(CASE WHEN due_at<=? THEN updated_at END) oldest_at,
+                          MIN(next_block) next_block
+                   FROM token_log_tasks GROUP BY chain""",
+                (now.isoformat(), now.isoformat()),
+            ).fetchall()
+            error_rows = self.conn.execute(
+                """SELECT chain,last_error,COUNT(*) count FROM token_log_tasks
+                   WHERE last_error IS NOT NULL GROUP BY chain,last_error"""
+            ).fetchall()
+        errors: dict[str, dict[str, int]] = {}
+        for row in error_rows:
+            errors.setdefault(str(row["chain"]), {})[str(row["last_error"])] = int(row["count"])
+        result = {}
+        for row in rows:
+            oldest = datetime.fromisoformat(row["oldest_at"]) if row["oldest_at"] else None
+            result[str(row["chain"])] = {
+                "total": int(row["total"]), "due": int(row["due"] or 0),
+                "failed": int(row["failed"] or 0),
+                "partial": int(row["partial"] or 0),
+                "oldest_age_sec": max(0.0, (now - oldest).total_seconds()) if oldest else 0.0,
+                "next_block": int(row["next_block"]),
+                "errors": errors.get(str(row["chain"]), {}),
+            }
+        return result
+
+    def commit_token_log_window(
+        self, chain: str, address: str, end: int, head: int,
+        token_rows: list[tuple[Any, ...]], relation_rows: list[tuple[Any, ...]],
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        address = address.lower()
+        with self._lock, self.conn:
+            task = self.token_log_task(chain, address)
+            if task is None or end < int(task["next_block"]):
+                raise RuntimeError("stale token log window")
+            self.conn.executemany(
+                """INSERT INTO tokens(chain,address,symbol,decimals,source)
+                   VALUES(?,?,?,?,?) ON CONFLICT(chain,address) DO NOTHING""",
+                token_rows,
+            )
+            before = self.conn.total_changes
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO contract_tokens(
+                       chain,contract,token,source,first_seen_block,last_seen_block)
+                   VALUES(?,?,?,?,?,?)""",
+                [(*row, row[4]) for row in relation_rows],
+            )
+            changed = self.conn.total_changes - before
+            self.conn.executemany(
+                """UPDATE contract_tokens SET
+                       last_seen_block=MAX(COALESCE(last_seen_block,0),?)
+                   WHERE chain=? AND contract=? AND token=? AND
+                       COALESCE(last_seen_block,0)<?""",
+                [(row[4], row[0], row[1], row[2], row[4]) for row in relation_rows],
+            )
+            done = end >= head
+            if done:
+                delay = 21600 if int(task["priority"]) >= 50 else 86400
+            else:
+                delay = 1
+            due = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
+            self.conn.execute(
+                """UPDATE token_log_tasks SET next_block=?,due_at=?,updated_at=?,
+                       completed_at=?,failures=0,last_error=NULL,
+                       window_size=MIN(1000,window_size*2),priority=CASE
+                         WHEN priority=100 THEN 50 ELSE priority END
+                   WHERE chain=? AND address=?""",
+                (end + 1, due, now.isoformat(), now.isoformat() if done else None,
+                 chain, address),
+            )
+            if changed or done:
+                self.conn.execute(
+                    "UPDATE address_chain_state SET next_retry_at=? WHERE chain=? AND address=?",
+                    (now.isoformat(), chain, address),
+                )
+            if changed:
+                self._bump_revision_locked()
+            return changed
+
+    def fail_token_log_task(self, chain: str, address: str, kind: str) -> int:
+        now = datetime.now(timezone.utc)
+        with self._lock, self.conn:
+            task = self.token_log_task(chain, address)
+            if task is None:
+                return 0
+            failures = int(task["failures"]) + 1
+            delay = (60, 300, 1800, 7200)[min(failures - 1, 3)]
+            due = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
+            self.conn.execute(
+                """UPDATE token_log_tasks SET window_size=MAX(1,window_size/2),
+                       failures=?,last_error=?,due_at=?,updated_at=?
+                   WHERE chain=? AND address=?""",
+                (failures, kind, due, now.isoformat(), chain, address.lower()),
+            )
+            return failures
+
+    def defer_token_log_task(self, chain: str, address: str, seconds: int) -> None:
+        due = datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE token_log_tasks SET due_at=? WHERE chain=? AND address=?",
+                (due, chain, address.lower()),
+            )
 
     def save_rpc_health(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -1683,12 +1971,17 @@ class DB:
                 "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
                 (address, chain),
             ).fetchone()
-            failed = status in {"rpc_error", "partial", "timeout"}
+            token_coverage_partial = str(row.get("note") or "").startswith(
+                "token_coverage_partial"
+            )
+            failed = status in {"rpc_error", "partial", "timeout"} and not token_coverage_partial
             failure_streak = (int(previous["failure_streak"]) if previous else 0) + 1 if failed else 0
             delay = balance_retry_delay(
                 status, row.get("has_code"), row.get("total_usd"), min_usd,
                 failure_streak,
             )
+            if token_coverage_partial:
+                delay = 21600 if float(row.get("total_usd") or 0) >= min_usd * 0.1 else 86400
             next_retry = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
             has_observation = row.get("has_code") is not None and row.get("total_usd") is not None
             def observed(name: str, fallback: Any = None) -> Any:
@@ -2317,10 +2610,10 @@ def _parse_retry_after(headers: httpx.Headers) -> float | None:
 def classify_rpc_problem(status: int | None, body: str, headers: httpx.Headers | None = None) -> RpcError | None:
     text = (body or "").lower()
     retry_after = _parse_retry_after(headers) if headers is not None else None
-    if status in (401, 403) or any(h in text for h in AUTH_HINTS):
-        return RpcError("auth", "authentication rejected", permanent=True)
     if status in (429,) or any(h in text for h in RATE_HINTS):
         return RpcError("rate_limit", "RPC rate limit", retry_after)
+    if status in (401, 403) or any(h in text for h in AUTH_HINTS):
+        return RpcError("auth", "authentication rejected", permanent=True)
     if any(h in text for h in RANGE_HINTS):
         return RpcError("range", "RPC range limit", None)
     if status in RETRYABLE_HTTP:
@@ -2461,6 +2754,51 @@ class RoleRpcLimiter:
         }
 
 
+class TokenLogBudget:
+    """Count actual eth_getLogs HTTP attempts across all RPC pools."""
+
+    def __init__(self, global_per_minute: int, chain_per_minute: int):
+        self.global_limit = max(1, global_per_minute)
+        self.chain_limit = max(1, chain_per_minute)
+        self.global_times: deque[float] = deque()
+        self.chain_times: dict[str, deque[float]] = {}
+        self.lock = asyncio.Lock()
+
+    def _trim(self, chain: str, now: float) -> deque[float]:
+        times = self.chain_times.setdefault(chain, deque())
+        while self.global_times and self.global_times[0] <= now - 60:
+            self.global_times.popleft()
+        while times and times[0] <= now - 60:
+            times.popleft()
+        return times
+
+    async def available_chains(self, chains: list[str]) -> list[str]:
+        async with self.lock:
+            now = time.monotonic()
+            self._trim("", now)
+            if len(self.global_times) >= self.global_limit:
+                return []
+            return [chain for chain in chains
+                    if len(self._trim(chain, now)) < self.chain_limit]
+
+    async def acquire(self, chain: str) -> None:
+        while True:
+            async with self.lock:
+                now = time.monotonic()
+                times = self._trim(chain, now)
+                if (len(self.global_times) < self.global_limit
+                        and len(times) < self.chain_limit):
+                    self.global_times.append(now)
+                    times.append(now)
+                    return
+                waits = []
+                if len(self.global_times) >= self.global_limit:
+                    waits.append(60 - (now - self.global_times[0]))
+                if len(times) >= self.chain_limit:
+                    waits.append(60 - (now - times[0]))
+            await asyncio.sleep(max(0.05, min(waits)))
+
+
 class RpcPool:
     def __init__(
         self,
@@ -2520,6 +2858,7 @@ class RpcPool:
         self.last_head: int | None = None
         self._batch_successes = {"block": 0, "receipt": 0, "call": 0}
         self.last_endpoint_by_group: dict[str, Endpoint] = {}
+        self.token_log_budget: TokenLogBudget | None = None
         if health_store is not None:
             persisted = health_store.load_rpc_health(chain)
             by_fp = {endpoint.fingerprint: endpoint for endpoint in self.endpoints}
@@ -2665,6 +3004,8 @@ class RpcPool:
                     if delay:
                         await asyncio.sleep(delay)
                     ep.next_request_at = time.monotonic() + interval
+                if method_group == "logs" and self.token_log_budget is not None:
+                    await self.token_log_budget.acquire(self.chain)
                 # Queued work for one chain must not reserve global slots.
                 async with self.sem:
                     limiter = (
@@ -2725,11 +3066,15 @@ class RpcPool:
                     continue
                 ep.last_error = exc.kind
                 if exc.permanent or exc.kind == "auth":
-                    ep.disable(exc.kind)
+                    if method_group == "head" or exc.kind == "wrong_chain":
+                        ep.disable(exc.kind)
+                    else:
+                        ep.health(method_group).permanent_error = exc.kind
                     log.warning(
-                        "[%s] %s disabled for this run (%s)",
+                        "[%s] %s disabled for %s (%s)",
                         self.chain,
                         _short_url(ep.url),
+                        method_group,
                         exc.kind,
                     )
                     continue
@@ -3131,6 +3476,7 @@ class PriceBook:
         self._lock = asyncio.Lock()
         self._missing_until: dict[str, float] = {}
         self._cooldown_until = 0.0
+        self._failure_streak = 0
 
     async def fetch(self, keys: list[str], ttl: float = 120.0) -> dict[str, float]:
         keys = list(dict.fromkeys(keys))
@@ -3147,11 +3493,16 @@ class PriceBook:
                         try:
                             r = await client.get(LLAMA_PRICES + ",".join(chunk))
                             if r.status_code == 429:
-                                self._cooldown_until = time.time() + (_parse_retry_after(r.headers) or 30)
+                                self._failure_streak += 1
+                                delay = _parse_retry_after(r.headers) or min(
+                                    300, 10 * 2 ** min(self._failure_streak, 5)
+                                )
+                                self._cooldown_until = time.time() + delay
                                 log.warning("DefiLlama rate limit; prices temporarily unavailable")
                                 break
                             r.raise_for_status()
                             coins = r.json().get("coins") or {}
+                            self._failure_streak = 0
                             ts = time.time()
                             for k in chunk:
                                 px = coins.get(k, {}).get("price")
@@ -3160,7 +3511,10 @@ class PriceBook:
                                 else:
                                     self._missing_until[k] = ts + 30
                         except Exception as exc:
-                            self._cooldown_until = time.time() + 10
+                            self._failure_streak += 1
+                            self._cooldown_until = time.time() + min(
+                                300, 10 * 2 ** min(self._failure_streak - 1, 5)
+                            )
                             log.warning("DefiLlama prices error: %s", type(exc).__name__)
                             break
         now = time.time()
@@ -3504,6 +3858,102 @@ async def collect_transfers(
     return list(token_rows.values()), list(relation_rows.values())
 
 
+async def process_token_log_task(
+    db: DB, chain: ChainCfg, rpc: RpcPool, task: sqlite3.Row, head: int,
+) -> int:
+    address = str(task["address"])
+    start = int(task["next_block"])
+    end = min(head, start + max(1, min(1000, int(task["window_size"]),
+                                     chain.logs_max_range)) - 1)
+    if end < start:
+        db.defer_token_log_task(chain.key, address, 60)
+        return 0
+    logs = await rpc.call("eth_getLogs", [{
+        "fromBlock": hex(start), "toBlock": hex(end),
+        "topics": [TRANSFER_TOPIC, None, "0x" + pad_addr(address)],
+    }])
+    if not isinstance(logs, list):
+        raise RpcError("malformed", "eth_getLogs did not return a list")
+    tokens: dict[str, tuple[Any, ...]] = {}
+    relations: dict[str, tuple[Any, ...]] = {}
+    for item in logs:
+        if not isinstance(item, dict):
+            raise RpcError("malformed", "eth_getLogs returned an invalid item")
+        topics = item.get("topics") or []
+        if len(topics) < 3 or not isinstance(topics[2], str) or len(topics[2]) != 66:
+            continue
+        if topic_to_addr(topics[2]) != address:
+            continue
+        token = normalize_evm_address(item.get("address"))
+        if token is None or token == ZERO:
+            continue
+        block = hex_int(item.get("blockNumber"))
+        if block < start or block > end:
+            raise RpcError("malformed", "eth_getLogs returned a block outside the window")
+        tokens[token] = (chain.key, token, None, None, "transfer_log")
+        relations[token] = (chain.key, address, token, "transfer_log", block)
+    return db.commit_token_log_window(
+        chain.key, address, end, head, list(tokens.values()), list(relations.values()),
+    )
+
+
+async def token_log_loop(
+    db: DB, chains: dict[str, ChainCfg], pools: dict[str, RpcPool],
+    cfg: AppCfg, stop: asyncio.Event, governor: LoadGovernor | None = None,
+    *, once: bool = False, monitor: MonitorStore | None = None,
+) -> None:
+    """Enrich contracts independently of both discovery cursors."""
+    done = 0
+    head_cache: dict[str, tuple[float, int]] = {}
+    while not stop.is_set():
+        await wait_if_paused(monitor, stop)
+        if stop.is_set():
+            return
+        if governor is not None and governor.state == "balance_only":
+            await asyncio.sleep(3)
+            continue
+        available = list(chains)
+        if pools:
+            budget = next(iter(pools.values())).token_log_budget
+            if budget is not None:
+                available = await budget.available_chains(available)
+        task = db.next_token_log_task(available)
+        if task is None:
+            if once:
+                return
+            await asyncio.sleep(2)
+            continue
+        key = str(task["chain"])
+        pool = pools[key]
+        try:
+            cached = head_cache.get(key)
+            if cached is None or time.monotonic() - cached[0] >= 30:
+                head = max(0, await latest_block(pool) - chains[key].confirmations)
+                head_cache[key] = (time.monotonic(), head)
+            else:
+                head = cached[1]
+            async with asyncio.timeout(min(120.0, cfg.discovery_range_timeout_sec)):
+                new_links = await process_token_log_task(db, chains[key], pool, task, head)
+            log.info(
+                "[%s/token-logs] %s next=%s new_links=%s endpoint=%s",
+                key, task["address"], db.token_log_task(key, task["address"])["next_block"],
+                new_links, pool.active_endpoint("logs"),
+            )
+        except (RpcError, TimeoutError) as exc:
+            kind = exc.kind if isinstance(exc, RpcError) else "timeout"
+            failures = db.fail_token_log_task(key, str(task["address"]), kind)
+            if failures >= 2:
+                pool.force_failover("logs", 300)
+            log.warning(
+                "[%s/token-logs] %s block=%s %s; retry scheduled, endpoint=%s",
+                key, task["address"], task["next_block"], kind,
+                pool.active_endpoint("logs"),
+            )
+        done += 1
+        if once and done >= cfg.token_log_global_per_minute:
+            return
+
+
 async def discover_tx_to_contracts(
     db: DB,
     chain: ChainCfg,
@@ -3741,18 +4191,11 @@ async def index_chain_cursor(
                 range_contracts = {
                     row[1] for row in [*direct_contracts, *active_contracts]
                 }
-                tokens: list[tuple[Any, ...]] = []
-                relations: list[tuple[Any, ...]] = []
-                if cfg.discover_tokens_from_transfers:
-                    update_stage("logs")
-                    tokens, relations = await collect_transfers(
-                        chain, rpc, start, end, known_contracts | range_contracts,
-                    )
                 update_stage("commit")
                 inserted, source_inserted = db.commit_index_range(
                     chain.key, role, end, [*direct_contracts, *active_contracts],
                     [*direct_discoveries, *active_discoveries], cache_rows,
-                    tokens, relations,
+                    [], [], enqueue_token_logs=cfg.discover_tokens_from_transfers,
                 )
                 known_contracts.update(range_contracts)
                 known_active_calls.update(found_active)
@@ -3930,31 +4373,25 @@ async def index_chain(
                         now,
                     )
                 )
-            inserted = db.upsert_contracts(new_rows)
-            db.upsert_contract_discoveries(direct_source_rows)
-            known_contracts.update(row[1] for row in new_rows)
-
-            active_inserted = 0
-            active_sources = 0
+            active_rows: list[tuple[Any, ...]] = []
+            active_discoveries: list[tuple[Any, ...]] = []
+            cache_rows: list[tuple[Any, ...]] = []
+            found_active: set[str] = set()
             code_checked = 0
             if cfg.discover_tx_to_contracts:
-                active_inserted, active_sources, code_checked = await discover_tx_to_contracts(
-                    db,
-                    chain,
-                    rpc,
-                    cfg,
-                    tx_to_candidates,
-                    known_contracts,
-                    known_active_calls,
-                    batch_end,
-                    now,
+                (active_rows, active_discoveries, cache_rows,
+                 found_active, code_checked) = await collect_tx_to_contracts(
+                    db, chain, rpc, cfg, tx_to_candidates,
+                    known_contracts | {row[1] for row in new_rows},
+                    known_active_calls, batch_end, now,
                 )
-
-            if cfg.discover_tokens_from_transfers:
-                await harvest_transfers(db, chain, rpc, numbers[0], batch_end)
-
-            # The cursor moves only after every mandatory block, receipt and log range succeeded.
-            db.set_last_indexed(chain.key, batch_end)
+            inserted, active_sources = db.commit_legacy_index_range(
+                chain.key, batch_end, [*new_rows, *active_rows],
+                [*direct_source_rows, *active_discoveries], cache_rows,
+                enqueue_token_logs=cfg.discover_tokens_from_transfers,
+            )
+            known_contracts.update(row[1] for row in [*new_rows, *active_rows])
+            known_active_calls.update(found_active)
             last = batch_end
             range_failures = 0
             rpc.grow_batch("block")
@@ -3966,7 +4403,7 @@ async def index_chain(
                 batch_end,
                 target,
                 max(0, target - last),
-                inserted + active_inserted,
+                inserted,
                 active_sources,
                 code_checked,
                 len(numbers),
@@ -4345,6 +4782,23 @@ async def _scan_address_chain(
             else:
                 chain_status = "complete"
                 note = anomaly_note
+            task = db.token_log_task(chain.key, address) if cfg.discover_tokens_from_transfers else None
+            if task is not None and (
+                task["completed_at"] is None or int(task["history_limited"])
+                or (task["due_at"] <= datetime.now(timezone.utc).isoformat()
+                    and getattr(rpc, "last_head", None) is not None
+                    and int(task["next_block"]) <= rpc.last_head - chain.confirmations)
+            ):
+                coverage_note = (
+                    "token_coverage_partial: history before active_call unknown"
+                    if int(task["history_limited"])
+                    else "token_coverage_partial: Transfer logs pending"
+                )
+                if chain_status == "complete":
+                    chain_status = "partial"
+                    note = coverage_note
+                else:
+                    note = f"{note}; {coverage_note}" if note else coverage_note
             if chain.lifecycle != "active":
                 lifecycle_note = f"network lifecycle={chain.lifecycle}"
                 note = f"{note}; {lifecycle_note}" if note else lifecycle_note
@@ -5125,12 +5579,17 @@ async def heartbeat_loop(
         paused = monitor.setting("scanner_paused", "0") == "1"
         slot_stats = await discovery_slots.snapshot()
         governor_stats = governor.snapshot()
+        token_log_stats = db.token_log_queue_snapshot() if cfg.discover_tokens_from_transfers else {}
+        for key, values in token_log_stats.items():
+            pool = pools.get(key)
+            values["endpoint"] = pool.active_endpoint("logs") if pool is not None else "none"
         monitor.heartbeat(
             run_id, "paused" if paused else "running",
             json.dumps({
                 "discovery_scheduler": slot_stats,
                 "load_governor": governor_stats,
                 "rpc_budgets": rpc_limiter.snapshot(),
+                "token_logs": token_log_stats,
             }, separators=(",", ":")),
         )
         lines = [
@@ -5531,6 +5990,25 @@ async def run(args: argparse.Namespace) -> None:
     # themselves. Reclassifying every latest scan here turns startup into an
     # O(addresses × contracts) SQLite workload on a long-running instance.
     seed_tokens(db, load_token_seed(ROOT / "tokens.yaml"), list(balance_chains))
+    if (cfg.discover_tokens_from_transfers and not args.rpc_check and
+            not args.export_only and db.needs_token_log_queue_seed()):
+        def migrate_token_logs() -> int:
+            if db.conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]:
+                backup_path = backup_database(
+                    db, ROOT / "backups" / "pre_token_log_queue_v1", keep=1,
+                )
+                log.info("token log queue backup: %s", backup_path.name)
+            return db.seed_priority_token_log_tasks(cfg.min_usd)
+
+        migration = asyncio.create_task(asyncio.to_thread(migrate_token_logs))
+        while True:
+            monitor.set_runtime_state("migrating", "seeding priority token log tasks")
+            try:
+                seeded = await asyncio.wait_for(asyncio.shield(migration), timeout=30)
+                break
+            except asyncio.TimeoutError:
+                continue
+        log.info("seeded %s priority token log tasks", seeded)
     cfg.export_dir.mkdir(parents=True, exist_ok=True)
     export_lock = asyncio.Lock()
 
@@ -5564,6 +6042,9 @@ async def run(args: argparse.Namespace) -> None:
         cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency
     )
     prices = PriceBook(cfg.http_timeout_sec, cfg.price_batch_size)
+    token_log_budget = TokenLogBudget(
+        cfg.token_log_global_per_minute, cfg.token_log_chain_per_minute,
+    )
     pools: dict[str, RpcPool] = {}
     sui_client: BlockberryClient | None = None
     should_export = not args.rpc_check
@@ -5595,6 +6076,7 @@ async def run(args: argparse.Namespace) -> None:
                 global_sem=global_rpc_sem,
                 health_store=db,
             )
+            pool.token_log_budget = token_log_budget
             await pool.__aenter__()
             pools[chain.key] = pool
 
@@ -5690,6 +6172,12 @@ async def run(args: argparse.Namespace) -> None:
                         monitor=monitor, run_id=run_id,
                     ))
                 await asyncio.gather(*index_jobs)
+                if cfg.discover_tokens_from_transfers:
+                    await token_log_loop(
+                        db,
+                        {chain.key: chain for chain in discovery_ready}, pools,
+                        cfg, stop, once=True,
+                    )
             if cfg.run_balance_checker and not args.index_only:
                 balance_jobs = [check_multichain_balances(
                     db, balance_chains, pools, prices, cfg, cfg.min_usd, stop,
@@ -5739,6 +6227,18 @@ async def run(args: argparse.Namespace) -> None:
                             name=f"idx-{chain.key}-{role}",
                         )
                     )
+            if cfg.discover_tokens_from_transfers:
+                tasks.append(asyncio.create_task(
+                    supervised(
+                        "token-logs",
+                        lambda: token_log_loop(
+                            db, {chain.key: chain for chain in discovery_ready},
+                            pools, cfg, stop, governor, monitor=monitor,
+                        ),
+                        stop, cfg.task_restart_sec, monitor,
+                    ),
+                    name="token-logs",
+                ))
             if sui_client is not None:
                 tasks.append(asyncio.create_task(
                     supervised(

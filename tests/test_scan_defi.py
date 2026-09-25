@@ -91,6 +91,7 @@ class ConfigAndDatabaseTests(unittest.TestCase):
                 "address_token_scans", "contract_discoveries", "contract_code_cache",
                 "chain_cursors", "address_chain_state", "address_token_state",
                 "asset_valuation_policies", "anomalous_balances", "rpc_method_health",
+                "token_log_tasks",
             ):
                 row = second.conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -100,7 +101,7 @@ class ConfigAndDatabaseTests(unittest.TestCase):
                 "SELECT source FROM contract_discoveries WHERE chain='ethereum' AND address='0xabc'"
             ).fetchone()
             self.assertEqual("direct_deploy", source["source"])
-            self.assertEqual(7, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
+            self.assertEqual(8, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
             second.close()
 
     def test_upsert_contract_count_is_exact_for_executemany(self):
@@ -338,11 +339,13 @@ class FakeIndexRpc:
         self.call_batch = 20
         self.receipt_batches = []
         self.code_batches = []
+        self.log_calls = 0
 
     async def call(self, method, params):
         if method == "eth_blockNumber":
             return hex(max(self.blocks))
         if method == "eth_getLogs":
+            self.log_calls += 1
             if self.log_error:
                 raise scan_defi.RpcError("rpc", "logs failed")
             return []
@@ -473,6 +476,7 @@ class CursorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["active_call"], [row["source"] for row in sources])
             self.assertEqual(2, sum(len(batch) for batch in rpc.code_batches))
             self.assertEqual(100, db.last_indexed("ethereum"))
+            self.assertEqual(0, rpc.log_calls)
             db.close()
 
     async def test_direct_deploy_and_active_call_share_one_contract(self):
@@ -827,7 +831,7 @@ class CursorBulkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(100, db.last_indexed("ethereum"))
             db.close()
 
-    async def test_log_failure_does_not_advance_cursor(self):
+    async def test_log_failure_does_not_block_discovery_cursor(self):
         cfg = replace(self.cfg, discover_tokens_from_transfers=True)
         rpc = FakeIndexRpc({100: {"number": hex(100), "transactions": []}}, log_error=True)
         with tempfile.TemporaryDirectory() as folder:
@@ -835,11 +839,12 @@ class CursorBulkTests(unittest.IsolatedAsyncioTestCase):
             db.upsert_contracts(
                 [("ethereum", "0x" + "12" * 20, 99, "0xtx", "0xcreator", "now")]
             )
-            with self.assertRaises(scan_defi.RpcError):
-                await scan_defi.index_chain(
-                    db, self.chain, rpc, cfg, asyncio.Event(), None, 100, once=True
-                )
-            self.assertEqual(99, db.last_indexed("ethereum"))
+            await scan_defi.index_chain(
+                db, self.chain, rpc, cfg, asyncio.Event(), None, 100, once=True
+            )
+            self.assertEqual(100, db.last_indexed("ethereum"))
+            self.assertEqual(0, rpc.log_calls)
+            self.assertIsNone(db.token_log_task("ethereum", "0x" + "12" * 20))
             db.close()
 
     async def test_range_watchdog_releases_slot_without_advancing_cursor(self):

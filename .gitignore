@@ -5,6 +5,9 @@
 __pycache__/
 .pytest_cache/
 .pytest-tmp-*/
+.pytest-run-tmp/
+.pytest-tmp/
+.test-token-logs*/
 pytest-cache-files-*/
 .test_tmp/
 .test-tmp/

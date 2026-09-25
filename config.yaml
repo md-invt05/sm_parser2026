@@ -49,6 +49,9 @@ task_restart_sec: 20
 run_indexer: true
 run_balance_checker: true
 discover_tokens_from_transfers: true
+# Token discovery is a separate bounded queue; these limits count actual RPC attempts.
+token_log_global_per_minute: 30
+token_log_chain_per_minute: 4
 # Discover unique top-level transaction recipients that currently have EVM bytecode.
 discover_tx_to_contracts: true
 # Empty-code recipients are not checked again during fast backfills until this expires.

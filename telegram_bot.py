@@ -343,6 +343,15 @@ class ReportBuilder:
                 f"RPC budget: discovery {budgets.get('discovery_limit', 0)}, "
                 f"balances {budgets.get('balance_limit', 0)}, total {budgets.get('total_limit', 0)}"
             )
+        token_logs = runtime_note.get("token_logs") or {} if isinstance(runtime_note, dict) else {}
+        if token_logs:
+            lines.append(
+                "Token logs: "
+                f"due {sum(int(item.get('due', 0)) for item in token_logs.values()):,}, "
+                f"partial {sum(int(item.get('partial', 0)) for item in token_logs.values()):,}, "
+                f"failed {sum(int(item.get('failed', 0)) for item in token_logs.values()):,}; "
+                f"oldest {human_duration(max(float(item.get('oldest_age_sec', 0)) for item in token_logs.values()))}"
+            )
         if aggregate:
             lines.append(
                 f"Адреса: {aggregate['unique_addresses']:,} | очередь: {aggregate['balance_pending']:,}"
@@ -436,6 +445,7 @@ class ReportBuilder:
         except (TypeError, ValueError, json.JSONDecodeError):
             runtime_note = {}
         governor = runtime_note.get("load_governor") or {} if isinstance(runtime_note, dict) else {}
+        token_logs = runtime_note.get("token_logs") or {} if isinstance(runtime_note, dict) else {}
         paused_by_governor = governor.get("state") == "balance_only"
         rows = self.monitor.rows(
             """
@@ -461,6 +471,17 @@ class ReportBuilder:
                         f"age {human_duration(age)}, failures {worker['failures']}"
                         f", endpoint {worker['endpoint'] or 'none'}"
                     )
+            log_state = token_logs.get(row["chain"], {}) if row["role"] == "live" else {}
+            if log_state:
+                worker_text += (
+                    f"; token logs due {log_state.get('due', 0)}, "
+                    f"partial {log_state.get('partial', 0)}, "
+                    f"failed {log_state.get('failed', 0)}, "
+                    f"next {log_state.get('next_block', 'n/a')}, "
+                    f"oldest {human_duration(log_state.get('oldest_age_sec'))}, "
+                    f"RPC {log_state.get('endpoint', 'none')}, "
+                    f"errors {log_state.get('errors') or '-'}"
+                )
             lines.append(
                 f"• {row['chain']} [{row['role']}]: cursor {row['cursor']}, head {row['safe_head']}, lag {row['lag']}; "
                 f"RPC {row['active_rpc']}; cooldown {float(row['cooldown_sec'] or 0):.0f}s; "

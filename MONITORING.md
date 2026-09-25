@@ -47,6 +47,9 @@ Discovery uses separate fair live/backfill queues. Profile capacities are `4/1` 
 `conservative` and `low`, `6/1` for `normal`, and `10/2` for `high`. Live waiters
 older than 30 seconds take FIFO priority; otherwise the largest lag is served first.
 `/status` shows active slots, queued networks, and the oldest wait time.
+It also shows the due, partial and failed token-log tasks. `/networks` shows
+their per-network cursor, oldest task, and active logs RPC. The token-log worker
+pauses while `steady` is in `balance_only`; its task positions remain in SQLite.
 Automatic exports run every six hours and rebuild only the qualifying EVM/Sui files.
 `/export` forces the complete report bundle. `/file` sends a nonempty report
 immediately when it was generated within the last six hours; otherwise it
