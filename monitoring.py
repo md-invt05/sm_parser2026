@@ -143,6 +143,9 @@ CREATE TABLE IF NOT EXISTS aggregate_samples(
     balance_pending INTEGER NOT NULL DEFAULT 0,
     balance_new_pending INTEGER NOT NULL DEFAULT 0,
     balance_retry_pending INTEGER NOT NULL DEFAULT 0,
+    balance_planned_pending INTEGER NOT NULL DEFAULT 0,
+    balance_rpc_retry_pending INTEGER NOT NULL DEFAULT 0,
+    balance_token_coverage_waiting INTEGER NOT NULL DEFAULT 0,
     balance_oldest_age_sec REAL,
     balance_completed INTEGER NOT NULL DEFAULT 0,
     balance_scans_total INTEGER NOT NULL DEFAULT 0,
@@ -276,7 +279,9 @@ class MonitorStore:
         }
         if "balance_oldest_age_sec" not in aggregate_columns:
             self.conn.execute("ALTER TABLE aggregate_samples ADD COLUMN balance_oldest_age_sec REAL")
-        for name in ("balance_new_pending", "balance_retry_pending", "balance_scans_total"):
+        for name in ("balance_new_pending", "balance_retry_pending", "balance_scans_total",
+                     "balance_planned_pending", "balance_rpc_retry_pending",
+                     "balance_token_coverage_waiting"):
             if name not in aggregate_columns:
                 self.conn.execute(
                     f"ALTER TABLE aggregate_samples ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
@@ -404,12 +409,16 @@ class MonitorStore:
             "ts", "run_id", "unique_addresses", "contract_instances", "direct_deploy",
             "active_call", "balance_pending", "balance_completed", "qualifying",
             "balance_new_pending", "balance_retry_pending", "balance_scans_total",
+            "balance_planned_pending", "balance_rpc_retry_pending",
+            "balance_token_coverage_waiting",
             "balance_oldest_age_sec",
             "below_count", "incomplete", "coverage_json", "db_bytes", "wal_bytes",
             "reports_json", "last_export_at",
         ]
         values.setdefault("ts", utc_now())
-        for name in ("balance_new_pending", "balance_retry_pending", "balance_scans_total"):
+        for name in ("balance_new_pending", "balance_retry_pending", "balance_scans_total",
+                     "balance_planned_pending", "balance_rpc_retry_pending",
+                     "balance_token_coverage_waiting"):
             values.setdefault(name, 0)
         for key in ("coverage_json", "reports_json"):
             values[key] = json.dumps(values.get(key, {}), ensure_ascii=False)

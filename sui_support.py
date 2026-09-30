@@ -1468,6 +1468,7 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
     )
     grouped = {"qualifying": [], "below": [], "incomplete": []}
     now = datetime.now(UTC)
+    provider_outage = bool(store.sync_value("last_defi_error", ""))
     for row in store.latest_projects():
         try:
             age = (now - datetime.fromisoformat(row["synced_at"])).total_seconds()
@@ -1475,11 +1476,10 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
             age = float("inf")
         tvl = float(row["indexed_tvl"] or 0.0)
         status = (
-            "incomplete" if age > 1800 or row["status"] == "incomplete" or not row["provider_complete"]
-            or not json.loads(row["packages_json"] or "[]")
+            "incomplete" if row["status"] == "incomplete" or not json.loads(row["packages_json"] or "[]")
             else "qualifying" if tvl >= min_usd else "below"
         )
-        grouped[status].append(row)
+        grouped[status].append((row, provider_outage or age > 1800 or not row["provider_complete"]))
     headers = [
         "Project", "Indexed TVL USD", "Status", "Packages", "Verified pool TVL USD",
         "Verified pools", "Known pools", "Verification coverage", "Synced (UTC)",
@@ -1488,15 +1488,11 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
     for path, status in zip(paths[:3], ("qualifying", "below", "incomplete")):
         if mode != "full" and status != mode:
             continue
-        wb = Workbook()
-        ws = wb.active
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet()
         ws.title = "Sui DeFi projects"
         ws.append(headers)
-        for cell in ws[1]:
-            cell.fill = PatternFill("solid", fgColor="17365D")
-            cell.font = Font(color="FFFFFF", bold=True)
-            cell.alignment = Alignment(horizontal="center", wrap_text=True)
-        for row in grouped.get(status, []):
+        for row, stale in grouped.get(status, []):
             packages = json.loads(row["packages_json"] or "[]")
             pool_count = int(row["pool_count"] or 0)
             verified_count = int(row["verified_pool_count"] or 0)
@@ -1506,16 +1502,9 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
                 "; ".join(packages)[:32000], float(row["verified_pool_tvl"] or 0.0),
                 verified_count, pool_count, coverage, row["synced_at"],
                 "Blockberry indexed TVL; verified pool TVL is evidence only and is not added "
-                "to indexed TVL" + (f"; {row['note']}" if row["note"] else ""),
+                "to indexed TVL" + (f"; snapshot stale since {row['synced_at']}" if stale else "")
+                + (f"; {row['note']}" if row["note"] else ""),
             ])
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        for index, width in enumerate((30, 20, 14, 80, 24, 16, 14, 20, 24, 75), 1):
-            ws.column_dimensions[get_column_letter(index)].width = width
-        for cell in ws["B"][1:]:
-            cell.number_format = '#,##0.00"$"'
-        for cell in ws["E"][1:]:
-            cell.number_format = '#,##0.00"$"'
         temporary = path.with_suffix(".tmp.xlsx")
         wb.save(temporary)
         temporary.replace(path)
@@ -1523,8 +1512,8 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
     if mode != "full" and mode != "packages":
         return paths
 
-    technical = Workbook()
-    ws = technical.active
+    technical = Workbook(write_only=True)
+    ws = technical.create_sheet()
     ws.title = "Move packages (technical)"
     ws.append([
         "Package ID", "Lineage", "Name", "Project hint", "Publisher", "Version",
@@ -1538,13 +1527,6 @@ def export_sui_xlsx(store: SuiStore, export_dir: Path, min_usd: float,
             row["first_tx"], row["last_tx"], row["first_seen_at"], row["last_seen_at"],
             "Technical package discovery only; no wallet balance or duplicated project TVL",
         ])
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for cell in ws[1]:
-        cell.fill = PatternFill("solid", fgColor="17365D")
-        cell.font = Font(color="FFFFFF", bold=True)
-    for index, width in enumerate((69, 69, 24, 24, 69, 10, 18, 18, 69, 69, 23, 23, 75), 1):
-        ws.column_dimensions[get_column_letter(index)].width = width
     temporary = paths[3].with_suffix(".tmp.xlsx")
     technical.save(temporary)
     temporary.replace(paths[3])

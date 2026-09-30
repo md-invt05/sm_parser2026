@@ -26,14 +26,14 @@ class BalanceScheduleTests(unittest.TestCase):
     def test_tiers_and_error_backoff(self):
         delay = scanner.balance_retry_delay
         threshold = 500_000
-        self.assertEqual(21600, delay("complete", 1, threshold, threshold))
-        self.assertEqual(86400, delay("complete", 1, 50_000, threshold))
-        self.assertEqual(259200, delay("complete", 1, 49_999, threshold))
-        self.assertEqual(604800, delay("complete", 1, 0, threshold))
-        self.assertEqual(2592000, delay("absent", 0, 0, threshold))
-        self.assertEqual(21600, delay("price_missing", 1, None, threshold))
+        self.assertEqual(86400, delay("complete", 1, threshold, threshold))
+        self.assertEqual(259200, delay("complete", 1, 150_000, threshold))
+        self.assertEqual(30 * 86400, delay("complete", 1, 49_999, threshold))
+        self.assertEqual(90 * 86400, delay("complete", 1, 0, threshold))
+        self.assertEqual(90 * 86400, delay("absent", 0, 0, threshold))
+        self.assertEqual(30 * 86400, delay("price_missing", 1, None, threshold))
         self.assertEqual(86400, delay("anomalous_balance", 1, None, threshold))
-        self.assertEqual([600, 1800, 7200, 21600, 86400], [
+        self.assertEqual([1800, 7200, 28800, 86400, 259200], [
             delay("rpc_error", None, None, threshold, streak) for streak in range(1, 6)
         ])
 
@@ -90,7 +90,7 @@ class BalanceScheduleTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertAlmostEqual(
                 datetime.fromisoformat(due).timestamp() - datetime.fromisoformat(old_checked).timestamp(),
-                30 * 86400, delta=1,
+                90 * 86400, delta=1,
             )
             self.assertEqual(0, db.rephase_balance_schedule(500_000))
             self.assertEqual(before, db.conn.execute("SELECT COUNT(*) FROM address_scans").fetchone()[0])

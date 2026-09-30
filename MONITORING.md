@@ -6,9 +6,10 @@ The default profile is `conservative` (`low` remains a compatibility alias), and
 Telegram never increases load automatically. Qualifying counts are recalculated
 with the current threshold rather than copied from historical scan labels.
 
-The production stack is defined in `docker-compose.yml` and contains four isolated services:
+The production stack is defined in `docker-compose.yml` and contains five isolated services:
 
 - `scanner` writes heartbeat and minute aggregates to `data/monitoring.db`;
+- `exporter` generates XLSX independently, capped at 0.75 CPU and 768 MiB;
 - `telegram-bot` reads monitoring data and reports, but receives no RPC secrets;
 - `docker-proxy` exposes the container API required for the fixed, labelled scanner target;
 - `node-exporter` exposes host metrics only on the internal Compose network.
@@ -41,23 +42,35 @@ Available commands: `/status`, `/report`, `/networks`, `/resources`, `/errors`,
 
 The scanner reads the persisted `conservative`, `low`, `steady`, `normal` or `high` profile on startup.
 `steady` is the recommended 24/7 server profile: it reserves four RPC requests for
-discovery and six for balances. Its governor reduces live slots and pauses backfill
-while the EVM/Sui queues are large, then restores capacity after ten stable minutes.
+discovery and six for balances. The protective governor applies to every profile,
+including `normal` and `high`: a large executable EVM/Sui queue pauses new
+discovery, and a large token backlog limits live discovery to one slot. Capacity
+returns only after ten stable minutes below the lower thresholds.
 Discovery uses separate fair live/backfill queues. Profile capacities are `4/1` for
 `conservative` and `low`, `6/1` for `normal`, and `10/2` for `high`. Live waiters
 older than 30 seconds take FIFO priority; otherwise the largest lag is served first.
 `/status` shows active slots, queued networks, and the oldest wait time.
 It also shows the due, partial and failed token-log tasks. `/networks` shows
 their per-network cursor, oldest task, and active logs RPC. The token-log worker
-pauses while `steady` is in `balance_only`; its task positions remain in SQLite.
+continues in `balance_only`, capped at 10 requests/minute globally and 2 per
+network (normally 30/4), using discovery's RPC quota. Recent 1,000-block windows
+have priority; historical work uses at most 20% of the log budget. Pending token
+history remains an explicit coverage gap, not a failed balance scan.
+Confirmed EVM balances are rechecked after 24 hours above the threshold, 72 hours
+from $150k, 30 days for smaller positives, and 90 days for zero/absent chains.
+RPC failures retry only the affected chain. Missing prices are retried from saved
+amounts without another balance RPC call.
 Automatic exports run every six hours and rebuild only the qualifying EVM/Sui files.
 `/export` forces the complete report bundle. `/file` sends a nonempty report
 immediately when it was generated within the last six hours; otherwise it
 queues only that report. Repeated requests for the same pending export share
-the same job. The bot shows new and due-for-recheck EVM work separately.
+the same job. The bot separates new, planned, RPC-retry and token-coverage work.
 Pause is cooperative: no new block range or address starts while current SQLite
-transactions finish. SIGTERM has a 35-second Compose grace period and performs a
-final export. Online SQLite backups are created daily; the newest seven are kept.
+transactions finish. The isolated exporter streams rows to temporary XLSX files
+and atomically replaces each completed report; a failed job leaves its predecessor.
+Scanner SIGTERM does not wait for an XLSX export. Online SQLite backups are created
+daily; the newest seven are kept. Before a server upgrade, make an online backup
+and rebuild `scanner` and `exporter`; never use `docker-compose down -v`.
 
 Before server deployment, rotate every RPC/API key that has ever been pasted into
 a chat or terminal transcript. Keep `.env` out of Git and set its mode to `600`.

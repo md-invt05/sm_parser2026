@@ -69,29 +69,31 @@ ZERO = "0x0000000000000000000000000000000000000000"
 LLAMA_PRICES = "https://coins.llama.fi/prices/current/"
 # Task-local policy: balance probes must not inherit the indexer's long retries.
 BALANCE_RPC = ContextVar("balance_rpc", default=False)
-BALANCE_SCHEDULE_REVISION = "2"
-TOKEN_LOG_QUEUE_REVISION = "1"
+TOKEN_LOG_HISTORY = ContextVar("token_log_history", default=False)
+BALANCE_SCHEDULE_REVISION = "3"
+TOKEN_LOG_QUEUE_REVISION = "2"
 
 
 def balance_retry_delay(status: str, has_code: int | None, usd: float | None,
-                        threshold: float, failure_streak: int = 0) -> int:
+                        threshold: float, failure_streak: int = 0,
+                        aggregate_usd: float | None = None) -> int:
     """Seconds until this chain needs another probe; never discard an address."""
     if status in {"rpc_error", "partial", "timeout"}:
-        return (600, 1800, 7200, 21600, 86400)[min(max(failure_streak - 1, 0), 4)]
+        return (1800, 7200, 28800, 86400, 259200)[min(max(failure_streak - 1, 0), 4)]
     if status == "price_missing":
-        return 21600
+        return 30 * 86400  # Prices are retried from observations, without balance RPC.
     if status == "anomalous_balance":
         return 86400
     if has_code == 0 or status == "absent":
-        return 30 * 86400
-    amount = float(usd or 0)
+        return 90 * 86400
+    amount = float(aggregate_usd if aggregate_usd is not None else usd or 0)
     if amount >= threshold:
-        return 21600
-    if amount >= threshold * 0.1:
         return 86400
-    if amount > 0:
+    if amount >= 150_000:
         return 3 * 86400
-    return 7 * 86400
+    if amount > 0:
+        return 30 * 86400
+    return 90 * 86400
 
 RATE_HINTS = (
     "rate limit",
@@ -531,6 +533,9 @@ CREATE TABLE IF NOT EXISTS token_log_tasks (
     completed_at     TEXT,
     failures         INTEGER NOT NULL DEFAULT 0,
     last_error       TEXT,
+    recent_cursor    INTEGER,
+    historical_cursor INTEGER,
+    recent_complete  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chain, address)
 );
 CREATE INDEX IF NOT EXISTS idx_token_log_tasks_due
@@ -611,6 +616,8 @@ CREATE TABLE IF NOT EXISTS address_chain_state (
     failure_streak   INTEGER NOT NULL DEFAULT 0,
     next_retry_at    TEXT NOT NULL,
     note             TEXT,
+    coverage_state   TEXT NOT NULL DEFAULT 'verified',
+    price_retry_at   TEXT,
     PRIMARY KEY (address, chain)
 );
 CREATE INDEX IF NOT EXISTS idx_address_chain_retry
@@ -700,6 +707,32 @@ class DB:
             self.conn.execute("PRAGMA query_only=ON")
             return
         self.conn.executescript(SCHEMA)
+        state_columns = {row["name"] for row in self.conn.execute(
+            "PRAGMA table_info(address_chain_state)"
+        )}
+        if "coverage_state" not in state_columns:
+            self.conn.execute(
+                "ALTER TABLE address_chain_state ADD COLUMN coverage_state TEXT NOT NULL DEFAULT 'verified'"
+            )
+        if "price_retry_at" not in state_columns:
+            self.conn.execute("ALTER TABLE address_chain_state ADD COLUMN price_retry_at TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_address_chain_price_retry "
+            "ON address_chain_state(price_retry_at)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_address_chain_coverage "
+            "ON address_chain_state(coverage_state)"
+        )
+        token_task_columns = {row["name"] for row in self.conn.execute(
+            "PRAGMA table_info(token_log_tasks)"
+        )}
+        for name, declaration in {
+            "recent_cursor": "INTEGER", "historical_cursor": "INTEGER",
+            "recent_complete": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in token_task_columns:
+                self.conn.execute(f"ALTER TABLE token_log_tasks ADD COLUMN {name} {declaration}")
         chain_state_columns = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(chain_state)")
         }
@@ -1360,9 +1393,16 @@ class DB:
                           50,?,?
                    FROM contracts c JOIN chain_state s ON s.chain=c.chain
                    WHERE c.last_total_usd>=?""",
-                (now, now, min_usd * 0.1),
+                (now, now, 150_000),
             )
             inserted = self.conn.total_changes - before
+            self.conn.execute(
+                """UPDATE token_log_tasks SET priority=CASE
+                     WHEN recent_complete=0 THEN 100
+                     WHEN COALESCE((SELECT MAX(c.last_total_usd) FROM contracts c
+                                    WHERE c.address=token_log_tasks.address),0)>=150000 THEN 50
+                     ELSE 10 END"""
+            )
             self.conn.execute(
                 """INSERT INTO runtime_meta(key,value,updated_at) VALUES(?,?,?)
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,
@@ -1378,17 +1418,22 @@ class DB:
                 (chain, address.lower()),
             ).fetchone()
 
-    def next_token_log_task(self, chains: list[str]) -> sqlite3.Row | None:
+    def next_token_log_task(
+        self, chains: list[str], allow_history: bool = True,
+        prefer_history: bool = False,
+    ) -> sqlite3.Row | None:
         if not chains:
             return None
         now = datetime.now(timezone.utc).isoformat()
         placeholders = ",".join("?" for _ in chains)
+        direction = "DESC" if prefer_history else "ASC"
         with self._lock:
             return self.conn.execute(
                 f"""SELECT * FROM token_log_tasks
                     WHERE chain IN ({placeholders}) AND due_at<=?
-                    ORDER BY priority DESC,due_at,updated_at LIMIT 1""",
-                (*chains, now),
+                      AND (recent_complete=0 OR (? AND priority>=50))
+                    ORDER BY recent_complete {direction},priority DESC,due_at,updated_at LIMIT 1""",
+                (*chains, now, int(allow_history)),
             ).fetchone()
 
     def token_log_queue_snapshot(self) -> dict[str, dict[str, Any]]:
@@ -1396,11 +1441,13 @@ class DB:
         with self._lock:
             rows = self.conn.execute(
                 """SELECT chain,COUNT(*) total,
-                          SUM(CASE WHEN due_at<=? THEN 1 ELSE 0 END) due,
+                          SUM(CASE WHEN due_at<=? AND
+                              (recent_complete=0 OR priority>=50) THEN 1 ELSE 0 END) due,
                           SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) failed,
                           SUM(CASE WHEN completed_at IS NULL OR history_limited=1
                               THEN 1 ELSE 0 END) partial,
-                          MIN(CASE WHEN due_at<=? THEN updated_at END) oldest_at,
+                          MIN(CASE WHEN due_at<=? AND
+                              (recent_complete=0 OR priority>=50) THEN updated_at END) oldest_at,
                           MIN(next_block) next_block
                    FROM token_log_tasks GROUP BY chain""",
                 (now.isoformat(), now.isoformat()),
@@ -1428,12 +1475,14 @@ class DB:
     def commit_token_log_window(
         self, chain: str, address: str, end: int, head: int,
         token_rows: list[tuple[Any, ...]], relation_rows: list[tuple[Any, ...]],
+        *, recent: bool = False,
     ) -> int:
         now = datetime.now(timezone.utc)
         address = address.lower()
         with self._lock, self.conn:
             task = self.token_log_task(chain, address)
-            if task is None or end < int(task["next_block"]):
+            cursor = task["recent_cursor"] if recent and task is not None else task["next_block"] if task is not None else None
+            if task is None or (cursor is not None and end < int(cursor)):
                 raise RuntimeError("stale token log window")
             self.conn.executemany(
                 """INSERT INTO tokens(chain,address,symbol,decimals,source)
@@ -1461,19 +1510,50 @@ class DB:
             else:
                 delay = 1
             due = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
-            self.conn.execute(
-                """UPDATE token_log_tasks SET next_block=?,due_at=?,updated_at=?,
-                       completed_at=?,failures=0,last_error=NULL,
-                       window_size=MIN(1000,window_size*2),priority=CASE
-                         WHEN priority=100 THEN 50 ELSE priority END
-                   WHERE chain=? AND address=?""",
-                (end + 1, due, now.isoformat(), now.isoformat() if done else None,
-                 chain, address),
-            )
-            if changed or done:
+            if recent:
+                # Recent evidence is useful immediately; the historical cursor
+                # remains at the first observation and advances separately.
+                recent_done = end >= head
+                aggregate = float(self.conn.execute(
+                    "SELECT MAX(last_total_usd) FROM contracts WHERE address=?", (address,),
+                ).fetchone()[0] or 0)
+                recent_priority = 50 if aggregate >= 150_000 else 10
+                recent_due = (1 if recent_priority >= 50 else 30 * 86400) if recent_done else 1
+                self.conn.execute(
+                    """UPDATE token_log_tasks SET recent_cursor=?,recent_complete=?,
+                           due_at=?,updated_at=?,failures=0,last_error=NULL,
+                           window_size=MIN(1000,window_size*2),priority=?
+                       WHERE chain=? AND address=?""",
+                    (end + 1, int(recent_done), datetime.fromtimestamp(now.timestamp() + recent_due, timezone.utc).isoformat(),
+                     now.isoformat(), recent_priority if recent_done else int(task["priority"]), chain, address),
+                )
+                if recent_done:
+                    self.conn.execute(
+                        "UPDATE address_chain_state SET coverage_state=? "
+                        "WHERE chain=? AND address=? AND coverage_state!='verified'",
+                        ("history_unknown" if int(task["history_limited"]) else "recent_only",
+                         chain, address),
+                    )
+            else:
+                self.conn.execute(
+                    """UPDATE token_log_tasks SET next_block=?,historical_cursor=?,due_at=?,updated_at=?,
+                           completed_at=?,failures=0,last_error=NULL,
+                           window_size=MIN(1000,window_size*2),priority=CASE
+                             WHEN priority=100 THEN 50 ELSE priority END
+                       WHERE chain=? AND address=?""",
+                    (end + 1, end + 1, due, now.isoformat(), now.isoformat() if done else None,
+                     chain, address),
+                )
+            if changed:
                 self.conn.execute(
                     "UPDATE address_chain_state SET next_retry_at=? WHERE chain=? AND address=?",
                     (now.isoformat(), chain, address),
+                )
+            elif done and not recent and not int(task["history_limited"]):
+                self.conn.execute(
+                    "UPDATE address_chain_state SET coverage_state='verified',note=NULL "
+                    "WHERE chain=? AND address=? AND coverage_state!='verified'",
+                    (chain, address),
                 )
             if changed:
                 self._bump_revision_locked()
@@ -1957,6 +2037,120 @@ class DB:
             if chain not in rows or str(rows[chain]["next_retry_at"]) <= now_iso
         ]
 
+    def price_refresh_candidates(self, limit: int = 10) -> list[sqlite3.Row]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            return list(self.conn.execute(
+                "SELECT * FROM address_chain_state WHERE status='price_missing' "
+                "AND price_retry_at<=? ORDER BY price_retry_at LIMIT ?", (now, limit),
+            ))
+
+    def unpriced_observations(self, address: str, chain: str) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.conn.execute(
+                "SELECT * FROM address_token_state WHERE address=? AND chain=? "
+                "AND priced=0 AND CAST(raw_amount AS INTEGER)>0",
+                (address.lower(), chain),
+            ))
+
+    def apply_price_refresh(
+        self, address: str, chain: str, prices: dict[str, float],
+        chains: dict[str, ChainCfg], cfg: AppCfg,
+    ) -> int:
+        """Reprice stored amounts only; do not issue balance RPC or increment scan count."""
+        address = address.lower()
+        now = datetime.now(timezone.utc)
+        applied = 0
+        with self._lock, self.conn:
+            for token in self.unpriced_observations(address, chain):
+                amount = token["amount"]
+                price = prices.get(str(token["token"]))
+                if amount is None or price is None:
+                    continue
+                usd = float(amount) * float(price)
+                if not math.isfinite(usd):
+                    continue
+                policy = self.valuation_policy(chain, address, str(token["token"]))
+                threshold = cfg.native_anomaly_usd if token["token"] == "native" else cfg.token_anomaly_usd
+                valuation = (
+                    str(policy["policy"]) if policy and policy["policy"] in {"quarantine", "exclude_from_total"}
+                    else "anomalous_balance" if usd >= threshold and not (
+                        policy and policy["policy"] == "include_verified"
+                    ) else "included"
+                )
+                self.conn.execute(
+                    """UPDATE address_token_state SET price_usd=?,usd_value=?,priced=1,
+                           valuation_status=? WHERE address=? AND chain=? AND token=?""",
+                    (price, usd, valuation, address, chain, token["token"]),
+                )
+                scan = self.conn.execute(
+                    "SELECT id FROM address_scans WHERE address=? ORDER BY id DESC LIMIT 1",
+                    (address,),
+                ).fetchone()
+                if scan:
+                    self.conn.execute(
+                        """UPDATE address_token_scans SET price_usd=?,usd_value=?,priced=1,
+                               valuation_status=? WHERE scan_id=? AND chain=? AND token=?""",
+                        (price, usd, valuation, scan["id"], chain, token["token"]),
+                    )
+                applied += 1
+            remaining = int(self.conn.execute(
+                "SELECT COUNT(*) FROM address_token_state WHERE address=? AND chain=? "
+                "AND priced=0 AND CAST(raw_amount AS INTEGER)>0",
+                (address, chain),
+            ).fetchone()[0])
+            sums = self.conn.execute(
+                """SELECT COALESCE(SUM(CASE WHEN token='native' AND valuation_status='included'
+                                            THEN usd_value ELSE 0 END),0) native_usd,
+                          COALESCE(SUM(CASE WHEN token!='native' AND valuation_status='included'
+                                            THEN usd_value ELSE 0 END),0) tokens_usd,
+                          COALESCE(SUM(CASE WHEN valuation_status!='included'
+                                            THEN usd_value ELSE 0 END),0) excluded_usd
+                   FROM address_token_state WHERE address=? AND chain=?""",
+                (address, chain),
+            ).fetchone()
+            status = "price_missing" if remaining else (
+                "anomalous_balance" if sums["excluded_usd"] else "complete"
+            )
+            next_price = (datetime.fromtimestamp(now.timestamp() + 21600, timezone.utc).isoformat()
+                          if remaining else None)
+            self.conn.execute(
+                """UPDATE address_chain_state SET status=?,included_native_usd=?,tokens_usd=?,
+                       total_usd=?,excluded_usd=?,price_retry_at=?
+                   WHERE address=? AND chain=?""",
+                (status, sums["native_usd"], sums["tokens_usd"],
+                 sums["native_usd"] + sums["tokens_usd"], sums["excluded_usd"],
+                 next_price, address, chain),
+            )
+            latest = self.conn.execute(
+                "SELECT id FROM address_scans WHERE address=? ORDER BY id DESC LIMIT 1",
+                (address,),
+            ).fetchone()
+            if latest:
+                self.conn.execute(
+                    """UPDATE address_chain_scans SET status=?,included_native_usd=?,tokens_usd=?,
+                           total_usd=?,excluded_usd=? WHERE scan_id=? AND chain=?""",
+                    (status, sums["native_usd"], sums["tokens_usd"],
+                     sums["native_usd"] + sums["tokens_usd"], sums["excluded_usd"],
+                     latest["id"], chain),
+                )
+                parts = [dict(row) for row in self.conn.execute(
+                    "SELECT * FROM address_chain_state WHERE address=?", (address,),
+                )]
+                total = sum(float(row["total_usd"] or 0) for row in parts)
+                category, _ = classify_address_scan(total, parts, cfg.min_usd)
+                self.conn.execute(
+                    "UPDATE address_scans SET total_usd=?,status=? WHERE id=?",
+                    (total, category, latest["id"]),
+                )
+                self.conn.execute(
+                    "UPDATE contracts SET last_total_usd=?,last_status=? WHERE lower(address)=?",
+                    (total, category, address),
+                )
+            if applied:
+                self._bump_revision_locked()
+        return applied
+
     def save_address_chain_state(
         self, address: str, row: dict[str, Any], token_rows: list[dict[str, Any]],
         min_usd: float,
@@ -1971,18 +2165,27 @@ class DB:
                 "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
                 (address, chain),
             ).fetchone()
-            token_coverage_partial = str(row.get("note") or "").startswith(
-                "token_coverage_partial"
+            coverage_state = str(
+                row.get("coverage_state") or
+                (previous["coverage_state"] if previous is not None else "verified")
             )
-            failed = status in {"rpc_error", "partial", "timeout"} and not token_coverage_partial
+            token_coverage_partial = str(row.get("note") or "").startswith("token_coverage_partial")
+            if token_coverage_partial and coverage_state == "verified":
+                coverage_state = "history_unknown" if "history before" in str(row.get("note")) else "historical_pending"
+            if token_coverage_partial and status == "partial":
+                status = "complete"
+            failed = status in {"rpc_error", "partial", "timeout"}
             failure_streak = (int(previous["failure_streak"]) if previous else 0) + 1 if failed else 0
+            aggregate = self.conn.execute(
+                "SELECT MAX(last_total_usd) FROM contracts WHERE lower(address)=?", (address,)
+            ).fetchone()[0]
             delay = balance_retry_delay(
                 status, row.get("has_code"), row.get("total_usd"), min_usd,
-                failure_streak,
+                failure_streak, max(float(aggregate or 0), float(row.get("total_usd") or 0)),
             )
-            if token_coverage_partial:
-                delay = 21600 if float(row.get("total_usd") or 0) >= min_usd * 0.1 else 86400
             next_retry = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
+            price_retry = (datetime.fromtimestamp(now.timestamp() + 21600, timezone.utc).isoformat()
+                           if status == "price_missing" else None)
             has_observation = row.get("has_code") is not None and row.get("total_usd") is not None
             def observed(name: str, fallback: Any = None) -> Any:
                 value = row.get(name)
@@ -1993,8 +2196,8 @@ class DB:
                 """INSERT INTO address_chain_state(
                        address,chain,checked_at,last_success_at,status,has_code,native_raw,
                        native_amount,observed_native_usd,included_native_usd,excluded_usd,
-                       tokens_usd,total_usd,valuation_status,failure_streak,next_retry_at,note
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       tokens_usd,total_usd,valuation_status,failure_streak,next_retry_at,note,coverage_state,price_retry_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(address,chain) DO UPDATE SET
                      checked_at=excluded.checked_at,last_success_at=excluded.last_success_at,
                      status=excluded.status,has_code=excluded.has_code,native_raw=excluded.native_raw,
@@ -2004,7 +2207,8 @@ class DB:
                      excluded_usd=excluded.excluded_usd,tokens_usd=excluded.tokens_usd,
                      total_usd=excluded.total_usd,valuation_status=excluded.valuation_status,
                      failure_streak=excluded.failure_streak,next_retry_at=excluded.next_retry_at,
-                     note=excluded.note""",
+                     note=excluded.note,coverage_state=excluded.coverage_state,
+                     price_retry_at=excluded.price_retry_at""",
                 (
                     address, chain, now_iso,
                     now_iso if has_observation else (previous["last_success_at"] if previous else None),
@@ -2015,7 +2219,8 @@ class DB:
                     observed("native_amount"), observed("observed_native_usd"),
                     observed("included_native_usd"), observed("excluded_usd", 0.0),
                     observed("tokens_usd"), observed("total_usd"),
-                    observed("valuation_status"), failure_streak, next_retry, row.get("note"),
+                    observed("valuation_status"), failure_streak, next_retry, row.get("note"), coverage_state,
+                    price_retry,
                 ),
             )
             if has_observation:
@@ -2106,11 +2311,18 @@ class DB:
     ) -> None:
         # A cross-chain sum can be near/above threshold even when every
         # individual chain is below it.  Bring healthy bytecode chains forward.
-        if status != "qualifying" and total_usd < min_usd * 0.1:
-            return
-        delay = 21_600 if status == "qualifying" else 86_400
+        delay = balance_retry_delay("complete", 1, total_usd, min_usd,
+                                    aggregate_usd=total_usd)
         target = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat()
         with self._lock, self.conn:
+            if total_usd >= 150_000:
+                self.conn.execute(
+                    """UPDATE token_log_tasks SET priority=MAX(priority,50),due_at=CASE
+                         WHEN due_at>? THEN ? ELSE due_at END
+                       WHERE address=? AND recent_complete=1 AND priority<50""",
+                    (datetime.now(timezone.utc).isoformat(),
+                     datetime.now(timezone.utc).isoformat(), address.lower()),
+                )
             self.conn.execute(
                 """UPDATE address_chain_state SET next_retry_at=CASE
                      WHEN next_retry_at>? THEN ? ELSE next_retry_at END
@@ -2141,7 +2353,7 @@ class DB:
             }
             changed = 0
             cursor = self.conn.execute(
-                "SELECT address,chain,checked_at,status,has_code,total_usd,failure_streak "
+                "SELECT address,chain,checked_at,status,has_code,total_usd,failure_streak,note "
                 "FROM address_chain_state ORDER BY address,chain"
             )
             while batch := cursor.fetchmany(2000):
@@ -2153,24 +2365,30 @@ class DB:
                             checked = checked.replace(tzinfo=timezone.utc)
                     except (TypeError, ValueError):
                         continue
-                    delay = balance_retry_delay(
-                        row["status"], row["has_code"], row["total_usd"],
-                        min_usd, int(row["failure_streak"] or 0),
-                    )
                     aggregate = latest.get(row["address"])
-                    if (row["has_code"] == 1 and row["status"] == "complete"
-                            and float(row["total_usd"] or 0) > 0 and aggregate):
-                        aggregate_status, aggregate_usd = aggregate
-                        if aggregate_status == "qualifying" or aggregate_usd >= min_usd:
-                            delay = min(delay, 21600)
-                        elif aggregate_usd >= min_usd * 0.1:
-                            delay = min(delay, 86400)
+                    old_token_only = (row["status"] == "partial" and
+                                      str(row["note"] or "").startswith("token_coverage_partial"))
+                    operational = "complete" if old_token_only else row["status"]
+                    delay = balance_retry_delay(
+                        operational, row["has_code"], row["total_usd"], min_usd,
+                        int(row["failure_streak"] or 0),
+                        aggregate[1] if aggregate else None,
+                    )
                     next_retry = datetime.fromtimestamp(
                         checked.timestamp() + delay, timezone.utc
                     ).isoformat()
-                    updates.append((next_retry, row["address"], row["chain"]))
+                    coverage = (
+                        "history_unknown" if "history before" in str(row["note"])
+                        else "historical_pending" if old_token_only else "verified"
+                    )
+                    price_retry = (datetime.fromtimestamp(checked.timestamp() + 21600, timezone.utc).isoformat()
+                                   if operational == "price_missing" else None)
+                    updates.append((next_retry, operational, coverage, price_retry,
+                                    0 if old_token_only else int(row["failure_streak"] or 0),
+                                    row["address"], row["chain"]))
                 self.conn.executemany(
-                    "UPDATE address_chain_state SET next_retry_at=? WHERE address=? AND chain=?",
+                    "UPDATE address_chain_state SET next_retry_at=?,status=?,coverage_state=?,"
+                    "price_retry_at=?,failure_streak=? WHERE address=? AND chain=?",
                     updates,
                 )
                 changed += len(updates)
@@ -2240,9 +2458,10 @@ class DB:
                    LEFT JOIN rabby_estimates r ON r.address=a.address
                    WHERE a.id=(SELECT MAX(a2.id) FROM address_scans a2 WHERE a2.address=a.address)
                      AND EXISTS (SELECT 1 FROM address_chain_scans c WHERE c.scan_id=a.id
-                                 AND c.status NOT IN ('complete','absent'))
+                                 AND (c.status NOT IN ('complete','absent')
+                                      OR c.note LIKE '%token_coverage_partial%'))
                      AND a.scanned_at <= ?
-                     AND (r.address IS NULL OR r.checked_at < ?)
+                     AND (r.address IS NULL OR (r.checked_at < ? AND r.checked_at < a.scanned_at))
                    ORDER BY COALESCE(r.checked_at, '') ASC, a.id LIMIT 1""", (old_enough, cutoff)
             ).fetchone()
 
@@ -2366,6 +2585,29 @@ class DB:
                 )
             )
 
+    def iter_latest_address_scans(
+        self, report_kind: str, min_usd: float, batch_size: int = 200,
+    ):
+        """Yield report rows in bounded batches; never materialize all scans."""
+        filters = {
+            "qualifying": "a.total_usd>=?",
+            "below": "a.status='below' AND a.total_usd>0 AND a.total_usd<?",
+            "incomplete": "a.status='incomplete' AND a.total_usd<?",
+        }
+        if report_kind not in filters:
+            raise ValueError("unsupported report kind")
+        params = (min_usd,)
+        with self._lock:
+            cursor = self.conn.execute(
+                f"""SELECT a.* FROM address_scans a WHERE a.id=(
+                      SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
+                      ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)
+                      AND {filters[report_kind]}
+                      ORDER BY a.total_usd DESC,a.address""", params,
+            )
+            while batch := cursor.fetchmany(batch_size):
+                yield batch
+
     def address_scan_chains(self, scan_id: int) -> list[sqlite3.Row]:
         with self._lock:
             return list(
@@ -2472,7 +2714,7 @@ class DB:
             except sqlite3.Error:
                 return 0
 
-    def balance_queue_snapshot(self) -> dict[str, Any]:
+    def balance_queue_snapshot(self, *, include_coverage: bool = False) -> dict[str, Any]:
         """Only due work; cheap enough for the 15-second load governor."""
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
@@ -2486,6 +2728,15 @@ class DB:
                 """SELECT COUNT(DISTINCT address) n,MIN(next_retry_at) oldest
                    FROM address_chain_state WHERE next_retry_at<=?""", (now_iso,)
             ).fetchone()
+            rpc_retry = int(self.conn.execute(
+                """SELECT COUNT(DISTINCT address) FROM address_chain_state
+                   WHERE next_retry_at<=? AND status IN ('rpc_error','partial','timeout')""",
+                (now_iso,),
+            ).fetchone()[0])
+            coverage_wait = int(self.conn.execute(
+                """SELECT COUNT(DISTINCT address) FROM address_chain_state
+                   WHERE coverage_state!='verified'"""
+            ).fetchone()[0]) if include_coverage else 0
         ages = []
         for row in (new, retry):
             if row["oldest"]:
@@ -2500,13 +2751,16 @@ class DB:
         return {
             "balance_new_pending": new_count,
             "balance_retry_pending": retry_count,
+            "balance_planned_pending": max(0, retry_count - rpc_retry),
+            "balance_rpc_retry_pending": rpc_retry,
+            "balance_token_coverage_waiting": coverage_wait,
             "balance_pending": new_count + retry_count,
             "balance_oldest_age_sec": max(ages, default=0.0),
         }
 
     def monitoring_snapshot(self, min_usd: float) -> dict[str, Any]:
         """Return one cheap aggregate snapshot for monitoring.db."""
-        queue = self.balance_queue_snapshot()
+        queue = self.balance_queue_snapshot(include_coverage=True)
         with self._lock:
             unique_addresses = int(self.conn.execute(
                 "SELECT COUNT(DISTINCT lower(address)) FROM contracts"
@@ -2762,6 +3016,8 @@ class TokenLogBudget:
         self.chain_limit = max(1, chain_per_minute)
         self.global_times: deque[float] = deque()
         self.chain_times: dict[str, deque[float]] = {}
+        self.history_times: deque[float] = deque()
+        self.balance_only = False
         self.lock = asyncio.Lock()
 
     def _trim(self, chain: str, now: float) -> deque[float]:
@@ -2770,32 +3026,53 @@ class TokenLogBudget:
             self.global_times.popleft()
         while times and times[0] <= now - 60:
             times.popleft()
+        while self.history_times and self.history_times[0] <= now - 60:
+            self.history_times.popleft()
         return times
+
+    def limits(self) -> tuple[int, int]:
+        if self.balance_only:
+            return min(self.global_limit, 10), min(self.chain_limit, 2)
+        return self.global_limit, self.chain_limit
+
+    async def history_available(self) -> bool:
+        async with self.lock:
+            self._trim("", time.monotonic())
+            return len(self.history_times) < max(1, self.limits()[0] // 5)
 
     async def available_chains(self, chains: list[str]) -> list[str]:
         async with self.lock:
             now = time.monotonic()
             self._trim("", now)
-            if len(self.global_times) >= self.global_limit:
+            global_limit, chain_limit = self.limits()
+            if len(self.global_times) >= global_limit:
                 return []
             return [chain for chain in chains
-                    if len(self._trim(chain, now)) < self.chain_limit]
+                    if len(self._trim(chain, now)) < chain_limit]
 
     async def acquire(self, chain: str) -> None:
         while True:
             async with self.lock:
                 now = time.monotonic()
                 times = self._trim(chain, now)
-                if (len(self.global_times) < self.global_limit
-                        and len(times) < self.chain_limit):
+                global_limit, chain_limit = self.limits()
+                history = TOKEN_LOG_HISTORY.get()
+                history_limit = max(1, global_limit // 5)
+                if (len(self.global_times) < global_limit
+                        and len(times) < chain_limit
+                        and (not history or len(self.history_times) < history_limit)):
                     self.global_times.append(now)
                     times.append(now)
+                    if history:
+                        self.history_times.append(now)
                     return
                 waits = []
-                if len(self.global_times) >= self.global_limit:
+                if len(self.global_times) >= global_limit:
                     waits.append(60 - (now - self.global_times[0]))
-                if len(times) >= self.chain_limit:
+                if len(times) >= chain_limit:
                     waits.append(60 - (now - times[0]))
+                if history and len(self.history_times) >= history_limit:
+                    waits.append(60 - (now - self.history_times[0]))
             await asyncio.sleep(max(0.05, min(waits)))
 
 
@@ -3684,7 +3961,7 @@ class DiscoverySlots:
 
 
 class LoadGovernor:
-    """Hysteretic backpressure for the steady server profile."""
+    """Hysteretic backpressure shared by every throughput profile."""
 
     def __init__(self, enabled: bool, base_live: int, base_backfill: int):
         self.enabled = enabled
@@ -3693,10 +3970,13 @@ class LoadGovernor:
         self.state = "normal"
         self.reason = "profile limits"
         self.recovery_since: float | None = None
+        self.token_recovery_since: float | None = None
+        self.token_limited = False
 
     def evaluate(
         self, pending: int, oldest_sec: float, live_wait_sec: float,
         now: float | None = None, sui_pending: int = 0,
+        token_pending: int = 0,
     ) -> tuple[int, int]:
         now = time.monotonic() if now is None else now
         if not self.enabled:
@@ -3725,16 +4005,28 @@ class LoadGovernor:
                 self.state, self.recovery_since = "normal", None
         self.reason = (
             f"pending={pending}+sui:{sui_pending}, oldest={oldest_sec:.0f}s, "
-            f"live_wait={live_wait_sec:.0f}s"
+            f"live_wait={live_wait_sec:.0f}s, token_due={token_pending}"
         )
+        if token_pending >= 10_000:
+            self.token_limited, self.token_recovery_since = True, None
+        elif self.token_limited:
+            if token_pending < 5_000:
+                self.token_recovery_since = now if self.token_recovery_since is None else self.token_recovery_since
+                if now - self.token_recovery_since >= 600:
+                    self.token_limited, self.token_recovery_since = False, None
+            else:
+                self.token_recovery_since = None
         if self.state == "balance_only":
             return 0, 0
+        if self.token_limited:
+            return min(self.base_live, 1), 0
         if self.state == "drain":
             return min(self.base_live, 3), 0
         return self.base_live, self.base_backfill
 
     def snapshot(self) -> dict[str, Any]:
-        return {"state": self.state, "reason": self.reason, "enabled": self.enabled}
+        return {"state": self.state, "reason": self.reason,
+                "token_limited": self.token_limited, "enabled": self.enabled}
 
 
 async def collect_tx_to_contracts(
@@ -3862,16 +4154,25 @@ async def process_token_log_task(
     db: DB, chain: ChainCfg, rpc: RpcPool, task: sqlite3.Row, head: int,
 ) -> int:
     address = str(task["address"])
-    start = int(task["next_block"])
+    recent = not int(task["recent_complete"])
+    start = (
+        max(int(task["first_block"]), head - 999)
+        if task["recent_cursor"] is None and recent
+        else int(task["recent_cursor"] if recent else task["next_block"])
+    )
     end = min(head, start + max(1, min(1000, int(task["window_size"]),
                                      chain.logs_max_range)) - 1)
     if end < start:
         db.defer_token_log_task(chain.key, address, 60)
         return 0
-    logs = await rpc.call("eth_getLogs", [{
-        "fromBlock": hex(start), "toBlock": hex(end),
-        "topics": [TRANSFER_TOPIC, None, "0x" + pad_addr(address)],
-    }])
+    history_context = TOKEN_LOG_HISTORY.set(not recent)
+    try:
+        logs = await rpc.call("eth_getLogs", [{
+            "fromBlock": hex(start), "toBlock": hex(end),
+            "topics": [TRANSFER_TOPIC, None, "0x" + pad_addr(address)],
+        }])
+    finally:
+        TOKEN_LOG_HISTORY.reset(history_context)
     if not isinstance(logs, list):
         raise RpcError("malformed", "eth_getLogs did not return a list")
     tokens: dict[str, tuple[Any, ...]] = {}
@@ -3894,6 +4195,7 @@ async def process_token_log_task(
         relations[token] = (chain.key, address, token, "transfer_log", block)
     return db.commit_token_log_window(
         chain.key, address, end, head, list(tokens.values()), list(relations.values()),
+        recent=recent,
     )
 
 
@@ -3909,15 +4211,18 @@ async def token_log_loop(
         await wait_if_paused(monitor, stop)
         if stop.is_set():
             return
-        if governor is not None and governor.state == "balance_only":
-            await asyncio.sleep(3)
-            continue
-        available = list(chains)
+        budget = None
         if pools:
             budget = next(iter(pools.values())).token_log_budget
             if budget is not None:
-                available = await budget.available_chains(available)
-        task = db.next_token_log_task(available)
+                budget.balance_only = governor is not None and governor.state == "balance_only"
+        available = list(chains)
+        if budget is not None:
+            available = await budget.available_chains(available)
+        task = db.next_token_log_task(
+            available, allow_history=budget is None or await budget.history_available(),
+            prefer_history=done % 5 == 4,
+        )
         if task is None:
             if once:
                 return
@@ -3934,10 +4239,13 @@ async def token_log_loop(
                 head = cached[1]
             async with asyncio.timeout(min(120.0, cfg.discovery_range_timeout_sec)):
                 new_links = await process_token_log_task(db, chains[key], pool, task, head)
+            current_task = db.token_log_task(key, str(task["address"]))
+            cursor = (current_task["recent_cursor"] if current_task is not None and
+                      not int(current_task["recent_complete"]) else
+                      current_task["historical_cursor"] if current_task is not None else None)
             log.info(
                 "[%s/token-logs] %s next=%s new_links=%s endpoint=%s",
-                key, task["address"], db.token_log_task(key, task["address"])["next_block"],
-                new_links, pool.active_endpoint("logs"),
+                key, task["address"], cursor, new_links, pool.active_endpoint("logs"),
             )
         except (RpcError, TimeoutError) as exc:
             kind = exc.kind if isinstance(exc, RpcError) else "timeout"
@@ -4508,7 +4816,12 @@ def classify_address_scan(
     coverage = sum(1 for row in chain_rows if row.get("has_code") is not None)
     if total_usd >= min_usd:
         return "qualifying", coverage
-    if chain_rows and all(row["status"] in ("complete", "absent") for row in chain_rows):
+    if chain_rows and all(
+        row["status"] in ("complete", "absent")
+        and row.get("coverage_state", "verified") == "verified"
+        and "token_coverage_partial" not in str(row.get("note") or "")
+        for row in chain_rows
+    ):
         return "below", coverage
     return "incomplete", coverage
 
@@ -4783,6 +5096,7 @@ async def _scan_address_chain(
                 chain_status = "complete"
                 note = anomaly_note
             task = db.token_log_task(chain.key, address) if cfg.discover_tokens_from_transfers else None
+            coverage_state = "verified"
             if task is not None and (
                 task["completed_at"] is None or int(task["history_limited"])
                 or (task["due_at"] <= datetime.now(timezone.utc).isoformat()
@@ -4794,11 +5108,12 @@ async def _scan_address_chain(
                     if int(task["history_limited"])
                     else "token_coverage_partial: Transfer logs pending"
                 )
-                if chain_status == "complete":
-                    chain_status = "partial"
-                    note = coverage_note
-                else:
-                    note = f"{note}; {coverage_note}" if note else coverage_note
+                coverage_state = (
+                    "history_unknown" if int(task["history_limited"])
+                    else "historical_pending" if task["completed_at"] is None
+                    else "recent_only"
+                )
+                note = f"{note}; {coverage_note}" if note else coverage_note
             if chain.lifecycle != "active":
                 lifecycle_note = f"network lifecycle={chain.lifecycle}"
                 note = f"{note}; {lifecycle_note}" if note else lifecycle_note
@@ -4806,6 +5121,7 @@ async def _scan_address_chain(
                 **base_row,
                 "has_code": 1,
                 "status": chain_status,
+                "coverage_state": coverage_state,
                 "native_amount": native_amount,
                 "native_usd": native_usd,
                 "native_raw": str(native_raw),
@@ -4986,7 +5302,7 @@ async def rabby_fallback_loop(
             if client.disabled:
                 return
             row = db.pending_rabby_scan(
-                cfg.balance_retry_sec, snapshot_at,
+                max(cfg.balance_retry_sec, 86400), snapshot_at,
                 cfg.rabby_token_discovery_after_sec,
             )
             if row is None or time.monotonic() < client.cooldown_until:
@@ -5028,6 +5344,39 @@ async def rabby_fallback_loop(
                 )
     finally:
         await client.close()
+
+
+async def price_refresh_loop(
+    db: DB, chains: dict[str, ChainCfg], prices: PriceBook,
+    cfg: AppCfg, stop: asyncio.Event,
+) -> None:
+    """Retry missing prices from stored balances without touching balance RPC."""
+    while not stop.is_set():
+        for state in db.price_refresh_candidates():
+            chain = chains.get(str(state["chain"]))
+            if chain is None:
+                continue
+            observations = db.unpriced_observations(str(state["address"]), chain.key)
+            keys = {
+                str(row["token"]): llama_key(
+                    chain, None if row["token"] == "native" else str(row["token"])
+                ) for row in observations if row["amount"] is not None
+            }
+            book = await prices.fetch(list(keys.values())) if keys else {}
+            updated = db.apply_price_refresh(
+                str(state["address"]), chain.key,
+                {token: book[key] for token, key in keys.items() if key in book},
+                chains, cfg,
+            )
+            if updated:
+                parts, _ = db.current_address_parts(str(state["address"]), list(chains))
+                total = sum(float(row.get("total_usd") or 0) for row in parts)
+                category, _ = classify_address_scan(total, parts, cfg.min_usd)
+                db.apply_address_schedule(str(state["address"]), category, total, cfg.min_usd)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def check_multichain_balances(
@@ -5239,15 +5588,10 @@ def export_xlsx(
         raise ValueError("unsupported EVM report kind")
     if mode == "qualifying":
         report_kind = "qualifying"
-    latest = db.latest_address_scans(report_kind, min_usd)
-    # Only gather joined details for rows that will actually be written.
-    selected = latest if report_kind is not None else [
-        row for row in latest
-        if float(row["total_usd"] or 0) >= min_usd
-        or (row["status"] == "below" and 0 < float(row["total_usd"] or 0) < min_usd)
-        or (row["status"] == "incomplete" and float(row["total_usd"] or 0) < min_usd)
-    ]
-    chain_map, token_map, source_map, estimate_map = db.latest_export_parts(selected)
+    chain_map: dict[int, list[sqlite3.Row]] = {}
+    token_map: dict[int, list[sqlite3.Row]] = {}
+    source_map: dict[str, list[sqlite3.Row]] = {}
+    estimate_map: dict[str, sqlite3.Row] = {}
 
     def prepared(row: sqlite3.Row) -> list[Any]:
         chain_parts = chain_map.get(int(row["id"]), [])
@@ -5324,64 +5668,46 @@ def export_xlsx(
             row["note"],
         ] + estimate_values
 
-    def build(path: Path, rows: list[sqlite3.Row], title: str, fill: PatternFill) -> None:
+    def build(path: Path, kind: str, title: str, fill: PatternFill) -> int:
+        nonlocal chain_map, token_map, source_map, estimate_map
         tmp = path.with_suffix(".tmp.xlsx")
-        wb = Workbook()
-        ws = wb.active
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet()
         ws.title = title[:31]
         ws.append(headers)
-        for row in rows:
-            ws.append(prepared(row))
-            for cell in ws[ws.max_row]:
-                cell.border = THIN
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
-                cell.fill = fill
-            ws.cell(ws.max_row, 2).number_format = MONEY
+        count = 0
+        for batch in db.iter_latest_address_scans(kind, min_usd):
+            chain_map, token_map, source_map, estimate_map = db.latest_export_parts(batch)
+            for row in batch:
+                ws.append(prepared(row))
+                count += 1
         info = wb.create_sheet("Parameters")
         info.append(["Parameter", "Value"])
         info.append(["USD threshold", min_usd])
         info.append(["Exported UTC", datetime.now(timezone.utc).isoformat()])
         info.append(["Database", str(db.path)])
-        info.append(["Rows", len(rows)])
+        info.append(["Rows", count])
         info.append(["Rabby", "Supplementary estimate; never changes RPC status or total"])
-        _style_header(ws)
-        _style_header(info)
-        _autosize(
-            ws,
-            {1: 46, 2: 16, 3: 12, 4: 14, 5: 34, 6: 60, 7: 70, 8: 70,
-             9: 24, 10: 24, 11: 24, 12: 35, 13: 20, 14: 24, 15: 24,
-             16: 22, 17: 16, 18: 24, 19: 70, 20: 60},
-        )
-        _autosize(info, {1: 24, 2: 70})
-        wb.save(tmp)
-        tmp.replace(path)
+        try:
+            wb.save(tmp)
+            tmp.replace(path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return count
 
-    # A database can contain scans made with a different --min-usd value.
-    # Classify exports from the actual latest total, not the historic status label.
-    qualifying = [
-        row for row in latest
-        if float(row["total_usd"] or 0.0) >= min_usd
-    ]
-    below = [
-        row for row in latest
-        if row["status"] == "below"
-        and 0.0 < float(row["total_usd"] or 0.0) < min_usd
-    ]
-    incomplete = [
-        row for row in latest
-        if row["status"] == "incomplete" and float(row["total_usd"] or 0.0) < min_usd
-    ]
+    counts: dict[str, int] = {}
     if mode in {"full", "qualifying", "file:qualifying"}:
-        build(paths[0], qualifying, "Qualifying", OK_FILL)
+        counts["qualifying"] = build(paths[0], "qualifying", "Qualifying", OK_FILL)
     if mode in {"full", "file:below"}:
-        build(paths[1], below, "Below threshold", BELOW_FILL)
+        counts["below"] = build(paths[1], "below", "Below threshold", BELOW_FILL)
     if mode in {"full", "file:incomplete"}:
-        build(paths[2], incomplete, "Incomplete", INCOMPLETE_FILL)
+        counts["incomplete"] = build(paths[2], "incomplete", "Incomplete", INCOMPLETE_FILL)
     log.info(
         "xlsx qualifying=%s below=%s incomplete=%s",
-        len(qualifying),
-        len(below),
-        len(incomplete),
+        counts.get("qualifying", "not requested"),
+        counts.get("below", "not requested"),
+        counts.get("incomplete", "not requested"),
     )
     return paths
 
@@ -5740,12 +6066,14 @@ async def governor_loop(
 ) -> None:
     while not stop.is_set():
         snapshot = db.balance_queue_snapshot()
+        token_pending = sum(row["due"] for row in db.token_log_queue_snapshot().values())
         slot_stats = await slots.snapshot()
         live, backfill = governor.evaluate(
             int(snapshot.get("balance_pending") or 0),
             float(snapshot.get("balance_oldest_age_sec") or 0.0),
             float(slot_stats.get("live_max_wait_sec") or 0.0),
             sui_pending=db.sui_enrichment_pending(),
+            token_pending=token_pending,
         )
         await slots.set_capacity(live, backfill)
         try:
@@ -5830,19 +6158,8 @@ async def control_loop(
                     monitor.set_setting("scanner_paused", "0")
                     result = "scanner resumed"
                 elif request.action in {"export", "export_qualifying", "export_file"}:
-                    mode = "full" if request.action == "export" else (
-                        "qualifying" if request.action == "export_qualifying" else "file"
-                    )
-                    file_key = request.payload.get("file_key") if mode == "file" else None
-                    monitor.set_setting("exporter_state", f"running:{file_key or mode}")
-                    paths = await run_export_process(
-                        db, cfg, chains, export_lock, mode=mode, file_key=file_key,
-                    )
-                    monitor.set_setting("exporter_state", "idle")
-                    monitor.set_setting(f"last_{mode}_export_at", time.time())
-                    if mode == "qualifying":
-                        monitor.set_setting("last_export_revision", db.data_revision())
-                    result = "exported: " + ", ".join(path.name for path in paths)
+                    # Owned by the memory/CPU-limited exporter container.
+                    continue
                 elif request.action == "backup":
                     path = await asyncio.to_thread(backup_database, db, ROOT / "backups", 7)
                     result = f"backup: {path.name}"
@@ -5960,7 +6277,7 @@ async def run(args: argparse.Namespace) -> None:
             if state_rows:
                 # Keep the pre-migration snapshot outside daily rotation.
                 backup_path = backup_database(
-                    db, ROOT / "backups" / "pre_balance_schedule_v2", keep=1,
+                    db, ROOT / "backups" / "pre_balance_schedule_v3", keep=1,
                 )
                 log.info("balance schedule backup: %s", backup_path.name)
             return db.rephase_balance_schedule(cfg.min_usd)
@@ -5995,7 +6312,7 @@ async def run(args: argparse.Namespace) -> None:
         def migrate_token_logs() -> int:
             if db.conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]:
                 backup_path = backup_database(
-                    db, ROOT / "backups" / "pre_token_log_queue_v1", keep=1,
+                    db, ROOT / "backups" / "pre_token_log_queue_v2", keep=1,
                 )
                 log.info("token log queue backup: %s", backup_path.name)
             return db.seed_priority_token_log_tasks(cfg.min_usd)
@@ -6036,8 +6353,6 @@ async def run(args: argparse.Namespace) -> None:
     # A container replacement can interrupt an XLSX run after it has set this
     # flag.  There is no exporter process to resume on a fresh scanner run;
     # leave an accurate status until the next scheduled/on-demand export.
-    if run_id is not None:
-        monitor.set_setting("exporter_state", "idle")
     global_rpc_sem = RoleRpcLimiter(
         cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency
     )
@@ -6047,7 +6362,7 @@ async def run(args: argparse.Namespace) -> None:
     )
     pools: dict[str, RpcPool] = {}
     sui_client: BlockberryClient | None = None
-    should_export = not args.rpc_check
+    should_export = False  # Continuous scanner never performs XLSX work.
     try:
         if sui_requested:
             blockberry_key = os.getenv("BLOCKBERRY_API_KEY", "").strip()
@@ -6198,7 +6513,7 @@ async def run(args: argparse.Namespace) -> None:
             backfill_slots=cfg.discovery_backfill_slots,
         )
         governor = LoadGovernor(
-            enabled=profile == "steady",
+            enabled=True,
             base_live=cfg.discovery_live_slots,
             base_backfill=cfg.discovery_backfill_slots,
         )
@@ -6208,6 +6523,7 @@ async def run(args: argparse.Namespace) -> None:
             float(initial_queue.get("balance_oldest_age_sec") or 0),
             0.0,
             sui_pending=db.sui_enrichment_pending(),
+            token_pending=sum(row["due"] for row in db.token_log_queue_snapshot().values()),
         )
         await discovery_slots.set_capacity(initial_live, initial_backfill)
         if cfg.run_indexer and not args.balances_only:
@@ -6263,6 +6579,13 @@ async def run(args: argparse.Namespace) -> None:
                 name="enrich-sui",
             ))
         if cfg.run_balance_checker and not args.index_only:
+            tasks.append(asyncio.create_task(
+                supervised(
+                    "price-refresh",
+                    lambda: price_refresh_loop(db, balance_chains, prices, cfg, stop),
+                    stop, cfg.task_restart_sec, monitor,
+                ), name="price-refresh",
+            ))
             tasks.append(
                 asyncio.create_task(
                     supervised(
@@ -6295,15 +6618,6 @@ async def run(args: argparse.Namespace) -> None:
                     ),
                     name="balances-sui",
                 ))
-        tasks.append(
-            asyncio.create_task(
-                export_loop(
-                    db, cfg, list(balance_chains.values()), stop, monitor,
-                    sui_store, export_lock,
-                ),
-                name="xlsx",
-            )
-        )
         tasks.append(
             asyncio.create_task(
                 heartbeat_loop(

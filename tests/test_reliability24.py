@@ -101,7 +101,7 @@ def test_only_failed_address_chain_becomes_due(tmp_path):
          "total_usd": None, "note": "timeout"},
         [], 500_000,
     )
-    future = __import__("time").time() + 601
+    future = __import__("time").time() + 1801
     assert db.due_address_chains(ADDRESS, ["ethereum", "optimism"], future) == ["optimism"]
     parts, _ = db.current_address_parts(ADDRESS, ["ethereum", "optimism"])
     assert sum(float(row.get("total_usd") or 0) for row in parts) == 300_000

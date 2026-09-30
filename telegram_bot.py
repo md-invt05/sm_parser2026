@@ -358,7 +358,9 @@ class ReportBuilder:
             )
             lines.append(
                 f"Balance queue: new {aggregate['balance_new_pending']:,}, "
-                f"retry {aggregate['balance_retry_pending']:,}; "
+                f"planned {aggregate['balance_planned_pending']:,}, "
+                f"RPC retry {aggregate['balance_rpc_retry_pending']:,}; "
+                f"token coverage waiting {aggregate['balance_token_coverage_waiting']:,}; "
                 f"completed scans {aggregate['balance_scans_total']:,}"
             )
             lines.append(
@@ -711,12 +713,18 @@ class BotService:
             request_id = self.monitor.request_export_once(str(update.effective_chat.id), key)
             completed = await self.wait_control(request_id, 300)
             if not completed:
+                request = self.monitor.control_request(request_id)
+                failed = request is not None and request["status"] == "failed"
                 if not path.exists():
-                    await update.message.reply_text("Экспорт ещё выполняется; готового файла пока нет.")
+                    await update.message.reply_text(
+                        "Экспорт завершился ошибкой; готового файла пока нет."
+                        if failed else "Экспорт ещё выполняется; готового файла пока нет."
+                    )
                     return
+                prefix = ("Экспорт завершился ошибкой; отправляю предыдущий файл "
+                          if failed else "Экспорт ещё выполняется; отправляю предыдущий файл ")
                 await update.message.reply_text(
-                    f"Экспорт ещё выполняется; отправляю предыдущий файл "
-                    f"(возраст {human_duration(time.time() - path.stat().st_mtime)})."
+                    f"{prefix}(возраст {human_duration(time.time() - path.stat().st_mtime)})."
                 )
         await self.send_file(update.effective_chat.id, path, context.bot)
 
@@ -773,7 +781,21 @@ class BotService:
             return
         if not context.args:
             profile = self.monitor.setting("load_profile", "conservative")
-            await update.message.reply_text(f"Профиль: {profile}\n{json.dumps(LOAD_PROFILES.get(profile or 'conservative', {}), ensure_ascii=False, indent=2)}")
+            runtime = self.monitor.runtime()
+            try:
+                note = json.loads(runtime["note"] or "{}") if runtime else {}
+            except (TypeError, ValueError):
+                note = {}
+            governor = note.get("load_governor") or {}
+            scheduler = note.get("discovery_scheduler") or {}
+            await update.message.reply_text(
+                f"Профиль: {profile}\n"
+                f"Governor: {governor.get('state', 'unknown')} "
+                f"(token cap: {governor.get('token_limited', False)})\n"
+                f"Effective slots: live {scheduler.get('live_slots', 0)}, "
+                f"backfill {scheduler.get('backfill_slots', 0)}\n"
+                f"{json.dumps(LOAD_PROFILES.get(profile or 'conservative', {}), ensure_ascii=False, indent=2)}"
+            )
             return
         profile = context.args[0].lower()
         if profile not in LOAD_PROFILES:
@@ -1066,16 +1088,16 @@ class BotService:
         self._condition(wal_runaway, "database:wal_growth", "critical", "database_growth", "SQLite WAL grew sharply and exceeds 1 GiB")
 
     async def _evaluate_resource_thresholds(self, now: datetime) -> None:
-        def cpu_state(
-            fingerprint: str, threshold: float, minutes: int,
+        def resource_state(
+            column: str, fingerprint: str, threshold: float, minutes: int,
             recovery_threshold: float, severity: str, message: str,
         ) -> bool:
             opened = self.monitor.active_incident(fingerprint)
             if opened is None:
                 cutoff = (now - timedelta(minutes=minutes)).isoformat()
                 samples = self.monitor.rows(
-                    "SELECT cpu_percent value,ts FROM resource_samples "
-                    "WHERE ts>=? AND cpu_percent IS NOT NULL ORDER BY ts", (cutoff,),
+                    f"SELECT {column} value,ts FROM resource_samples "
+                    f"WHERE ts>=? AND {column} IS NOT NULL ORDER BY ts", (cutoff,),
                 )
                 span = timestamp_span(samples[0]["ts"], samples[-1]["ts"]) if samples else 0
                 if span >= minutes * 60 - 20 and all(
@@ -1088,8 +1110,8 @@ class BotService:
                 return False
             recovery_cutoff = (now - timedelta(minutes=2)).isoformat()
             recovery = self.monitor.rows(
-                "SELECT cpu_percent value,ts FROM resource_samples "
-                "WHERE ts>=? AND cpu_percent IS NOT NULL ORDER BY ts", (recovery_cutoff,),
+                f"SELECT {column} value,ts FROM resource_samples "
+                f"WHERE ts>=? AND {column} IS NOT NULL ORDER BY ts", (recovery_cutoff,),
             )
             span = timestamp_span(recovery[0]["ts"], recovery[-1]["ts"]) if recovery else 0
             if span >= 100 and all(
@@ -1099,18 +1121,25 @@ class BotService:
                 return False
             return True
 
-        critical_cpu = cpu_state(
-            "system:cpu:critical", 95, 5, 85, "critical",
+        critical_cpu = resource_state(
+            "cpu_percent", "system:cpu:critical", 95, 5, 85, "critical",
             "CPU above 95% for 5 minutes",
         )
         if not critical_cpu:
-            cpu_state(
-                "system:cpu:warning", 80, 10, 70, "warning",
+            resource_state(
+                "cpu_percent", "system:cpu:warning", 80, 10, 70, "warning",
                 "CPU above 80% for 10 minutes",
             )
+        critical_ram = resource_state(
+            "ram_percent", "system:ram:critical", 92, 2, 85, "critical",
+            "RAM above 92% for 2 minutes",
+        )
+        if not critical_ram:
+            resource_state(
+                "ram_percent", "system:ram:warning", 80, 5, 70, "warning",
+                "RAM above 80% for 5 minutes",
+            )
         rules = [
-            ("ram_percent", 80, 5, "warning", "RAM above 80% for 5 minutes", "system:ram:warning", False),
-            ("ram_percent", 92, 2, "critical", "RAM above 92% for 2 minutes", "system:ram:critical", False),
             ("io_wait_percent", 20, 5, "warning", "I/O wait above 20% for 5 minutes", "system:iowait", False),
             ("disk_free_percent", 15, 0, "warning", "Disk free below 15%", "system:disk:warning", True),
             ("disk_free_percent", 5, 0, "critical", "Disk free below 5%", "system:disk:critical", True),

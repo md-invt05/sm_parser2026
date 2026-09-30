@@ -69,11 +69,12 @@ def test_priority_migration_is_idempotent_and_skips_low_value(tmp_path):
         ("ethereum", ADDRESS, 101, "0xtx", ADDRESS, "2026-01-01T00:00:00+00:00"),
         ("ethereum", TOKEN, None, None, None, "2026-01-01T00:00:00+00:00"),
     ])
-    db.conn.execute("UPDATE contracts SET last_total_usd=60000 WHERE address=?", (ADDRESS,))
+    db.conn.execute("UPDATE contracts SET last_total_usd=200000 WHERE address=?", (ADDRESS,))
     db.conn.execute("UPDATE contracts SET last_total_usd=1 WHERE address=?", (TOKEN,))
     assert db.seed_priority_token_log_tasks(500000) == 1
     assert db.seed_priority_token_log_tasks(500000) == 0
     assert db.token_log_task("ethereum", ADDRESS)["next_block"] == 101
+    assert db.token_log_task("ethereum", ADDRESS)["recent_cursor"] is None
     assert db.token_log_task("ethereum", TOKEN) is None
     db.close()
 
@@ -137,7 +138,8 @@ async def _log_failure_preserves_cursor_then_new_token_wakes_only_its_chain(tmp_
     assert await scanner.process_token_log_task(
         db, chain, rpc, db.token_log_task("ethereum", ADDRESS), 100,
     ) == 1
-    assert db.token_log_task("ethereum", ADDRESS)["next_block"] == 101
+    assert db.token_log_task("ethereum", ADDRESS)["next_block"] == 100
+    assert db.token_log_task("ethereum", ADDRESS)["recent_cursor"] == 101
     assert db.conn.execute(
         "SELECT COUNT(*) FROM contract_tokens WHERE chain='ethereum' AND contract=?",
         (ADDRESS,),
@@ -174,8 +176,8 @@ def test_once_worker_drains_one_window_and_keeps_queue(tmp_path):
             db, {"ethereum": chain}, {"ethereum": Pool()}, config(),
             asyncio.Event(), once=True,
         )
-        assert db.token_log_task("ethereum", ADDRESS)["next_block"] == 101
-        assert db.token_log_task("ethereum", ADDRESS)["completed_at"] is not None
+        assert db.token_log_task("ethereum", ADDRESS)["recent_cursor"] == 101
+        assert db.token_log_task("ethereum", ADDRESS)["completed_at"] is None
         db.close()
 
     asyncio.run(run())
@@ -272,7 +274,8 @@ def test_token_coverage_partial_preserves_known_lower_bound(tmp_path):
             ADDRESS, asyncio.Semaphore(1),
         )
         assert row["total_usd"] == 100
-        assert row["status"] == "partial"
+        assert row["status"] == "complete"
+        assert row["coverage_state"] == "historical_pending"
         assert scanner.classify_address_scan(100, [row], 500)[0] == "incomplete"
         assert scanner.classify_address_scan(100, [row], 50)[0] == "qualifying"
         db.save_address_chain_state(ADDRESS, row, [], 500)

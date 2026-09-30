@@ -188,13 +188,13 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 blocked.cancel()
                 await asyncio.gather(blocked, return_exceptions=True)
 
-    async def test_incomplete_retries_after_five_minutes_not_24_hours(self):
+    async def test_incomplete_retries_after_thirty_minutes(self):
         add_address(self.db)
         self.db.save_address_chain_state(ADDRESS, missing_row(), [], 100000)
         self.assertEqual([], self.db.pending_addresses(86400, retry_sec=600))
         self.assertEqual(
             [ADDRESS],
-            self.db.pending_addresses(86400, retry_sec=600, as_of=time.time() + 601),
+            self.db.pending_addresses(86400, retry_sec=600, as_of=time.time() + 1801),
         )
 
 
