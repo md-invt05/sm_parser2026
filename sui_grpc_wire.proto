@@ -1,0 +1,75 @@
+// Wire-compatible subset of MystenLabs sui-apis sui.rpc.v2, pinned to the
+// LedgerService/ListTransactions schema at MystenLabs/sui-apis commit
+// 187995d1b57cddc3c67eb0f9d1affd4247ef110b (2026-10-05).
+// Only fields consumed by this scanner are declared. Unknown protobuf fields
+// are safely ignored; field numbers and types match the upstream definitions.
+syntax = "proto3";
+package sui.rpc.v2;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+service LedgerService {
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
+  rpc GetCheckpoint(GetCheckpointRequest) returns (GetCheckpointResponse);
+  rpc ListTransactions(ListTransactionsRequest) returns (stream ListTransactionsResponse);
+}
+
+message GetServiceInfoRequest {}
+message GetServiceInfoResponse {
+  optional string chain_id = 1;
+  optional string chain = 2;
+  optional uint64 checkpoint_height = 4;
+  optional uint64 lowest_available_checkpoint = 6;
+}
+message GetCheckpointRequest {
+  oneof checkpoint_id {
+    uint64 sequence_number = 1;
+    string digest = 2;
+  }
+  optional google.protobuf.FieldMask read_mask = 3;
+}
+message GetCheckpointResponse {
+  optional Checkpoint checkpoint = 1;
+}
+message Checkpoint {
+  optional uint64 sequence_number = 1;
+  optional CheckpointSummary summary = 3;
+}
+message CheckpointSummary {
+  optional google.protobuf.Timestamp timestamp = 9;
+}
+message QueryOptions {
+  optional uint32 limit = 1;
+  optional bytes after = 2;
+}
+message ListTransactionsRequest {
+  optional google.protobuf.FieldMask read_mask = 1;
+  optional uint64 start_checkpoint = 2;
+  optional uint64 end_checkpoint = 3;
+  optional QueryOptions options = 5;
+}
+message ExecutedTransaction {
+  optional string digest = 1;
+  optional uint64 checkpoint = 6;
+}
+message Watermark {
+  optional bytes cursor = 1;
+  optional uint64 checkpoint = 2;
+}
+message QueryEnd {
+  optional QueryEndReason reason = 1;
+}
+enum QueryEndReason {
+  QUERY_END_REASON_UNKNOWN = 0;
+  QUERY_END_REASON_ITEM_LIMIT = 1;
+  QUERY_END_REASON_SCAN_LIMIT = 2;
+  QUERY_END_REASON_CHECKPOINT_BOUND = 3;
+  QUERY_END_REASON_CURSOR_BOUND = 4;
+  QUERY_END_REASON_LEDGER_TIP = 5;
+}
+message ListTransactionsResponse {
+  optional ExecutedTransaction transaction = 1;
+  optional Watermark watermark = 2;
+  optional QueryEnd end = 3;
+}

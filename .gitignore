@@ -2,6 +2,8 @@
 .DS_Store
 .venv/
 .runtime_deps/
+.test-deps-2026/
+.test-20*/
 __pycache__/
 .pytest_cache/
 .pytest-tmp-*/
@@ -15,6 +17,7 @@ pytest-cache-files-*/
 coverage.xml
 htmlcov/
 *.pyc
+scripts/*.pyc
 data/*.db*
 logs/
 reports/

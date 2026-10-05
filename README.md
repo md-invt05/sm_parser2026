@@ -4,11 +4,14 @@
 
 The default server profile is `conservative`: six global EVM requests, one
 request per network, two addresses and four address/network parts at a time.
-Discovery uses separate `live` and `backfill` cursors on every enabled network;
-a failed block, receipt, log or code request cannot advance its cursor.
+Discovery uses separate tip-live and original-backfill cursors plus durable
+catch-up gaps after downtime. Block, receipt and code are mandatory before a
+range commits; Transfer logs run in a separate persisted worker and cannot
+block discovery. A failed mandatory stage cannot advance its cursor.
 
-Balance state is persisted per `address + chain`, so a transient failure retries
-only that network. Large native balances are quarantined until classified.
+Balance state is persisted per `address + chain`, and failed token operations
+have their own retry items; successful observations are retained. Large native
+and token balances are quarantined until classified.
 Known system reserves remain auditable but are excluded from `total_usd`; this
 includes the genesis-prefunded Polygon zkEVM bridge reserve. Polygon zkEVM is
 marked `legacy_read_only`.

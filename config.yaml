@@ -11,14 +11,15 @@ recheck_interval_sec: 86400
 
 # Conservative defaults for public, best-effort RPC endpoints.
 global_rpc_concurrency: 6
-discovery_rpc_concurrency: 3
-balance_rpc_concurrency: 3
+discovery_rpc_concurrency: 2
+balance_rpc_concurrency: 2
+sui_rpc_concurrency: 2
 rpc_concurrency: 1
 balance_concurrency: 2
-# Parallel network scans shared by all balance addresses; HTTP still uses 12/2 limits.
+# Parallel network scans shared by balance addresses; HTTP uses the profile's shared cap.
 balance_chain_concurrency: 4
-balance_chain_timeout_sec: 45
-balance_address_timeout_sec: 240
+balance_chain_timeout_sec: 120
+balance_address_timeout_sec: 180
 balance_retry_sec: 600
 # Supplemental estimates only for incomplete/slow RPC scans; their own serial queue.
 rabby_fallback: true

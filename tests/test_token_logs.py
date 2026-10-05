@@ -18,11 +18,16 @@ def config():
 
 
 def queue_task(db, address=ADDRESS, first=100, limited=0):
+    db.upsert_contracts([("ethereum", address, first, "0xtx", address,
+                          "2020-01-01T00:00:00+00:00")])
     with db.conn:
         db.conn.execute(
             """INSERT INTO token_log_tasks(
-                 chain,address,first_block,next_block,history_limited,priority,due_at,updated_at)
+                 chain,address,first_block,next_block,history_limited,priority,due_at,updated_at,
+                 recent_due_at,history_due_at,recent_updated_at,history_updated_at)
                VALUES('ethereum',?,?,?,?,100,'2020-01-01T00:00:00+00:00',
+                      '2020-01-01T00:00:00+00:00','2020-01-01T00:00:00+00:00',
+                      '2020-01-01T00:00:00+00:00','2020-01-01T00:00:00+00:00',
                       '2020-01-01T00:00:00+00:00')""",
             (address, first, first, limited),
         )

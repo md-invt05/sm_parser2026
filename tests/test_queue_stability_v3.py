@@ -115,11 +115,13 @@ def test_token_budget_balance_only_and_governor_hysteresis():
             await budget.acquire("base")
         finally:
             scanner.TOKEN_LOG_HISTORY.reset(marker)
-        assert not await budget.history_available()
+        # History has a guaranteed scheduling share, not a hard maximum: it
+        # may borrow otherwise idle log capacity without raising rate limits.
+        assert await budget.history_available()
     asyncio.run(check_budget())
     governor = scanner.LoadGovernor(True, 6, 1, allow_balance_only=True)
-    assert governor.evaluate(0, 0, 0, now=0, token_pending=10_000) == (1, 0)
-    assert governor.evaluate(0, 0, 0, now=100, token_pending=4_000) == (1, 0)
+    assert governor.evaluate(0, 0, 0, now=0, token_pending=10_000) == (6, 1)
+    assert governor.evaluate(0, 0, 0, now=100, token_pending=4_000) == (6, 1)
     assert governor.evaluate(0, 0, 0, now=701, token_pending=4_000) == (6, 1)
     assert governor.evaluate(21_000, 0, 0, now=800) == (0, 0)
 
@@ -137,7 +139,7 @@ def test_only_steady_enters_automatic_balance_only(profile):
         assert slots == (0, 0)
     else:
         assert governor.state == "drain"
-        assert slots == (min(limits["discovery_live_slots"], 3), 0)
+        assert slots == (min(limits["discovery_live_slots"], 3), 1)
         assert governor.evaluate(0, 0, 0, now=1) == slots
         assert governor.evaluate(0, 0, 0, now=602) == (
             limits["discovery_live_slots"], limits["discovery_backfill_slots"]
@@ -147,13 +149,15 @@ def test_only_steady_enters_automatic_balance_only(profile):
 def test_deferred_low_value_history_is_not_reported_as_runnable(tmp_path):
     db = scanner.DB(tmp_path / "db.sqlite")
     now = datetime.now(timezone.utc).isoformat()
+    later = "2099-01-01T00:00:00+00:00"
     with db.conn:
         db.conn.executemany(
             """INSERT INTO token_log_tasks(
                    chain,address,first_block,next_block,priority,due_at,updated_at,
-                   recent_complete,completed_at)
-               VALUES('ethereum',?,1,1,?,?,?,1,NULL)""",
-            [(ADDRESS, 10, now, now), (TOKEN, 50, now, now)],
+                   recent_complete,completed_at,recent_due_at,history_due_at)
+               VALUES('ethereum',?,1,1,?,?,?,1,NULL,?,?)""",
+            [(ADDRESS, 10, now, now, later, later),
+             (TOKEN, 50, now, now, later, now)],
         )
     snapshot = db.token_log_queue_snapshot()["ethereum"]
     assert snapshot["total"] == 2

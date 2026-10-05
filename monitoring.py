@@ -43,8 +43,9 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
     },
     "steady": {
         "global_rpc_concurrency": 10,
-        "discovery_rpc_concurrency": 4,
+        "discovery_rpc_concurrency": 2,
         "balance_rpc_concurrency": 6,
+        "sui_rpc_concurrency": 2,
         "rpc_concurrency": 2,
         "balance_concurrency": 6,
         "balance_chain_concurrency": 10,
@@ -56,6 +57,9 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
     },
     "normal": {
         "global_rpc_concurrency": 12,
+        "discovery_rpc_concurrency": 4,
+        "balance_rpc_concurrency": 6,
+        "sui_rpc_concurrency": 2,
         "rpc_concurrency": 2,
         "balance_concurrency": 8,
         "balance_chain_concurrency": 12,
@@ -80,9 +84,11 @@ LOAD_PROFILES: dict[str, dict[str, int]] = {
 
 for _profile in LOAD_PROFILES.values():
     _total = _profile["global_rpc_concurrency"]
-    _profile.setdefault("discovery_rpc_concurrency", max(1, _total // 2))
+    _profile.setdefault("sui_rpc_concurrency", 2)
+    _profile.setdefault("discovery_rpc_concurrency", max(1, _total // 2 - 1))
     _profile.setdefault(
-        "balance_rpc_concurrency", _total - _profile["discovery_rpc_concurrency"]
+        "balance_rpc_concurrency",
+        _total - _profile["discovery_rpc_concurrency"] - _profile["sui_rpc_concurrency"],
     )
 
 
@@ -253,6 +259,25 @@ CREATE TABLE IF NOT EXISTS discovery_workers(
     last_error TEXT,
     endpoint TEXT
 );
+CREATE TABLE IF NOT EXISTS discovery_stage_minute(
+    minute TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    role TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    total_ms REAL NOT NULL DEFAULT 0,
+    candidates INTEGER NOT NULL DEFAULT 0,
+    code_rpc_checks INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(minute,chain,role,stage)
+);
+CREATE TABLE IF NOT EXISTS rpc_attempt_minute(
+    minute TEXT NOT NULL, chain TEXT NOT NULL, workload TEXT NOT NULL,
+    method_group TEXT NOT NULL, endpoint_label TEXT NOT NULL,
+    error_class TEXT NOT NULL, attempts INTEGER NOT NULL,
+    total_ms REAL NOT NULL, max_ms REAL NOT NULL,
+    PRIMARY KEY(minute,chain,workload,method_group,endpoint_label,error_class)
+);
+CREATE INDEX IF NOT EXISTS idx_rpc_attempt_minute_time ON rpc_attempt_minute(minute,chain);
 """
 
 
@@ -316,6 +341,7 @@ class MonitorStore:
                 )
                 self.conn.execute("UPDATE schema_meta SET version=2 WHERE version<2")
             self.conn.execute("UPDATE schema_meta SET version=3 WHERE version<3")
+            self.conn.execute("UPDATE schema_meta SET version=4 WHERE version<4")
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                 ("scanner_paused", "0", utc_now()),
@@ -597,6 +623,92 @@ class MonitorStore:
                 (f"{chain}:{role}",),
             ).fetchone()
 
+    def add_discovery_stage_sample(self, chain: str, role: str, stage: str,
+                                   elapsed_ms: float, candidates: int = 0,
+                                   code_rpc_checks: int = 0) -> None:
+        if stage not in {"queued", "blocks", "receipts", "code", "commit"}:
+            return
+        minute = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:00+00:00")
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO discovery_stage_minute(minute,chain,role,stage,attempts,
+                   total_ms,candidates,code_rpc_checks) VALUES(?,?,?,?,1,?,?,?)
+                   ON CONFLICT(minute,chain,role,stage) DO UPDATE SET
+                     attempts=attempts+1,total_ms=total_ms+excluded.total_ms,
+                     candidates=candidates+excluded.candidates,
+                     code_rpc_checks=code_rpc_checks+excluded.code_rpc_checks""",
+                (minute, chain, role, stage, max(0.0, elapsed_ms),
+                 candidates, code_rpc_checks),
+            )
+
+    def discovery_stage_summary(self, seconds: int = 600) -> dict[str, dict[str, Any]]:
+        cutoff = datetime.fromtimestamp(time.time() - seconds, UTC).strftime(
+            "%Y-%m-%dT%H:%M:00+00:00"
+        )
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT chain,stage,SUM(attempts) AS attempts,
+                   SUM(total_ms)/MAX(1,SUM(attempts)) AS avg_ms,
+                   SUM(candidates) AS candidates,SUM(code_rpc_checks) AS code_rpc_checks
+                   FROM discovery_stage_minute WHERE minute>=? AND role='live'
+                   GROUP BY chain,stage""", (cutoff,),
+            ).fetchall()
+        return {str(row["chain"]): {
+            "stage": str(row["stage"]), "attempts": int(row["attempts"]),
+            "avg_ms": float(row["avg_ms"] or 0),
+            "candidates": int(row["candidates"] or 0),
+            "code_rpc_checks": int(row["code_rpc_checks"] or 0),
+        } for row in rows if row["stage"] in {"blocks", "receipts", "code", "commit"}
+        and float(row["avg_ms"] or 0) == max(
+            float(other["avg_ms"] or 0) for other in rows if other["chain"] == row["chain"]
+            and other["stage"] in {"blocks", "receipts", "code", "commit"}
+        )}
+
+    def add_rpc_attempts(self, chain: str,
+                         attempts: Iterable[tuple[str, str, str, str, str, float]]) -> None:
+        """Persist only minute aggregates, never full RPC URLs or per-call rows."""
+        grouped: dict[tuple[str, str, str, str, str], tuple[int, float, float]] = {}
+        for minute, workload, method, endpoint, error, latency in attempts:
+            key = (minute, workload, method, endpoint, error)
+            count, total, maximum = grouped.get(key, (0, 0.0, 0.0))
+            grouped[key] = (count + 1, total + latency, max(maximum, latency))
+        if not grouped:
+            return
+        with self._lock, self.conn:
+            self.conn.executemany(
+                """INSERT INTO rpc_attempt_minute(minute,chain,workload,method_group,
+                   endpoint_label,error_class,attempts,total_ms,max_ms)
+                   VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET
+                   attempts=attempts+excluded.attempts,
+                   total_ms=total_ms+excluded.total_ms,
+                   max_ms=MAX(max_ms,excluded.max_ms)""",
+                [(*key[:1], chain, *key[1:], *values)
+                for key, values in grouped.items()],
+            )
+
+    def rpc_failure_summary(self, seconds: int = 600) -> dict[str, dict[str, Any]]:
+        cutoff = datetime.fromtimestamp(time.time() - seconds, UTC).strftime(
+            "%Y-%m-%dT%H:%M:00+00:00"
+        )
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT chain,workload,method_group,endpoint_label,error_class,
+                   SUM(attempts) AS attempts FROM rpc_attempt_minute
+                   WHERE minute>=? AND error_class!='ok'
+                   GROUP BY chain,workload,method_group,endpoint_label,error_class
+                   ORDER BY attempts DESC""", (cutoff,),
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            result.setdefault(str(row["chain"]), {
+                "workload": str(row["workload"]),
+                "method": str(row["method_group"]),
+                "endpoint": str(row["endpoint_label"]),
+                "error": str(row["error_class"]),
+                "attempts": int(row["attempts"]),
+            })
+        return result
+
     def audit(self, chat_id: str, user_id: str | None, command: str, allowed: bool, result: str = "") -> None:
         with self._lock, self.conn:
             self.conn.execute(
@@ -620,6 +732,8 @@ class MonitorStore:
         with self._lock, self.conn:
             for table in ("chain_samples", "aggregate_samples", "resource_samples"):
                 self.conn.execute(f"DELETE FROM {table} WHERE ts<?", (cutoff,))
+            self.conn.execute("DELETE FROM discovery_stage_minute WHERE minute<?", (cutoff,))
+            self.conn.execute("DELETE FROM rpc_attempt_minute WHERE minute<?", (cutoff,))
 
 
 def parse_period(value: str, allowed: tuple[str, ...] = ("30m", "1h", "6h", "12h", "24h", "7d")) -> int:

@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import scan_defi as scanner
 
 
@@ -119,6 +120,36 @@ def test_dual_cursor_commit_is_atomic_and_idempotent(tmp_path):
     assert db.commit_index_range("ethereum", "live", 120, [contract], [source], [], [], []) == (0, 0)
     assert db.conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 1
     assert db.conn.execute("SELECT COUNT(*) FROM contract_discoveries").fetchone()[0] == 1
+    db.close()
+
+
+def test_tip_reanchor_preserves_gap_and_commits_it_with_cas(tmp_path):
+    db = scanner.DB(tmp_path / "db.sqlite")
+    db.init_chain("ethereum", 100, True)
+    db.init_chain_cursors("ethereum", 100, 120, lookback=1)
+    assert db.commit_index_range(
+        "ethereum", "live", 120, [], [], [], [], [], expected_start=120,
+    ) == (0, 0)
+    gap_id = db.reanchor_tip("ethereum", 200, 1000, lookback=2)
+    assert gap_id is not None
+    gap = db.discovery_gap(gap_id)
+    assert (gap["start_block"], gap["end_block"], gap["next_block"]) == (121, 198, 121)
+    assert db.cursor("ethereum", "live")["next_block"] == 199
+    assert db.reanchor_tip("ethereum", 220, 1000, lookback=2) is None
+    contract = ("ethereum", ADDRESS, None, None, None, "2026-01-01")
+    source = ("ethereum", ADDRESS, "active_call", 121, "0xtx", None, "2026-01-01")
+    db.commit_index_range(
+        "ethereum", "catchup", 125, [contract], [source], [], [], [],
+        expected_start=121, gap_id=gap_id,
+        block_hashes=[(125, "0xabc")],
+    )
+    assert db.discovery_gap(gap_id)["next_block"] == 126
+    assert db.cursor("ethereum", "live")["next_block"] == 199
+    with pytest.raises(RuntimeError, match="cursor changed"):
+        db.commit_index_range("ethereum", "catchup", 126, [], [], [], [], [],
+                              expected_start=121, gap_id=gap_id)
+    assert db.discovery_gap(gap_id)["next_block"] == 126
+    assert db.conn.execute("SELECT block_hash FROM discovery_block_hashes WHERE chain='ethereum' AND block_number=125").fetchone()[0] == "0xabc"
     db.close()
 
 

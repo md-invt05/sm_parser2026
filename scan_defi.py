@@ -51,6 +51,7 @@ from monitoring import LOAD_PROFILES, MonitorStore, percentile
 from sui_support import (
     BlockberryClient,
     SuiConfig,
+    SuiGrpcClient,
     SuiStore,
     export_sui_xlsx,
     sui_balance_loop,
@@ -71,7 +72,7 @@ LLAMA_PRICES = "https://coins.llama.fi/prices/current/"
 BALANCE_RPC = ContextVar("balance_rpc", default=False)
 TOKEN_LOG_HISTORY = ContextVar("token_log_history", default=False)
 BALANCE_SCHEDULE_REVISION = "3"
-TOKEN_LOG_QUEUE_REVISION = "2"
+TOKEN_LOG_QUEUE_REVISION = "3"
 
 
 def balance_retry_delay(status: str, has_code: int | None, usd: float | None,
@@ -177,6 +178,7 @@ class AppCfg:
     global_rpc_concurrency: int
     discovery_rpc_concurrency: int
     balance_rpc_concurrency: int
+    sui_rpc_concurrency: int
     rpc_concurrency: int
     balance_concurrency: int
     balance_chain_concurrency: int
@@ -299,6 +301,7 @@ def load_config(path: Path) -> AppCfg:
         global_rpc_concurrency=int(raw.get("global_rpc_concurrency", 12)),
         discovery_rpc_concurrency=max(1, int(raw.get("discovery_rpc_concurrency", 6))),
         balance_rpc_concurrency=max(1, int(raw.get("balance_rpc_concurrency", 6))),
+        sui_rpc_concurrency=max(1, int(raw.get("sui_rpc_concurrency", 2))),
         rpc_concurrency=int(raw.get("rpc_concurrency", 2)),
         balance_concurrency=max(1, int(raw.get("balance_concurrency", 8))),
         balance_chain_concurrency=max(1, int(raw.get("balance_chain_concurrency", 12))),
@@ -429,6 +432,7 @@ CREATE TABLE IF NOT EXISTS contracts (
     last_checked_at  TEXT,
     last_total_usd   REAL,
     last_status      TEXT,
+    canonical        INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (chain, address)
 );
 
@@ -478,6 +482,7 @@ CREATE TABLE IF NOT EXISTS contract_tokens (
     source           TEXT NOT NULL DEFAULT 'transfer',
     first_seen_block INTEGER,
     last_seen_block  INTEGER,
+    canonical        INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (chain, contract, token)
 );
 
@@ -536,10 +541,25 @@ CREATE TABLE IF NOT EXISTS token_log_tasks (
     recent_cursor    INTEGER,
     historical_cursor INTEGER,
     recent_complete  INTEGER NOT NULL DEFAULT 0,
+    recent_due_at TEXT,
+    history_due_at TEXT,
+    recent_failures INTEGER NOT NULL DEFAULT 0,
+    history_failures INTEGER NOT NULL DEFAULT 0,
+    recent_updated_at TEXT,
+    history_updated_at TEXT,
     PRIMARY KEY (chain, address)
 );
 CREATE INDEX IF NOT EXISTS idx_token_log_tasks_due
     ON token_log_tasks(due_at, priority);
+CREATE TABLE IF NOT EXISTS token_log_minute (
+    minute TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    class TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    links INTEGER NOT NULL DEFAULT 0,
+    retry_success INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(minute,chain,class)
+);
 CREATE INDEX IF NOT EXISTS idx_address_scans_latest
     ON address_scans(address, scanned_at);
 CREATE INDEX IF NOT EXISTS idx_address_scans_latest_id
@@ -569,6 +589,7 @@ CREATE TABLE IF NOT EXISTS contract_discoveries (
     observed_tx      TEXT,
     actor            TEXT,
     first_seen_at    TEXT NOT NULL,
+    canonical        INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (chain, address, source)
 );
 
@@ -595,7 +616,31 @@ CREATE TABLE IF NOT EXISTS chain_cursors (
     status           TEXT NOT NULL DEFAULT 'active',
     updated_at       TEXT NOT NULL,
     note             TEXT,
+    segment_start_block INTEGER,
     PRIMARY KEY (chain, role)
+);
+
+CREATE TABLE IF NOT EXISTS discovery_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain TEXT NOT NULL,
+    start_block INTEGER NOT NULL,
+    end_block INTEGER NOT NULL,
+    next_block INTEGER NOT NULL,
+    last_committed INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(start_block <= end_block)
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_gaps_next
+    ON discovery_gaps(chain,status,next_block);
+CREATE TABLE IF NOT EXISTS discovery_block_hashes (
+    chain TEXT NOT NULL,
+    block_number INTEGER NOT NULL,
+    block_hash TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY(chain,block_number)
 );
 
 CREATE TABLE IF NOT EXISTS address_chain_state (
@@ -620,6 +665,25 @@ CREATE TABLE IF NOT EXISTS address_chain_state (
     price_retry_at   TEXT,
     PRIMARY KEY (address, chain)
 );
+
+CREATE TABLE IF NOT EXISTS balance_work_items (
+    chain TEXT NOT NULL,
+    address TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    asset TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 10,
+    due_at TEXT NOT NULL,
+    failure_streak INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    lease_until TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(chain,address,kind,asset)
+);
+CREATE INDEX IF NOT EXISTS idx_balance_work_due
+    ON balance_work_items(status,due_at,priority);
+CREATE INDEX IF NOT EXISTS idx_balance_work_chain_due
+    ON balance_work_items(chain,status,due_at);
 CREATE INDEX IF NOT EXISTS idx_address_chain_retry
     ON address_chain_state(next_retry_at, address);
 
@@ -716,6 +780,19 @@ class DB:
             )
         if "price_retry_at" not in state_columns:
             self.conn.execute("ALTER TABLE address_chain_state ADD COLUMN price_retry_at TEXT")
+        cursor_columns = {row["name"] for row in self.conn.execute(
+            "PRAGMA table_info(chain_cursors)"
+        )}
+        if "segment_start_block" not in cursor_columns:
+            self.conn.execute("ALTER TABLE chain_cursors ADD COLUMN segment_start_block INTEGER")
+        for table in ("contracts", "contract_discoveries", "contract_tokens"):
+            columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            if "canonical" not in columns:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN canonical INTEGER NOT NULL DEFAULT 1")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_discoveries_canonical_block "
+            "ON contract_discoveries(chain,canonical,observed_block)"
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_address_chain_price_retry "
             "ON address_chain_state(price_retry_at)"
@@ -730,9 +807,33 @@ class DB:
         for name, declaration in {
             "recent_cursor": "INTEGER", "historical_cursor": "INTEGER",
             "recent_complete": "INTEGER NOT NULL DEFAULT 0",
+            "recent_due_at": "TEXT", "history_due_at": "TEXT",
+            "recent_failures": "INTEGER NOT NULL DEFAULT 0",
+            "history_failures": "INTEGER NOT NULL DEFAULT 0",
+            "recent_updated_at": "TEXT", "history_updated_at": "TEXT",
         }.items():
             if name not in token_task_columns:
                 self.conn.execute(f"ALTER TABLE token_log_tasks ADD COLUMN {name} {declaration}")
+        now = datetime.now(timezone.utc).isoformat()
+        # A completed recent window must not postpone an unfinished historical
+        # cursor merely because the old schema had one shared due_at.
+        self.conn.execute(
+            "UPDATE token_log_tasks SET recent_due_at=COALESCE(recent_due_at,due_at),"
+            "history_due_at=COALESCE(history_due_at,CASE WHEN recent_complete=1 "
+            "AND completed_at IS NULL AND priority>=50 THEN ? ELSE due_at END),"
+            "recent_updated_at=COALESCE(recent_updated_at,updated_at),"
+            "history_updated_at=COALESCE(history_updated_at,updated_at) "
+            "WHERE recent_due_at IS NULL OR history_due_at IS NULL",
+            (now,),
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_recent_due "
+            "ON token_log_tasks(recent_complete,recent_due_at,priority)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_history_due "
+            "ON token_log_tasks(completed_at,history_due_at,priority)"
+        )
         chain_state_columns = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(chain_state)")
         }
@@ -784,9 +885,9 @@ class DB:
             """
         )
         self.conn.execute(
-            "INSERT INTO schema_meta(version) SELECT 8 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
+            "INSERT INTO schema_meta(version) SELECT 12 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
         )
-        self.conn.execute("UPDATE schema_meta SET version=8 WHERE version < 8")
+        self.conn.execute("UPDATE schema_meta SET version=12 WHERE version < 12")
         self.conn.execute(
             "INSERT OR IGNORE INTO runtime_meta(key,value,updated_at) VALUES('data_revision','0',?)",
             (datetime.now(timezone.utc).isoformat(),),
@@ -795,6 +896,11 @@ class DB:
 
     def close(self) -> None:
         self.conn.close()
+
+    def prune_token_log_telemetry(self, days: int = 30) -> None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self.conn:
+            self.conn.execute("DELETE FROM token_log_minute WHERE minute<?", (cutoff,))
 
     def _bump_revision_locked(self) -> int:
         row = self.conn.execute(
@@ -1159,10 +1265,15 @@ class DB:
             )
             self.conn.execute(
                 """INSERT OR IGNORE INTO chain_cursors(
-                       chain,role,next_block,anchor_block,last_committed,status,updated_at,note
-                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                       chain,role,next_block,anchor_block,last_committed,status,updated_at,note,
+                       segment_start_block
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (chain, "live", live_next, safe_head, live_next - 1,
-                 "active", now, "safe-head anchor with two-block lookback"),
+                 "active", now, "safe-head anchor with two-block lookback", live_next),
+            )
+            self.conn.execute(
+                """UPDATE chain_cursors SET segment_start_block=COALESCE(segment_start_block,anchor_block-1)
+                   WHERE chain=? AND role='live'""", (chain,),
             )
             if existing_live_before is not None:
                 replay_from = max(
@@ -1170,7 +1281,9 @@ class DB:
                 )
                 self.conn.execute(
                     """UPDATE chain_cursors SET next_block=?,last_committed=?,anchor_block=?,
-                         status='active',updated_at=?,note='startup reorg lookback'
+                         status=CASE WHEN status IN ('reorg_alert','reorg_replay')
+                             THEN status ELSE 'active' END,
+                         updated_at=?,note='startup reorg lookback'
                        WHERE chain=? AND role='live'""",
                     (replay_from, replay_from - 1, safe_head, now, chain),
                 )
@@ -1184,6 +1297,235 @@ class DB:
             return self.conn.execute(
                 "SELECT * FROM chain_cursors WHERE chain=? AND role=?", (chain, role)
             ).fetchone()
+
+    def next_discovery_gap(self, chain: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                """SELECT *,end_block AS anchor_block FROM discovery_gaps
+                   WHERE chain=? AND status='active'
+                   ORDER BY CASE WHEN reason='reorg_replay' THEN 0 ELSE 1 END,
+                            start_block,id LIMIT 1""",
+                (chain,),
+            ).fetchone()
+
+    def discovery_gap(self, gap_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT *,end_block AS anchor_block FROM discovery_gaps WHERE id=?",
+                (gap_id,),
+            ).fetchone()
+
+    def discovery_gap_snapshot(self) -> dict[str, dict[str, int]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT chain,COUNT(*) AS open_gaps,
+                          COALESCE(SUM(end_block-next_block+1),0) AS remaining_blocks,
+                          SUM(CASE WHEN status='reorg_alert' THEN 1 ELSE 0 END) AS reorg_alerts,
+                          MIN(next_block) AS oldest_next_block
+                   FROM discovery_gaps WHERE status!='complete' GROUP BY chain"""
+            ).fetchall()
+        return {str(row["chain"]): {
+            "open_gaps": int(row["open_gaps"]),
+            "remaining_blocks": int(row["remaining_blocks"]),
+            "reorg_alerts": int(row["reorg_alerts"]),
+            "oldest_next_block": int(row["oldest_next_block"]),
+        } for row in rows}
+
+    def balance_work_snapshot(self) -> dict[str, int]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT kind,COUNT(*) AS total,
+                          SUM(CASE WHEN due_at<=? THEN 1 ELSE 0 END) AS due
+                   FROM balance_work_items WHERE status='pending' GROUP BY kind""",
+                (now,),
+            ).fetchall()
+        return {f"{row['kind']}_{name}": int(row[name] or 0)
+                for row in rows for name in ("total", "due")}
+
+    def discovery_hashes(self, chain: str, start: int, end: int) -> dict[int, str]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT block_number,block_hash FROM discovery_block_hashes
+                   WHERE chain=? AND block_number BETWEEN ? AND ?""",
+                (chain, start, end),
+            ).fetchall()
+        return {int(row["block_number"]): str(row["block_hash"]).lower() for row in rows}
+
+    def halt_discovery_on_reorg(self, chain: str, role: str, gap_id: int | None,
+                                block_number: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE discovery_gaps SET status='reorg_alert',updated_at=?
+                   WHERE chain=? AND status='active'""",
+                (now, chain),
+            )
+            self.conn.execute(
+                """UPDATE chain_cursors SET status='reorg_alert',updated_at=?,note=?
+                   WHERE chain=? AND status='active'""",
+                (now, f"block hash changed at {block_number}", chain),
+            )
+
+    def pending_reorg_conflict(self, chain: str) -> int | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT note FROM chain_cursors WHERE chain=? AND status='reorg_alert' "
+                "AND note LIKE 'block hash changed at %' LIMIT 1", (chain,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(str(row[0]).rsplit(" ", 1)[-1])
+        except ValueError:
+            return None
+
+    def mark_reorg_manual(self, chain: str, conflict: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE chain_cursors SET note=? WHERE chain=? AND status='reorg_alert'",
+                (f"manual: common ancestor outside saved window at {conflict}", chain),
+            )
+
+    def begin_reorg_replay(self, chain: str, ancestor: int, conflict: int) -> int:
+        """Quarantine orphan provenance and schedule a durable replay atomically."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            existing = self.conn.execute(
+                "SELECT id FROM discovery_gaps WHERE chain=? AND reason='reorg_replay' "
+                "AND status='active' ORDER BY id DESC LIMIT 1", (chain,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing[0])
+            row = self.conn.execute(
+                "SELECT MAX(block_number) FROM discovery_block_hashes WHERE chain=? AND block_number>?",
+                (chain, ancestor),
+            ).fetchone()
+            replay_end = max(conflict, int(row[0] or conflict))
+            if ancestor >= conflict or replay_end <= ancestor:
+                raise RuntimeError("invalid reorg ancestor/replay bounds")
+            self.conn.execute(
+                "UPDATE contract_discoveries SET canonical=0 WHERE chain=? "
+                "AND observed_block>? AND observed_block<=?",
+                (chain, ancestor, replay_end),
+            )
+            self.conn.execute(
+                """UPDATE contracts SET canonical=0,
+                   created_block=CASE WHEN created_block>? THEN NULL ELSE created_block END,
+                   created_tx=CASE WHEN created_block>? THEN NULL ELSE created_tx END,
+                   creator=CASE WHEN created_block>? THEN NULL ELSE creator END
+                   WHERE chain=? AND EXISTS(
+                     SELECT 1 FROM contract_discoveries d WHERE d.chain=contracts.chain
+                     AND d.address=contracts.address AND d.canonical=0)
+                   AND NOT EXISTS(
+                     SELECT 1 FROM contract_discoveries d WHERE d.chain=contracts.chain
+                     AND d.address=contracts.address AND d.canonical=1)""",
+                (ancestor, ancestor, ancestor, chain),
+            )
+            self.conn.execute(
+                "DELETE FROM discovery_block_hashes WHERE chain=? AND block_number>?",
+                (chain, ancestor),
+            )
+            self.conn.execute(
+                "DELETE FROM contract_code_cache WHERE chain=? AND checked_block>?",
+                (chain, ancestor),
+            )
+            affected_tokens = [row[0] for row in self.conn.execute(
+                "SELECT DISTINCT contract FROM contract_tokens WHERE chain=? "
+                "AND first_seen_block>? AND first_seen_block<=?",
+                (chain, ancestor, replay_end),
+            )]
+            self.conn.execute(
+                "UPDATE contract_tokens SET canonical=0 WHERE chain=? "
+                "AND first_seen_block>? AND first_seen_block<=?",
+                (chain, ancestor, replay_end),
+            )
+            self.conn.executemany(
+                """UPDATE token_log_tasks SET next_block=MIN(next_block,?),
+                   historical_cursor=MIN(COALESCE(historical_cursor,next_block),?),
+                   history_due_at=?,completed_at=NULL WHERE chain=? AND address=?""",
+                [(ancestor + 1, ancestor + 1, now, chain, address)
+                 for address in affected_tokens],
+            )
+            self.conn.executemany(
+                """UPDATE address_chain_state SET coverage_state='history_unknown',
+                   next_retry_at=MIN(next_retry_at,?) WHERE chain=? AND address=?""",
+                [(now, chain, address) for address in affected_tokens],
+            )
+            self.conn.execute(
+                "UPDATE chain_cursors SET status='reorg_replay',updated_at=? "
+                "WHERE chain=? AND status='reorg_alert'", (now, chain),
+            )
+            self.conn.execute(
+                "UPDATE discovery_gaps SET status='reorg_replay',updated_at=? "
+                "WHERE chain=? AND status='reorg_alert'", (now, chain),
+            )
+            cur = self.conn.execute(
+                """INSERT INTO discovery_gaps(chain,start_block,end_block,next_block,
+                   last_committed,status,reason,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'active','reorg_replay',?,?)""",
+                (chain, ancestor + 1, replay_end, ancestor + 1, ancestor, now, now),
+            )
+            self._bump_revision_locked()
+            return int(cur.lastrowid)
+
+    def finish_reorg_replay(self, chain: str, replay_gap_id: int) -> None:
+        """Only called after the replay gap's compare-and-swap commit is complete."""
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT status,reason FROM discovery_gaps WHERE id=? AND chain=?",
+                (replay_gap_id, chain),
+            ).fetchone()
+            if row is None or row["status"] != "complete" or row["reason"] != "reorg_replay":
+                raise RuntimeError("reorg replay has not committed")
+            now = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                "UPDATE chain_cursors SET status='active',note=NULL,updated_at=? "
+                "WHERE chain=? AND status='reorg_replay'", (now, chain),
+            )
+            self.conn.execute(
+                "UPDATE discovery_gaps SET status='active',updated_at=? "
+                "WHERE chain=? AND status='reorg_replay'", (now, chain),
+            )
+
+    def reanchor_tip(self, chain: str, safe_head: int, lag_sec: float,
+                     *, lag_trigger_sec: float = 900, cooldown_sec: float = 21600,
+                     lookback: int = 2) -> int | None:
+        """Save every skipped block as a gap in the same transaction as the new tip."""
+        if lag_sec < lag_trigger_sec:
+            return None
+        now = datetime.now(timezone.utc)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT next_block,status FROM chain_cursors WHERE chain=? AND role='live'",
+                (chain,),
+            ).fetchone()
+            if row is None or row["status"] != "active":
+                return None
+            start = int(row["next_block"])
+            tip_start = max(start, safe_head - max(0, lookback) + 1)
+            if tip_start <= start:
+                return None
+            latest = self.conn.execute(
+                "SELECT created_at FROM discovery_gaps WHERE chain=? AND reason='tip_reanchor' "
+                "ORDER BY id DESC LIMIT 1", (chain,),
+            ).fetchone()
+            if latest and (now - datetime.fromisoformat(latest[0])).total_seconds() < cooldown_sec:
+                return None
+            cur = self.conn.execute(
+                """INSERT INTO discovery_gaps(chain,start_block,end_block,next_block,
+                       last_committed,status,reason,created_at,updated_at)
+                   VALUES(?,?,?,?,?,'active','tip_reanchor',?,?)""",
+                (chain, start, tip_start - 1, start, start - 1,
+                 now.isoformat(), now.isoformat()),
+            )
+            self.conn.execute(
+                """UPDATE chain_cursors SET next_block=?,last_committed=?,
+                       segment_start_block=?,updated_at=?,note='tip with durable catch-up gap'
+                   WHERE chain=? AND role='live' AND next_block=?""",
+                (tip_start, tip_start - 1, tip_start, now.isoformat(), chain, start),
+            )
+            return int(cur.lastrowid)
 
     def advance_cursor_start(self, chain: str, role: str, next_block: int) -> None:
         with self._lock, self.conn:
@@ -1205,16 +1547,29 @@ class DB:
         token_rows: list[tuple[Any, ...]],
         relation_rows: list[tuple[Any, ...]],
         enqueue_token_logs: bool = False,
+        expected_start: int | None = None,
+        gap_id: int | None = None,
+        block_hashes: list[tuple[int, str]] | None = None,
     ) -> tuple[int, int]:
         """Commit all derived data and the matching cursor in one transaction."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self.conn:
-            cursor = self.conn.execute(
-                "SELECT next_block,anchor_block FROM chain_cursors WHERE chain=? AND role=?",
+            cursor = (self.conn.execute(
+                "SELECT next_block,end_block AS anchor_block,reason FROM discovery_gaps WHERE id=? AND chain=? AND status='active'",
+                (gap_id, chain),
+            ).fetchone() if role == "catchup" else self.conn.execute(
+                "SELECT next_block,anchor_block FROM chain_cursors WHERE chain=? AND role=? AND status='active'",
                 (chain, role),
-            ).fetchone()
+            ).fetchone())
             if cursor is None:
                 raise RuntimeError(f"missing {chain}/{role} cursor")
+            current_start = int(cursor["next_block"])
+            if expected_start is not None and current_start != expected_start:
+                raise RuntimeError(f"{chain}/{role} cursor changed: {current_start} != {expected_start}")
+            if range_end < current_start and expected_start is None:
+                return 0, 0  # Compatibility with an already committed legacy replay.
+            if range_end < current_start or (role != "live" and range_end > int(cursor["anchor_block"])):
+                raise RuntimeError(f"invalid {chain}/{role} range {current_start}..{range_end}")
             before = self.conn.total_changes
             self.conn.executemany(
                 """INSERT OR IGNORE INTO contracts(
@@ -1224,10 +1579,14 @@ class DB:
             )
             inserted = self.conn.total_changes - before
             self.conn.executemany(
-                """UPDATE contracts SET created_block=COALESCE(created_block,?),
-                     created_tx=COALESCE(created_tx,?),creator=COALESCE(creator,?)
-                   WHERE chain=? AND address=? AND ? IS NOT NULL""",
-                [(row[2], row[3], row[4], row[0], row[1], row[2]) for row in contract_rows],
+                """UPDATE contracts SET created_block=?,created_tx=?,creator=?
+                   WHERE chain=? AND address=? AND ? IS NOT NULL
+                     AND (created_block IS NULL OR created_block>?)""",
+                [(row[2], row[3], row[4], row[0], row[1], row[2], row[2]) for row in contract_rows],
+            )
+            self.conn.executemany(
+                "UPDATE contracts SET canonical=1 WHERE chain=? AND address=?",
+                [(row[0], row[1]) for row in contract_rows],
             )
             before_sources = self.conn.total_changes
             self.conn.executemany(
@@ -1237,6 +1596,13 @@ class DB:
                 discovery_rows,
             )
             sources_inserted = self.conn.total_changes - before_sources
+            self.conn.executemany(
+                """UPDATE contract_discoveries SET observed_block=?,observed_tx=?,actor=?,canonical=1
+                   WHERE chain=? AND address=? AND source=?
+                     AND (canonical=0 OR observed_block>?)""",
+                [(row[3], row[4], row[5], row[0], row[1], row[2], row[3])
+                 for row in discovery_rows if row[3] is not None],
+            )
             self.conn.executemany(
                 """INSERT INTO contract_code_cache(chain,address,has_code,checked_at,checked_block)
                    VALUES(?,?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET
@@ -1255,22 +1621,54 @@ class DB:
                 """INSERT INTO contract_tokens(
                        chain,contract,token,source,first_seen_block,last_seen_block
                    ) VALUES(?,?,?,?,?,?) ON CONFLICT(chain,contract,token) DO UPDATE SET
+                     first_seen_block=CASE WHEN contract_tokens.canonical=0
+                       THEN excluded.first_seen_block ELSE contract_tokens.first_seen_block END,
+                     canonical=1,
                      last_seen_block=MAX(contract_tokens.last_seen_block,excluded.last_seen_block)""",
                 [(*row, row[4]) for row in relation_rows],
             )
             if enqueue_token_logs:
                 self._enqueue_discovered_token_tasks_locked(contract_rows, discovery_rows, now)
             anchor = int(cursor["anchor_block"])
-            status = "complete" if role == "backfill" and range_end >= anchor else "active"
-            self.conn.execute(
-                """UPDATE chain_cursors SET next_block=?,last_committed=?,status=?,updated_at=?,note=NULL
-                   WHERE chain=? AND role=?""",
-                (range_end + 1, range_end, status, now, chain, role),
-            )
+            status = "complete" if role in {"backfill", "catchup"} and range_end >= anchor else "active"
+            if role == "catchup":
+                updated = self.conn.execute(
+                    """UPDATE discovery_gaps SET next_block=?,last_committed=?,status=?,updated_at=?
+                       WHERE id=? AND chain=? AND next_block=? AND status='active'""",
+                    (range_end + 1, range_end, status, now, gap_id, chain, current_start),
+                )
+            else:
+                updated = self.conn.execute(
+                    """UPDATE chain_cursors SET next_block=?,last_committed=?,status=?,updated_at=?,note=NULL
+                       WHERE chain=? AND role=? AND next_block=? AND status='active'""",
+                    (range_end + 1, range_end, status, now, chain, role, current_start),
+                )
+            if updated.rowcount != 1:
+                raise RuntimeError(f"{chain}/{role} cursor compare-and-swap failed")
+            if block_hashes:
+                self.conn.executemany(
+                    """INSERT INTO discovery_block_hashes(chain,block_number,block_hash,checked_at)
+                       VALUES(?,?,?,?) ON CONFLICT(chain,block_number) DO UPDATE SET
+                       block_hash=excluded.block_hash,checked_at=excluded.checked_at""",
+                    [(chain, number, block_hash, now) for number, block_hash in block_hashes],
+                )
+                self.conn.execute(
+                    "DELETE FROM discovery_block_hashes WHERE chain=? AND block_number<?",
+                    (chain, range_end - 63),
+                )
             if role == "backfill":
                 self.conn.execute(
                     "UPDATE chain_state SET last_indexed=MAX(last_indexed,?) WHERE chain=?",
                     (range_end, chain),
+                )
+            if role == "catchup" and status == "complete" and cursor["reason"] == "reorg_replay":
+                self.conn.execute(
+                    "UPDATE chain_cursors SET status='active',note=NULL,updated_at=? "
+                    "WHERE chain=? AND status='reorg_replay'", (now, chain),
+                )
+                self.conn.execute(
+                    "UPDATE discovery_gaps SET status='active',updated_at=? "
+                    "WHERE chain=? AND status='reorg_replay'", (now, chain),
                 )
             self._bump_revision_locked()
             return int(inserted), int(sources_inserted)
@@ -1296,18 +1694,20 @@ class DB:
         self.conn.executemany(
             """INSERT INTO token_log_tasks(
                    chain,address,first_block,next_block,history_limited,priority,
-                   due_at,updated_at)
-               VALUES(?,?,?,?,?,100,?,?)
+                   due_at,updated_at,recent_due_at,history_due_at,
+                   recent_updated_at,history_updated_at)
+               VALUES(?,?,?,?,?,100,?,?,?,?,?,?)
                ON CONFLICT(chain,address) DO UPDATE SET
                    first_block=MIN(token_log_tasks.first_block,excluded.first_block),
                    next_block=CASE WHEN excluded.first_block<token_log_tasks.first_block
                        THEN excluded.first_block ELSE token_log_tasks.next_block END,
                    history_limited=MIN(token_log_tasks.history_limited,excluded.history_limited),
-                   due_at=CASE WHEN excluded.first_block<token_log_tasks.first_block
-                       THEN excluded.due_at ELSE token_log_tasks.due_at END,
+                   history_due_at=CASE WHEN excluded.first_block<token_log_tasks.first_block
+                       THEN excluded.history_due_at ELSE token_log_tasks.history_due_at END,
+                   recent_due_at=MIN(token_log_tasks.recent_due_at,excluded.recent_due_at),
                    completed_at=CASE WHEN excluded.first_block<token_log_tasks.first_block
                        THEN NULL ELSE token_log_tasks.completed_at END""",
-            [(chain, address, block, block, limited, now, now)
+            [(chain, address, block, block, limited, now, now, now, now, now, now)
              for (chain, address), (block, limited) in sources.items()],
         )
 
@@ -1379,7 +1779,8 @@ class DB:
             self.conn.execute(
                 """INSERT OR IGNORE INTO token_log_tasks(
                        chain,address,first_block,next_block,history_limited,priority,
-                       due_at,updated_at)
+                       due_at,updated_at,recent_due_at,history_due_at,
+                       recent_updated_at,history_updated_at)
                    SELECT c.chain,lower(c.address),
                           MAX(s.start_block,COALESCE(c.created_block,
                               (SELECT MIN(d.observed_block) FROM contract_discoveries d
@@ -1390,10 +1791,10 @@ class DB:
                                WHERE d.chain=c.chain AND d.address=lower(c.address)
                                  AND d.observed_block IS NOT NULL),s.last_indexed)),
                           CASE WHEN c.created_block IS NULL THEN 1 ELSE 0 END,
-                          50,?,?
+                          50,?,?,?,?,?,?
                    FROM contracts c JOIN chain_state s ON s.chain=c.chain
-                   WHERE c.last_total_usd>=?""",
-                (now, now, 150_000),
+                   WHERE c.canonical=1 AND c.last_total_usd>=?""",
+                (now, now, now, now, now, now, 150_000),
             )
             inserted = self.conn.total_changes - before
             self.conn.execute(
@@ -1421,41 +1822,98 @@ class DB:
     def next_token_log_task(
         self, chains: list[str], allow_history: bool = True,
         prefer_history: bool = False,
-    ) -> sqlite3.Row | None:
+    ) -> dict[str, Any] | None:
         if not chains:
             return None
         now = datetime.now(timezone.utc).isoformat()
         placeholders = ",".join("?" for _ in chains)
-        direction = "DESC" if prefer_history else "ASC"
+        # Each lane has an independent due clock. A reserved historical turn
+        # guarantees progress even under a permanent recent/retry storm.
+        classes = (["historical", "high_value", "recent", "retry"] if prefer_history
+                   else ["recent", "high_value", "retry", "historical"])
         with self._lock:
-            return self.conn.execute(
-                f"""SELECT * FROM token_log_tasks
-                    WHERE chain IN ({placeholders}) AND due_at<=?
-                      AND (recent_complete=0 OR (? AND priority>=50))
-                    ORDER BY recent_complete {direction},priority DESC,due_at,updated_at LIMIT 1""",
-                (*chains, now, int(allow_history)),
-            ).fetchone()
+            for category in classes:
+                if category in {"historical", "high_value"} and not allow_history:
+                    continue
+                if category == "recent":
+                    condition = "recent_due_at<=? AND recent_failures=0"
+                    order = "priority DESC,recent_due_at,recent_updated_at"
+                    lane = "recent"
+                elif category == "high_value":
+                    condition = "history_due_at<=? AND completed_at IS NULL AND priority>=50 AND history_failures=0"
+                    order = "priority DESC,history_due_at,history_updated_at"
+                    lane = "history"
+                elif category == "retry":
+                    condition = "((recent_due_at<=? AND recent_failures>0) OR "
+                    condition += "(history_due_at<=? AND completed_at IS NULL AND history_failures>0))"
+                    order = "priority DESC,updated_at"
+                    lane = "retry"
+                else:
+                    condition = "history_due_at<=? AND completed_at IS NULL AND priority<50 AND history_failures=0"
+                    order = "history_due_at,history_updated_at"
+                    lane = "history"
+                row = self.conn.execute(
+                    f"SELECT * FROM token_log_tasks WHERE chain IN ({placeholders}) "
+                    "AND NOT EXISTS(SELECT 1 FROM contracts c WHERE c.chain=token_log_tasks.chain "
+                    "AND c.address=token_log_tasks.address AND c.canonical=0) "
+                    f"AND {condition} ORDER BY {order} LIMIT 1",
+                    (*chains, now, now) if category == "retry" else (*chains, now),
+                ).fetchone()
+                if row is not None:
+                    result = dict(row)
+                    result["_class"] = category
+                    result["_lane"] = ("recent" if lane == "retry" and
+                                       result["recent_failures"] > 0 and
+                                       result["recent_due_at"] <= now else
+                                       "history" if lane == "retry" else lane)
+                    return result
+        return None
 
     def token_log_queue_snapshot(self) -> dict[str, dict[str, Any]]:
         now = datetime.now(timezone.utc)
+        cutoff = datetime.fromtimestamp(now.timestamp() - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:00+00:00")
         with self._lock:
             rows = self.conn.execute(
                 """SELECT chain,COUNT(*) total,
-                          SUM(CASE WHEN due_at<=? AND
-                              (recent_complete=0 OR priority>=50) THEN 1 ELSE 0 END) due,
+                          SUM(CASE WHEN recent_due_at<=? OR
+                              (history_due_at<=? AND completed_at IS NULL) THEN 1 ELSE 0 END) due,
+                          SUM(CASE WHEN recent_due_at<=? AND recent_failures=0 THEN 1 ELSE 0 END) recent_due,
+                          SUM(CASE WHEN history_due_at<=? AND completed_at IS NULL
+                              AND priority>=50 AND history_failures=0 THEN 1 ELSE 0 END) high_value_due,
+                          SUM(CASE WHEN (recent_due_at<=? AND recent_failures>0) OR
+                              (history_due_at<=? AND completed_at IS NULL AND history_failures>0)
+                              THEN 1 ELSE 0 END) retry_due,
+                          SUM(CASE WHEN history_due_at<=? AND completed_at IS NULL
+                              AND priority<50 AND history_failures=0 THEN 1 ELSE 0 END) history_due,
                           SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) failed,
                           SUM(CASE WHEN completed_at IS NULL OR history_limited=1
                               THEN 1 ELSE 0 END) partial,
-                          MIN(CASE WHEN due_at<=? AND
-                              (recent_complete=0 OR priority>=50) THEN updated_at END) oldest_at,
+                          MIN(CASE WHEN recent_due_at<=? OR
+                              (history_due_at<=? AND completed_at IS NULL) THEN updated_at END) oldest_at,
                           MIN(next_block) next_block
-                   FROM token_log_tasks GROUP BY chain""",
-                (now.isoformat(), now.isoformat()),
+                   FROM token_log_tasks WHERE NOT EXISTS(
+                     SELECT 1 FROM contracts c WHERE c.chain=token_log_tasks.chain
+                     AND c.address=token_log_tasks.address AND c.canonical=0)
+                   GROUP BY chain""",
+                (now.isoformat(),) * 9,
             ).fetchall()
             error_rows = self.conn.execute(
                 """SELECT chain,last_error,COUNT(*) count FROM token_log_tasks
                    WHERE last_error IS NOT NULL GROUP BY chain,last_error"""
             ).fetchall()
+            hourly = self.conn.execute(
+                "SELECT chain,class,SUM(completed) completed,SUM(links) links,"
+                "SUM(retry_success) retry_success FROM token_log_minute WHERE minute>=? "
+                "GROUP BY chain,class",
+                (cutoff,),
+            ).fetchall()
+        rates: dict[str, dict[str, dict[str, int]]] = {}
+        for item in hourly:
+            rates.setdefault(str(item["chain"]), {})[str(item["class"])] = {
+                "completed": int(item["completed"] or 0),
+                "links": int(item["links"] or 0),
+                "retry_success": int(item["retry_success"] or 0),
+            }
         errors: dict[str, dict[str, int]] = {}
         for row in error_rows:
             errors.setdefault(str(row["chain"]), {})[str(row["last_error"])] = int(row["count"])
@@ -1466,16 +1924,26 @@ class DB:
                 "total": int(row["total"]), "due": int(row["due"] or 0),
                 "failed": int(row["failed"] or 0),
                 "partial": int(row["partial"] or 0),
+                "recent_due": int(row["recent_due"] or 0),
+                "high_value_due": int(row["high_value_due"] or 0),
+                "retry_due": int(row["retry_due"] or 0),
+                "history_due": int(row["history_due"] or 0),
                 "oldest_age_sec": max(0.0, (now - oldest).total_seconds()) if oldest else 0.0,
                 "next_block": int(row["next_block"]),
                 "errors": errors.get(str(row["chain"]), {}),
+                "completed_hour": {key: value["completed"] for key, value in
+                                   rates.get(str(row["chain"]), {}).items()},
+                "links_hour": sum(value["links"] for value in rates.get(str(row["chain"]), {}).values()),
+                "retry_success_hour": sum(value["retry_success"] for value in
+                                          rates.get(str(row["chain"]), {}).values()),
+                "history_eta_sec": None,  # Window count is not yet measured reliably.
             }
         return result
 
     def commit_token_log_window(
         self, chain: str, address: str, end: int, head: int,
         token_rows: list[tuple[Any, ...]], relation_rows: list[tuple[Any, ...]],
-        *, recent: bool = False,
+        *, recent: bool = False, task_class: str | None = None,
     ) -> int:
         now = datetime.now(timezone.utc)
         address = address.lower()
@@ -1499,10 +1967,11 @@ class DB:
             changed = self.conn.total_changes - before
             self.conn.executemany(
                 """UPDATE contract_tokens SET
-                       last_seen_block=MAX(COALESCE(last_seen_block,0),?)
+                       first_seen_block=CASE WHEN canonical=0 THEN ? ELSE first_seen_block END,
+                       canonical=1,last_seen_block=MAX(COALESCE(last_seen_block,0),?)
                    WHERE chain=? AND contract=? AND token=? AND
-                       COALESCE(last_seen_block,0)<?""",
-                [(row[4], row[0], row[1], row[2], row[4]) for row in relation_rows],
+                       (canonical=0 OR COALESCE(last_seen_block,0)<?)""",
+                [(row[4], row[4], row[0], row[1], row[2], row[4]) for row in relation_rows],
             )
             done = end >= head
             if done:
@@ -1518,14 +1987,20 @@ class DB:
                     "SELECT MAX(last_total_usd) FROM contracts WHERE address=?", (address,),
                 ).fetchone()[0] or 0)
                 recent_priority = 50 if aggregate >= 150_000 else 10
-                recent_due = (1 if recent_priority >= 50 else 30 * 86400) if recent_done else 1
+                recent_due = (21600 if recent_priority >= 50 else 30 * 86400) if recent_done else 1
+                recent_due_at = datetime.fromtimestamp(now.timestamp() + recent_due, timezone.utc).isoformat()
+                history_due_at = (datetime.fromtimestamp(now.timestamp() + 30 * 86400, timezone.utc).isoformat()
+                                  if recent_done and recent_priority < 50 else
+                                  task["history_due_at"] or now.isoformat())
                 self.conn.execute(
                     """UPDATE token_log_tasks SET recent_cursor=?,recent_complete=?,
-                           due_at=?,updated_at=?,failures=0,last_error=NULL,
+                           recent_due_at=?,history_due_at=?,due_at=?,recent_updated_at=?,
+                           updated_at=?,recent_failures=0,failures=0,last_error=NULL,
                            window_size=MIN(1000,window_size*2),priority=?
                        WHERE chain=? AND address=?""",
-                    (end + 1, int(recent_done), datetime.fromtimestamp(now.timestamp() + recent_due, timezone.utc).isoformat(),
-                     now.isoformat(), recent_priority if recent_done else int(task["priority"]), chain, address),
+                    (end + 1, int(recent_done), recent_due_at, history_due_at,
+                     min(recent_due_at, history_due_at), now.isoformat(), now.isoformat(),
+                     recent_priority if recent_done else int(task["priority"]), chain, address),
                 )
                 if recent_done:
                     self.conn.execute(
@@ -1536,14 +2011,27 @@ class DB:
                     )
             else:
                 self.conn.execute(
-                    """UPDATE token_log_tasks SET next_block=?,historical_cursor=?,due_at=?,updated_at=?,
-                           completed_at=?,failures=0,last_error=NULL,
+                    """UPDATE token_log_tasks SET next_block=?,historical_cursor=?,history_due_at=?,
+                           due_at=?,history_updated_at=?,updated_at=?,
+                           completed_at=?,history_failures=0,failures=0,last_error=NULL,
                            window_size=MIN(1000,window_size*2),priority=CASE
                              WHEN priority=100 THEN 50 ELSE priority END
                        WHERE chain=? AND address=?""",
-                    (end + 1, end + 1, due, now.isoformat(), now.isoformat() if done else None,
+                    (end + 1, end + 1, due, min(due, task["recent_due_at"] or due),
+                     now.isoformat(), now.isoformat(), now.isoformat() if done else None,
                      chain, address),
                 )
+            category = task_class or ("recent" if recent else
+                                      "high_value" if int(task["priority"]) >= 50 else "historical")
+            retry_success = int((task["recent_failures"] if recent else task["history_failures"]) > 0)
+            minute = now.strftime("%Y-%m-%dT%H:%M:00+00:00")
+            self.conn.execute(
+                """INSERT INTO token_log_minute(minute,chain,class,completed,links,retry_success)
+                   VALUES(?,?,?,1,?,?) ON CONFLICT(minute,chain,class) DO UPDATE SET
+                   completed=completed+1,links=links+excluded.links,
+                   retry_success=retry_success+excluded.retry_success""",
+                (minute, chain, category, changed, retry_success),
+            )
             if changed:
                 self.conn.execute(
                     "UPDATE address_chain_state SET next_retry_at=? WHERE chain=? AND address=?",
@@ -1559,28 +2047,37 @@ class DB:
                 self._bump_revision_locked()
             return changed
 
-    def fail_token_log_task(self, chain: str, address: str, kind: str) -> int:
+    def fail_token_log_task(self, chain: str, address: str, kind: str,
+                            lane: str | None = None) -> int:
         now = datetime.now(timezone.utc)
         with self._lock, self.conn:
             task = self.token_log_task(chain, address)
             if task is None:
                 return 0
-            failures = int(task["failures"]) + 1
+            lane = lane or ("recent" if not int(task["recent_complete"]) else "history")
+            failure_column = "recent_failures" if lane == "recent" else "history_failures"
+            due_column = "recent_due_at" if lane == "recent" else "history_due_at"
+            failures = int(task[failure_column]) + 1
             delay = (60, 300, 1800, 7200)[min(failures - 1, 3)]
             due = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
             self.conn.execute(
-                """UPDATE token_log_tasks SET window_size=MAX(1,window_size/2),
-                       failures=?,last_error=?,due_at=?,updated_at=?
-                   WHERE chain=? AND address=?""",
-                (failures, kind, due, now.isoformat(), chain, address.lower()),
+                f"""UPDATE token_log_tasks SET window_size=MAX(1,window_size/2),
+                       {failure_column}=?,failures=?,last_error=?,{due_column}=?,
+                       due_at=?,updated_at=? WHERE chain=? AND address=?""",
+                (failures, failures, kind, due,
+                 min(due, (task["history_due_at"] if lane == "recent" else task["recent_due_at"])
+                     or task["due_at"]),
+                 now.isoformat(), chain, address.lower()),
             )
             return failures
 
-    def defer_token_log_task(self, chain: str, address: str, seconds: int) -> None:
+    def defer_token_log_task(self, chain: str, address: str, seconds: int,
+                             lane: str = "recent") -> None:
         due = datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
         with self._lock, self.conn:
             self.conn.execute(
-                "UPDATE token_log_tasks SET due_at=? WHERE chain=? AND address=?",
+                f"UPDATE token_log_tasks SET {'recent_due_at' if lane == 'recent' else 'history_due_at'}=? "
+                "WHERE chain=? AND address=?",
                 (due, chain, address.lower()),
             )
 
@@ -1730,7 +2227,7 @@ class DB:
             return {
                 row["address"].lower()
                 for row in self.conn.execute(
-                    "SELECT address FROM contract_discoveries WHERE chain=? AND source=?",
+                    "SELECT address FROM contract_discoveries WHERE chain=? AND source=? AND canonical=1",
                     (chain, source),
                 )
             }
@@ -1803,7 +2300,7 @@ class DB:
             return {
                 r["address"].lower()
                 for r in self.conn.execute(
-                    "SELECT address FROM contracts WHERE chain=?", (chain,)
+                    "SELECT address FROM contracts WHERE chain=? AND canonical=1", (chain,)
                 )
             }
 
@@ -1955,11 +2452,13 @@ class DB:
                     )
                 else:
                     self.conn.execute(
-                        "UPDATE contract_tokens SET last_seen_block=CASE "
+                        "UPDATE contract_tokens SET first_seen_block=CASE "
+                        "WHEN canonical=0 THEN ? ELSE first_seen_block END,"
+                        "last_seen_block=CASE "
                         "WHEN last_seen_block IS NULL OR last_seen_block<? THEN ? "
-                        "ELSE last_seen_block END "
+                        "ELSE last_seen_block END,canonical=1 "
                         "WHERE chain=? AND contract=? AND token=?",
-                        (block, block, chain, contract, token),
+                        (block, block, block, chain, contract, token),
                     )
 
     def tokens_for_contract(self, chain: str, contract: str) -> list[sqlite3.Row]:
@@ -1977,6 +2476,7 @@ class DB:
                             WHERE ct.chain=t.chain
                               AND ct.token=t.address
                               AND ct.contract=?
+                              AND ct.canonical=1
                         )
                       )
                     ORDER BY t.address
@@ -1997,7 +2497,7 @@ class DB:
             # next_retry_at index, not a GROUP BY over every contract on each poll.
             new_rows = self.conn.execute(
                 """SELECT lower(c.address) address,MIN(c.first_seen_at) due_at
-                   FROM contracts c WHERE NOT EXISTS(
+                   FROM contracts c WHERE c.canonical=1 AND NOT EXISTS(
                      SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
                    GROUP BY lower(c.address) ORDER BY due_at,address LIMIT ?""",
                 (limit,),
@@ -2041,7 +2541,7 @@ class DB:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             return list(self.conn.execute(
-                "SELECT * FROM address_chain_state WHERE status='price_missing' "
+                "SELECT * FROM address_chain_state WHERE status IN ('price_missing','partial') "
                 "AND price_retry_at<=? ORDER BY price_retry_at LIMIT ?", (now, limit),
             ))
 
@@ -2049,7 +2549,7 @@ class DB:
         with self._lock:
             return list(self.conn.execute(
                 "SELECT * FROM address_token_state WHERE address=? AND chain=? "
-                "AND priced=0 AND CAST(raw_amount AS INTEGER)>0",
+                "AND priced=0 AND valuation_status!='stale' AND CAST(raw_amount AS INTEGER)>0",
                 (address.lower(), chain),
             ))
 
@@ -2096,7 +2596,7 @@ class DB:
                 applied += 1
             remaining = int(self.conn.execute(
                 "SELECT COUNT(*) FROM address_token_state WHERE address=? AND chain=? "
-                "AND priced=0 AND CAST(raw_amount AS INTEGER)>0",
+                "AND priced=0 AND valuation_status!='stale' AND CAST(raw_amount AS INTEGER)>0",
                 (address, chain),
             ).fetchone()[0])
             sums = self.conn.execute(
@@ -2104,7 +2604,8 @@ class DB:
                                             THEN usd_value ELSE 0 END),0) native_usd,
                           COALESCE(SUM(CASE WHEN token!='native' AND valuation_status='included'
                                             THEN usd_value ELSE 0 END),0) tokens_usd,
-                          COALESCE(SUM(CASE WHEN valuation_status!='included'
+                          COALESCE(SUM(CASE WHEN valuation_status IN
+                               ('anomalous_balance','quarantine','exclude_from_total')
                                             THEN usd_value ELSE 0 END),0) excluded_usd
                    FROM address_token_state WHERE address=? AND chain=?""",
                 (address, chain),
@@ -2112,6 +2613,12 @@ class DB:
             status = "price_missing" if remaining else (
                 "anomalous_balance" if sums["excluded_usd"] else "complete"
             )
+            previous_status = self.conn.execute(
+                "SELECT status FROM address_chain_state WHERE address=? AND chain=?",
+                (address, chain),
+            ).fetchone()
+            if previous_status is not None and previous_status["status"] == "partial":
+                status = "partial"
             next_price = (datetime.fromtimestamp(now.timestamp() + 21600, timezone.utc).isoformat()
                           if remaining else None)
             self.conn.execute(
@@ -2160,6 +2667,8 @@ class DB:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         status = str(row.get("status") or "rpc_error")
+        deferred_tokens = {str(token).lower() for token in row.get("deferred_tokens") or []}
+        actual_failed_tokens = {str(token).lower() for token in row.get("failed_tokens") or []} - deferred_tokens
         with self._lock, self.conn:
             previous = self.conn.execute(
                 "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
@@ -2174,7 +2683,8 @@ class DB:
                 coverage_state = "history_unknown" if "history before" in str(row.get("note")) else "historical_pending"
             if token_coverage_partial and status == "partial":
                 status = "complete"
-            failed = status in {"rpc_error", "partial", "timeout"}
+            failed = (status in {"rpc_error", "timeout"}
+                      or (status == "partial" and (not deferred_tokens or bool(actual_failed_tokens))))
             failure_streak = (int(previous["failure_streak"]) if previous else 0) + 1 if failed else 0
             aggregate = self.conn.execute(
                 "SELECT MAX(last_total_usd) FROM contracts WHERE lower(address)=?", (address,)
@@ -2184,6 +2694,9 @@ class DB:
                 failure_streak, max(float(aggregate or 0), float(row.get("total_usd") or 0)),
             )
             next_retry = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
+            deferred_due = datetime.fromtimestamp(now.timestamp() + 5, timezone.utc).isoformat()
+            if deferred_tokens and status == "partial":
+                next_retry = min(next_retry, deferred_due)
             price_retry = (datetime.fromtimestamp(now.timestamp() + 21600, timezone.utc).isoformat()
                            if status == "price_missing" else None)
             has_observation = row.get("has_code") is not None and row.get("total_usd") is not None
@@ -2224,13 +2737,44 @@ class DB:
                 ),
             )
             if has_observation:
+                self.conn.execute(
+                    "DELETE FROM balance_work_items WHERE chain=? AND address=? AND kind='chain_reconcile'",
+                    (chain, address),
+                )
+                self.conn.execute(
+                    "DELETE FROM balance_work_items WHERE chain=? AND address=? "
+                    "AND kind IN ('code','native_balance')", (chain, address),
+                )
+                checked_tokens = [str(token).lower() for token in row.get("checked_tokens") or []]
+                failed_tokens = [str(token).lower() for token in row.get("failed_tokens") or []]
+                if status in {"complete", "price_missing", "anomalous_balance", "absent"}:
+                    self.conn.execute(
+                        "DELETE FROM balance_work_items WHERE chain=? AND address=? AND kind='token_balance'",
+                        (chain, address),
+                    )
+                else:
+                    self.conn.executemany(
+                        """DELETE FROM balance_work_items
+                           WHERE chain=? AND address=? AND kind='token_balance' AND asset=?""",
+                        [(chain, address, token) for token in checked_tokens],
+                    )
+                    self.conn.executemany(
+                        """INSERT INTO balance_work_items(
+                             chain,address,kind,asset,status,priority,due_at,updated_at)
+                           VALUES(?,?,'token_balance',?,'pending',50,?,?)
+                           ON CONFLICT(chain,address,kind,asset) DO UPDATE SET
+                             due_at=excluded.due_at,status='pending',updated_at=excluded.updated_at""",
+                        [(chain, address, token,
+                          deferred_due if token in deferred_tokens else
+                          datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat(),
+                          now_iso) for token in failed_tokens],
+                    )
                 if status in {"complete", "price_missing", "anomalous_balance", "absent"}:
                     self.conn.execute(
                         "DELETE FROM address_token_state WHERE address=? AND chain=?",
                         (address, chain),
                     )
                 else:
-                    checked_tokens = list(row.get("checked_tokens") or [])
                     for offset in range(0, len(checked_tokens), 500):
                         chunk = checked_tokens[offset:offset + 500]
                         placeholders = ",".join("?" for _ in chunk)
@@ -2252,6 +2796,39 @@ class DB:
                         token.get("valuation_status", "included"),
                     ) for token in token_rows],
                 )
+                self.conn.executemany(
+                    """UPDATE address_token_state SET valuation_status='stale'
+                       WHERE chain=? AND address=? AND token=?""",
+                    [(chain, address, token) for token in failed_tokens],
+                )
+                missing_metadata = [str(token["token"]).lower() for token in token_rows
+                                    if token["token"] != "native"
+                                    and int(token.get("raw_amount") or 0) > 0
+                                    and token.get("amount") is None]
+                self.conn.executemany(
+                    "DELETE FROM balance_work_items WHERE chain=? AND address=? "
+                    "AND kind='token_metadata' AND asset=?",
+                    [(chain, address, str(token["token"]).lower()) for token in token_rows
+                     if token["token"] != "native" and token.get("amount") is not None],
+                )
+                if missing_metadata:
+                    self.conn.executemany(
+                        """INSERT INTO balance_work_items(
+                             chain,address,kind,asset,status,priority,due_at,updated_at)
+                           VALUES(?,?,'token_metadata',?,'pending',60,?,?)
+                           ON CONFLICT(chain,address,kind,asset) DO UPDATE SET
+                             status='pending',due_at=excluded.due_at,
+                             lease_until=NULL,updated_at=excluded.updated_at""",
+                        [(chain, address, asset,
+                          datetime.fromtimestamp(now.timestamp() + 1800, timezone.utc).isoformat(),
+                          now_iso) for asset in missing_metadata],
+                    )
+                    next_retry = min(next_retry, datetime.fromtimestamp(
+                        now.timestamp() + 1800, timezone.utc).isoformat())
+                    self.conn.execute(
+                        "UPDATE address_chain_state SET next_retry_at=? WHERE address=? AND chain=?",
+                        (next_retry, address, chain),
+                    )
                 if status == "partial":
                     token_total = float(self.conn.execute(
                         """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
@@ -2262,7 +2839,7 @@ class DB:
                     excluded_tokens = float(self.conn.execute(
                         """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
                            WHERE address=? AND chain=? AND token!='native'
-                             AND valuation_status!='included'""",
+                             AND valuation_status IN ('anomalous_balance','quarantine','exclude_from_total')""",
                         (address, chain),
                     ).fetchone()[0])
                     included_native = float(observed("included_native_usd", 0.0) or 0.0)
@@ -2271,9 +2848,436 @@ class DB:
                            WHERE address=? AND chain=?""",
                         (token_total, token_total + included_native,
                          excluded_tokens + max(0.0, float(observed("observed_native_usd", 0.0) or 0.0) - included_native),
-                         address, chain),
+                        address, chain),
+                    )
+            elif status in {"rpc_error", "timeout", "partial"}:
+                operation = "code" if row.get("has_code") is None else (
+                    "native_balance" if row.get("native_raw") is None else None)
+                if operation is not None:
+                    self.conn.execute(
+                        """INSERT INTO balance_work_items(
+                             chain,address,kind,asset,status,priority,due_at,updated_at)
+                           VALUES(?,?,?,'','pending',80,?,?)
+                           ON CONFLICT(chain,address,kind,asset) DO UPDATE SET
+                             status='pending',due_at=excluded.due_at,
+                             lease_until=NULL,updated_at=excluded.updated_at""",
+                        (chain, address, operation, next_retry, now_iso),
                     )
             self._bump_revision_locked()
+
+    def due_token_balance_work(self, address: str, chain: str,
+                               as_of: float | None = None) -> list[sqlite3.Row]:
+        """Lazily migrate an old token-only partial chain without rescanning native/code."""
+        address = address.lower()
+        now = datetime.fromtimestamp(as_of or time.time(), timezone.utc).isoformat()
+        with self._lock, self.conn:
+            state = self.conn.execute(
+                "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
+                (address, chain),
+            ).fetchone()
+            if state is None or state["status"] != "partial" or state["has_code"] != 1 or state["native_raw"] is None:
+                return []
+            count = self.conn.execute(
+                "SELECT COUNT(*) FROM balance_work_items WHERE chain=? AND address=?",
+                (chain, address),
+            ).fetchone()[0]
+            if not count:
+                known = self.tokens_for_contract(chain, address)
+                observed = {str(row["token"]): row for row in self.conn.execute(
+                    "SELECT token,checked_at,valuation_status FROM address_token_state WHERE address=? AND chain=?",
+                    (address, chain),
+                )}
+                missing = [str(token["address"]).lower() for token in known
+                           if (str(token["address"]).lower() not in observed or
+                               observed[str(token["address"]).lower()]["valuation_status"] == "stale" or
+                               observed[str(token["address"]).lower()]["checked_at"] < state["checked_at"])]
+                self.conn.executemany(
+                    """INSERT OR IGNORE INTO balance_work_items(
+                         chain,address,kind,asset,status,priority,due_at,updated_at)
+                       VALUES(?,?,'token_balance',?,'pending',50,?,?)""",
+                    [(chain, address, token, now, now) for token in missing],
+                )
+            return self.conn.execute(
+                """SELECT * FROM balance_work_items WHERE chain=? AND address=?
+                   AND kind='token_balance' AND status='pending' AND due_at<=?
+                   ORDER BY priority DESC,due_at,asset LIMIT 20""",
+                (chain, address, now),
+            ).fetchall()
+
+    def due_balance_work(self, address: str, chain: str,
+                         as_of: float | None = None) -> list[sqlite3.Row]:
+        """Return only runnable operations; an active lease is not another failure."""
+        self.due_token_balance_work(address, chain, as_of)
+        now = datetime.fromtimestamp(time.time() if as_of is None else as_of,
+                                     timezone.utc).isoformat()
+        with self._lock:
+            return list(self.conn.execute(
+                """SELECT * FROM balance_work_items WHERE chain=? AND address=?
+                   AND status='pending' AND due_at<=?
+                   AND (lease_until IS NULL OR lease_until<=?)
+                   ORDER BY priority DESC,due_at,kind,asset LIMIT 20""",
+                (chain, address.lower(), now, now),
+            ))
+
+    def has_balance_work(self, address: str, chain: str) -> bool:
+        with self._lock:
+            return self.conn.execute(
+                """SELECT 1 FROM balance_work_items
+                   WHERE chain=? AND address=? AND status='pending' LIMIT 1""",
+                (chain, address.lower()),
+            ).fetchone() is not None
+
+    def lease_balance_work(self, address: str, chain: str, kind: str,
+                           asset: str = '', seconds: int = 180) -> bool:
+        now = datetime.now(timezone.utc)
+        due = now.isoformat()
+        until = datetime.fromtimestamp(now.timestamp() + seconds,
+                                       timezone.utc).isoformat()
+        with self._lock, self.conn:
+            result = self.conn.execute(
+                """UPDATE balance_work_items SET lease_until=?,updated_at=?
+                   WHERE chain=? AND address=? AND kind=? AND asset=?
+                     AND status='pending' AND due_at<=?
+                     AND (lease_until IS NULL OR lease_until<=?)""",
+                (until, due, chain, address.lower(), kind, asset, due, due),
+            )
+            return result.rowcount == 1
+
+    def fail_balance_work(self, address: str, chain: str, kind: str,
+                          asset: str, error: str, *, local_wait: bool = False) -> None:
+        now = datetime.now(timezone.utc)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                """SELECT failure_streak FROM balance_work_items
+                   WHERE chain=? AND address=? AND kind=? AND asset=?""",
+                (chain, address.lower(), kind, asset),
+            ).fetchone()
+            if row is None:
+                return
+            streak = int(row[0]) + (0 if local_wait else 1)
+            delay = 60 if local_wait else [1800, 7200, 28800, 86400, 259200][min(streak - 1, 4)]
+            due = datetime.fromtimestamp(now.timestamp() + delay, timezone.utc).isoformat()
+            self.conn.execute(
+                """UPDATE balance_work_items SET due_at=?,failure_streak=?,
+                     last_error=?,lease_until=NULL,updated_at=?
+                   WHERE chain=? AND address=? AND kind=? AND asset=?""",
+                (due, streak, error[:80], now.isoformat(), chain, address.lower(), kind, asset),
+            )
+            self.conn.execute(
+                """UPDATE address_chain_state SET next_retry_at=?
+                   WHERE address=? AND chain=? AND next_retry_at>?""",
+                (due, address.lower(), chain, due),
+            )
+
+    def apply_code_work(self, address: str, chain: str, has_code: bool) -> None:
+        """A code probe never overwrites saved financial observations."""
+        address = address.lower()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "DELETE FROM balance_work_items WHERE chain=? AND address=? AND kind='code'",
+                (chain, address),
+            )
+            if has_code:
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO balance_work_items(
+                         chain,address,kind,asset,status,priority,due_at,updated_at)
+                       VALUES(?,?,'native_balance','','pending',80,?,?)""",
+                    (chain, address, now, now),
+                )
+                self.conn.execute(
+                    """UPDATE address_chain_state SET has_code=1,next_retry_at=?,
+                         note='code verified; native balance pending'
+                       WHERE address=? AND chain=?""", (now, address, chain),
+                )
+            else:
+                prior = self.conn.execute(
+                    "SELECT last_success_at FROM address_chain_state WHERE address=? AND chain=?",
+                    (address, chain),
+                ).fetchone()
+                if prior is not None and prior["last_success_at"] is not None:
+                    # A contradictory later code probe must not erase old USD.
+                    self.conn.execute(
+                        """UPDATE address_chain_state SET status='partial',
+                             next_retry_at=?,note='bytecode changed; reconcile required'
+                           WHERE address=? AND chain=?""",
+                        (datetime.fromtimestamp(time.time() + 1800,
+                                                timezone.utc).isoformat(), address, chain),
+                    )
+                else:
+                    self.conn.execute(
+                        """UPDATE address_chain_state SET has_code=0,status='absent',
+                             native_raw='0',native_amount=0,observed_native_usd=0,
+                             included_native_usd=0,tokens_usd=0,total_usd=0,
+                             next_retry_at=?,note='no bytecode'
+                           WHERE address=? AND chain=?""",
+                        (datetime.fromtimestamp(time.time() + 90 * 86400,
+                                                timezone.utc).isoformat(), address, chain),
+                    )
+            self._bump_revision_locked()
+
+    def apply_native_work(self, address: str, chain: str, raw: int,
+                          amount: float, observed_usd: float | None,
+                          included_usd: float | None, valuation: str,
+                          price: float | None) -> None:
+        address = address.lower()
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO address_token_state(address,chain,token,checked_at,
+                     raw_amount,amount,symbol,price_usd,usd_value,priced,valuation_status)
+                   VALUES(?,?,'native',?,?,?,?,?,?,?,?)
+                   ON CONFLICT(address,chain,token) DO UPDATE SET
+                     checked_at=excluded.checked_at,raw_amount=excluded.raw_amount,
+                     amount=excluded.amount,price_usd=excluded.price_usd,
+                     usd_value=excluded.usd_value,priced=excluded.priced,
+                     valuation_status=excluded.valuation_status""",
+                (address, chain, now_iso, str(raw), amount, None, price,
+                 observed_usd, int(price is not None), valuation),
+            )
+            self.conn.execute(
+                "DELETE FROM balance_work_items WHERE chain=? AND address=? AND kind='native_balance'",
+                (chain, address),
+            )
+            known = self.tokens_for_contract(chain, address)
+            observed = {str(r[0]) for r in self.conn.execute(
+                "SELECT token FROM address_token_state WHERE address=? AND chain=?", (address, chain))}
+            missing = [str(token['address']).lower() for token in known
+                       if str(token['address']).lower() not in observed]
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO balance_work_items(
+                     chain,address,kind,asset,status,priority,due_at,updated_at)
+                   VALUES(?,?,'token_balance',?,'pending',50,?,?)""",
+                [(chain, address, token, now_iso, now_iso) for token in missing],
+            )
+            token_total = float(self.conn.execute(
+                """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
+                   WHERE chain=? AND address=? AND token!='native'
+                     AND valuation_status='included'""", (chain, address),
+            ).fetchone()[0])
+            token_incomplete = bool(missing) or bool(self.conn.execute(
+                """SELECT 1 FROM balance_work_items WHERE chain=? AND address=?
+                   AND kind IN ('token_balance','token_metadata') AND status='pending' LIMIT 1""",
+                (chain, address),
+            ).fetchone())
+            unpriced_token = bool(self.conn.execute(
+                """SELECT 1 FROM address_token_state WHERE chain=? AND address=?
+                   AND token!='native' AND priced=0 AND CAST(raw_amount AS INTEGER)>0 LIMIT 1""",
+                (chain, address),
+            ).fetchone())
+            due = now_iso if missing else datetime.fromtimestamp(
+                now.timestamp() + (21600 if (raw and price is None) or unpriced_token else 86400),
+                timezone.utc).isoformat()
+            if token_incomplete:
+                pending_due = self.conn.execute(
+                    """SELECT MIN(due_at) FROM balance_work_items
+                       WHERE chain=? AND address=? AND status='pending'""",
+                    (chain, address),
+                ).fetchone()[0]
+                if pending_due is not None:
+                    due = str(pending_due)
+            self.conn.execute(
+                """UPDATE address_chain_state SET checked_at=?,last_success_at=?,
+                     status=?,has_code=1,native_raw=?,native_amount=?,
+                     observed_native_usd=?,included_native_usd=?,
+                     tokens_usd=?,total_usd=?,excluded_usd=?,valuation_status=?,
+                     failure_streak=0,next_retry_at=?,price_retry_at=?,note=?
+                   WHERE address=? AND chain=?""",
+                (now_iso, now_iso,
+                 'partial' if token_incomplete else 'price_missing'
+                 if (raw and price is None) or unpriced_token else
+                 'anomalous_balance' if valuation in {'anomalous_balance', 'quarantine'}
+                 else 'complete',
+                 str(raw), amount, observed_usd, included_usd, token_total,
+                 token_total + float(included_usd or 0),
+                 max(0.0, float(observed_usd or 0) - float(included_usd or 0)),
+                 valuation,
+                 due, due if (raw and price is None) or unpriced_token else None,
+                 'token operations pending' if token_incomplete else None, address, chain),
+            )
+            self._bump_revision_locked()
+
+    def apply_token_metadata_work(self, address: str, chain: str,
+                                  asset: str, decimals: int,
+                                  symbol: str | None) -> None:
+        address = address.lower()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE tokens SET decimals=?,symbol=COALESCE(?,symbol)
+                   WHERE chain=? AND address=?""",
+                (decimals, symbol, chain, asset),
+            )
+            self.conn.execute(
+                """UPDATE address_token_state SET amount=CAST(raw_amount AS REAL)/?,
+                     symbol=COALESCE(?,symbol),priced=0,price_usd=NULL,usd_value=NULL
+                   WHERE address=? AND chain=? AND token=?""",
+                (10 ** decimals, symbol, address, chain, asset),
+            )
+            self.conn.execute(
+                """DELETE FROM balance_work_items
+                   WHERE chain=? AND address=? AND kind='token_metadata' AND asset=?""",
+                (chain, address, asset),
+            )
+            remaining = self.conn.execute(
+                """SELECT MIN(due_at) FROM balance_work_items
+                   WHERE chain=? AND address=? AND status='pending'""",
+                (chain, address),
+            ).fetchone()[0]
+            if remaining is None:
+                remaining = datetime.fromtimestamp(
+                    time.time() + 86400, timezone.utc).isoformat()
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO balance_work_items(
+                         chain,address,kind,asset,status,priority,due_at,updated_at)
+                       VALUES(?,?,'chain_reconcile','','pending',20,?,?)""",
+                    (chain, address, remaining, now),
+                )
+            self.conn.execute(
+                """UPDATE address_chain_state SET price_retry_at=?,next_retry_at=?
+                   WHERE address=? AND chain=?""",
+                (now, str(remaining), address, chain),
+            )
+            self._bump_revision_locked()
+
+    def defer_chain_work(self, address: str, chain: str, seconds: float) -> None:
+        due = datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE address_chain_state SET next_retry_at=?
+                   WHERE address=? AND chain=? AND next_retry_at<?""",
+                (due, address.lower(), chain, due),
+            )
+
+    def apply_token_balance_work(
+        self, address: str, chain: str, successes: list[dict[str, Any]],
+        failures: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Persist individual ERC-20 outcomes; never discard other observations."""
+        address = address.lower()
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        with self._lock, self.conn:
+            for token in successes:
+                asset = str(token["token"]).lower()
+                raw = int(token["raw_amount"])
+                if raw == 0:
+                    self.conn.execute(
+                        "DELETE FROM address_token_state WHERE address=? AND chain=? AND token=?",
+                        (address, chain, asset),
+                    )
+                else:
+                    self.conn.execute(
+                        """INSERT INTO address_token_state(
+                             address,chain,token,checked_at,raw_amount,amount,symbol,
+                             price_usd,usd_value,priced,valuation_status)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(address,chain,token) DO UPDATE SET
+                             checked_at=excluded.checked_at,raw_amount=excluded.raw_amount,
+                             amount=excluded.amount,symbol=excluded.symbol,
+                             price_usd=excluded.price_usd,usd_value=excluded.usd_value,
+                             priced=excluded.priced,valuation_status=excluded.valuation_status""",
+                        (address, chain, asset, now_iso, str(raw), token.get("amount"),
+                         token.get("symbol"), token.get("price_usd"), token.get("usd_value"),
+                         int(bool(token.get("priced"))), token.get("valuation_status", "included")),
+                    )
+                self.conn.execute(
+                    "DELETE FROM balance_work_items WHERE chain=? AND address=? AND kind='token_balance' AND asset=?",
+                    (chain, address, asset),
+                )
+                if raw and token.get("amount") is None:
+                    metadata_due = datetime.fromtimestamp(now.timestamp() + 1800,
+                                                          timezone.utc).isoformat()
+                    self.conn.execute(
+                        """INSERT INTO balance_work_items(
+                             chain,address,kind,asset,status,priority,due_at,updated_at)
+                           VALUES(?,?,'token_metadata',?,'pending',60,?,?)
+                           ON CONFLICT(chain,address,kind,asset) DO UPDATE SET
+                             status='pending',due_at=excluded.due_at,
+                             lease_until=NULL,updated_at=excluded.updated_at""",
+                        (chain, address, asset, metadata_due, now_iso),
+                    )
+                else:
+                    self.conn.execute(
+                        "DELETE FROM balance_work_items WHERE chain=? AND address=? "
+                        "AND kind='token_metadata' AND asset=?", (chain, address, asset),
+                    )
+            for asset, error in failures:
+                row = self.conn.execute(
+                    """SELECT failure_streak FROM balance_work_items WHERE chain=? AND address=?
+                       AND kind='token_balance' AND asset=?""",
+                    (chain, address, asset),
+                ).fetchone()
+                streak = int(row[0]) + 1 if row else 1
+                delay = balance_retry_delay("partial", 1, None, 500_000, streak)
+                due = datetime.fromtimestamp(now.timestamp() + delay * random.uniform(.8, 1.2), timezone.utc).isoformat()
+                self.conn.execute(
+                    """INSERT INTO balance_work_items(
+                         chain,address,kind,asset,status,priority,due_at,failure_streak,last_error,updated_at)
+                       VALUES(?,?,'token_balance',?,'pending',50,?,?,?,?)
+                       ON CONFLICT(chain,address,kind,asset) DO UPDATE SET
+                         due_at=excluded.due_at,failure_streak=excluded.failure_streak,
+                         last_error=excluded.last_error,updated_at=excluded.updated_at""",
+                    (chain, address, asset, due, streak, error[:80], now_iso),
+                )
+            remaining = self.conn.execute(
+                """SELECT COUNT(*) count,MIN(due_at) due_at FROM balance_work_items
+                   WHERE chain=? AND address=? AND kind IN ('token_balance','token_metadata')
+                     AND status='pending'""",
+                (chain, address),
+            ).fetchone()
+            if remaining["count"]:
+                next_due = str(remaining["due_at"])
+                note = f"{remaining['count']} ERC-20 balance operations pending"
+            else:
+                next_due = datetime.fromtimestamp(now.timestamp() + 86400, timezone.utc).isoformat()
+                note = "token retries complete; mixed snapshot awaits chain reconcile"
+                self.conn.execute(
+                    """INSERT INTO balance_work_items(
+                         chain,address,kind,asset,status,priority,due_at,updated_at)
+                       VALUES(?,?,'chain_reconcile','','pending',20,?,?)
+                       ON CONFLICT(chain,address,kind,asset) DO UPDATE SET
+                         due_at=excluded.due_at,updated_at=excluded.updated_at""",
+                    (chain, address, next_due, now_iso),
+                )
+            included = float(self.conn.execute(
+                """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
+                   WHERE address=? AND chain=? AND token!='native' AND valuation_status='included'""",
+                (address, chain),
+            ).fetchone()[0])
+            excluded_tokens = float(self.conn.execute(
+                """SELECT COALESCE(SUM(usd_value),0) FROM address_token_state
+                   WHERE address=? AND chain=? AND token!='native'
+                     AND valuation_status IN ('anomalous_balance','quarantine','exclude_from_total')""",
+                (address, chain),
+            ).fetchone()[0])
+            state = self.conn.execute(
+                "SELECT included_native_usd,observed_native_usd FROM address_chain_state WHERE address=? AND chain=?",
+                (address, chain),
+            ).fetchone()
+            native = float(state["included_native_usd"] or 0)
+            excluded_native = max(0.0, float(state["observed_native_usd"] or 0) - native)
+            unpriced = self.conn.execute(
+                """SELECT COUNT(*) FROM address_token_state WHERE address=? AND chain=?
+                   AND priced=0 AND valuation_status!='stale' AND CAST(raw_amount AS INTEGER)>0""",
+                (address, chain),
+            ).fetchone()[0]
+            price_due = (datetime.fromtimestamp(now.timestamp() + 21600, timezone.utc).isoformat()
+                         if unpriced else None)
+            self.conn.execute(
+                """UPDATE address_chain_state SET checked_at=?,last_success_at=CASE
+                     WHEN ? THEN ? ELSE last_success_at END,status='partial',
+                     tokens_usd=?,total_usd=?,excluded_usd=?,next_retry_at=?,note=?,price_retry_at=?
+                   WHERE address=? AND chain=?""",
+                (now_iso, int(bool(successes)), now_iso, included, native + included,
+                 excluded_native + excluded_tokens, next_due, note, price_due, address, chain),
+            )
+            self._bump_revision_locked()
+            return dict(self.conn.execute(
+                "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
+                (address, chain),
+            ).fetchone())
 
     def current_address_parts(
         self, address: str, chain_keys: list[str],
@@ -2317,8 +3321,8 @@ class DB:
         with self._lock, self.conn:
             if total_usd >= 150_000:
                 self.conn.execute(
-                    """UPDATE token_log_tasks SET priority=MAX(priority,50),due_at=CASE
-                         WHEN due_at>? THEN ? ELSE due_at END
+                    """UPDATE token_log_tasks SET priority=MAX(priority,50),
+                         history_due_at=CASE WHEN history_due_at>? THEN ? ELSE history_due_at END
                        WHERE address=? AND recent_complete=1 AND priority<50""",
                     (datetime.now(timezone.utc).isoformat(),
                      datetime.now(timezone.utc).isoformat(), address.lower()),
@@ -2574,7 +3578,10 @@ class DB:
                     f"""
                     SELECT a.*
                     FROM address_scans a
-                    WHERE a.id=(
+                    WHERE NOT EXISTS(SELECT 1 FROM contracts c WHERE c.address=a.address
+                                     AND c.canonical=0 AND NOT EXISTS(
+                                         SELECT 1 FROM contracts c2 WHERE c2.address=a.address AND c2.canonical=1))
+                      AND a.id=(
                         SELECT a2.id FROM address_scans a2
                         WHERE a2.address=a.address
                         ORDER BY a2.scanned_at DESC, a2.id DESC LIMIT 1
@@ -2599,7 +3606,11 @@ class DB:
         params = (min_usd,)
         with self._lock:
             cursor = self.conn.execute(
-                f"""SELECT a.* FROM address_scans a WHERE a.id=(
+                f"""SELECT a.* FROM address_scans a WHERE
+                      NOT EXISTS(SELECT 1 FROM contracts c WHERE c.address=a.address
+                                 AND c.canonical=0 AND NOT EXISTS(
+                                     SELECT 1 FROM contracts c2 WHERE c2.address=a.address AND c2.canonical=1))
+                      AND a.id=(
                       SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
                       ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)
                       AND {filters[report_kind]}
@@ -2636,7 +3647,7 @@ class DB:
                 self.conn.execute(
                     """
                     SELECT chain, source, observed_block, observed_tx, actor, first_seen_at
-                    FROM contract_discoveries WHERE lower(address)=?
+                    FROM contract_discoveries WHERE lower(address)=? AND canonical=1
                     ORDER BY first_seen_at, chain, source
                     """,
                     (address.lower(),),
@@ -2887,10 +3898,13 @@ class MethodHealth:
     last_error: str | None = None
     latency_ewma_ms: float | None = None
     success_since_resize: int = 0
+    probe_inflight: bool = False
+    probe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def available(self) -> bool:
         now = time.time()
-        return self.permanent_error is None and now >= self.cooldown_until and now >= self.circuit_until
+        return (self.permanent_error is None and now >= self.cooldown_until
+                and now >= self.circuit_until and not self.probe_inflight)
 
 
 @dataclass
@@ -2934,18 +3948,23 @@ class Endpoint:
         wait = min(cap, wait * (2 ** min(state.fail_streak - 1, 6)))
         wait *= random.uniform(0.85, 1.15)
         state.cooldown_until = time.time() + wait
-        if state.fail_streak >= 5:
-            state.circuit_until = time.time() + 300
+        if state.fail_streak >= 3:
+            state.circuit_until = max(state.circuit_until, time.time() + min(900, wait))
         state.last_error = self.last_error
         return wait
 
     def ok(self, method_group: str = "head", latency_ms: float | None = None) -> None:
         state = self.health(method_group)
-        state.fail_streak = 0
         state.ok_streak += 1
+        # Two successful serialized probes are required to close an open
+        # method breaker. The first success only moves it to half-open.
+        if state.fail_streak >= 3 and state.ok_streak < 2:
+            state.circuit_until = 0.0
+        else:
+            state.fail_streak = 0
+            state.circuit_until = 0.0
         state.success_since_resize += 1
         state.cooldown_until = 0.0
-        state.circuit_until = 0.0
         state.last_error = None
         if latency_ms is not None:
             state.latency_ewma_ms = (
@@ -2986,25 +4005,62 @@ def rpc_method_group(method: str) -> str:
 
 
 class RoleRpcLimiter:
-    """Split the global RPC budget so balance backlog cannot be starved by discovery."""
+    """Three reserved roles sharing one hard cap; idle reservations may be borrowed."""
 
-    def __init__(self, discovery: int, balance: int):
+    def __init__(self, discovery: int, balance: int, sui: int = 0):
         self.discovery_limit = max(1, int(discovery))
         self.balance_limit = max(1, int(balance))
-        self.discovery = asyncio.Semaphore(self.discovery_limit)
-        self.balance = asyncio.Semaphore(self.balance_limit)
+        self.sui_limit = max(0, int(sui))
+        self.limits = {
+            "discovery": self.discovery_limit,
+            "balance": self.balance_limit,
+            "sui": self.sui_limit,
+        }
+        self.total_limit = sum(self.limits.values())
+        self.active = {role: 0 for role in self.limits}
+        self.waiting = {role: 0 for role in self.limits}
+        self.condition = asyncio.Condition()
+
+    def _can_start(self, role: str) -> bool:
+        free = self.total_limit - sum(self.active.values())
+        if free <= 0:
+            return False
+        if self.active[role] < self.limits[role]:
+            return True
+        reserved = sum(
+            max(0, limit - self.active[other])
+            for other, limit in self.limits.items()
+            if other != role and self.waiting[other] > 0
+        )
+        return free > reserved
 
     @asynccontextmanager
-    async def slot(self):
-        semaphore = self.balance if BALANCE_RPC.get() else self.discovery
-        async with semaphore:
+    async def slot(self, role: str | None = None):
+        role = role or ("balance" if BALANCE_RPC.get() else "discovery")
+        if role not in self.limits:
+            raise ValueError(f"unknown RPC role: {role}")
+        async with self.condition:
+            self.waiting[role] += 1
+            try:
+                await self.condition.wait_for(lambda: self._can_start(role))
+                self.active[role] += 1
+            finally:
+                self.waiting[role] -= 1
+        try:
             yield
+        finally:
+            async with self.condition:
+                self.active[role] -= 1
+                self.condition.notify_all()
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, Any]:
         return {
             "discovery_limit": self.discovery_limit,
             "balance_limit": self.balance_limit,
-            "total_limit": self.discovery_limit + self.balance_limit,
+            "sui_limit": self.sui_limit,
+            "total_limit": self.total_limit,
+            "active": dict(self.active),
+            "waiting": dict(self.waiting),
         }
 
 
@@ -3036,9 +4092,9 @@ class TokenLogBudget:
         return self.global_limit, self.chain_limit
 
     async def history_available(self) -> bool:
-        async with self.lock:
-            self._trim("", time.monotonic())
-            return len(self.history_times) < max(1, self.limits()[0] // 5)
+        # History has a guaranteed scheduling turn, not a hard maximum. When
+        # recent work is absent it may use idle capacity up to the same RPC cap.
+        return True
 
     async def available_chains(self, chains: list[str]) -> list[str]:
         async with self.lock:
@@ -3057,10 +4113,8 @@ class TokenLogBudget:
                 times = self._trim(chain, now)
                 global_limit, chain_limit = self.limits()
                 history = TOKEN_LOG_HISTORY.get()
-                history_limit = max(1, global_limit // 5)
                 if (len(self.global_times) < global_limit
-                        and len(times) < chain_limit
-                        and (not history or len(self.history_times) < history_limit)):
+                        and len(times) < chain_limit):
                     self.global_times.append(now)
                     times.append(now)
                     if history:
@@ -3071,8 +4125,6 @@ class TokenLogBudget:
                     waits.append(60 - (now - self.global_times[0]))
                 if len(times) >= chain_limit:
                     waits.append(60 - (now - times[0]))
-                if history and len(self.history_times) >= history_limit:
-                    waits.append(60 - (now - self.history_times[0]))
             await asyncio.sleep(max(0.05, min(waits)))
 
 
@@ -3132,6 +4184,9 @@ class RpcPool:
         self.metric_successes = 0
         self.metric_errors: dict[str, int] = {}
         self.metric_latencies_ms: list[float] = []
+        self.recent_attempts: deque[tuple[float, bool, float, str, str, str]] = deque()
+        self.pending_metric_attempts: deque[tuple[str, str, str, str, str, float]] = deque()
+        self.active_requests = 0
         self.last_head: int | None = None
         self._batch_successes = {"block": 0, "receipt": 0, "call": 0}
         self.last_endpoint_by_group: dict[str, Endpoint] = {}
@@ -3149,9 +4204,14 @@ class RpcPool:
                 state.ok_streak = int(row["success_streak"])
                 state.cooldown_until = max(now, float(row["cooldown_until"] or 0)) if float(row["cooldown_until"] or 0) > now else 0.0
                 state.circuit_until = max(now, float(row["circuit_until"] or 0)) if float(row["circuit_until"] or 0) > now else 0.0
-                # auth/wrong-chain disablement lasts only for the process; cooldowns
-                # and learned limits survive restarts.
-                state.permanent_error = None
+                # The fingerprint is derived from the complete configured URL: a
+                # changed key/endpoint gets a fresh health row, unchanged auth
+                # failures stay disabled across scanner restarts.
+                state.permanent_error = row["permanent_error"] if row["permanent_error"] in {"auth", "wrong_chain"} else None
+                if state.permanent_error == "wrong_chain":
+                    endpoint.permanent_error = "wrong_chain"
+                elif state.permanent_error == "auth" and row["method_group"] == "head":
+                    endpoint.permanent_error = "auth"
                 state.latency_ewma_ms = row["latency_ewma_ms"]
                 state.success_since_resize = int(row["success_since_resize"] or 0)
                 limit = row["batch_limit"]
@@ -3165,7 +4225,7 @@ class RpcPool:
 
     async def __aenter__(self) -> "RpcPool":
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout, connect=15.0),
+            timeout=httpx.Timeout(self.timeout, connect=5.0),
             transport=self.transport,
         )
         return self
@@ -3270,9 +4330,19 @@ class RpcPool:
         self, ep: Endpoint, payload: Any, method_group: str = "head",
     ) -> Any:
         assert self._client
+        state = ep.health(method_group)
+        probe_reserved = False
+        if state.fail_streak >= 3:
+            async with state.probe_lock:
+                if not state.available():
+                    raise RpcError("cooldown", "method breaker probe already in flight")
+                state.probe_inflight = True
+                probe_reserved = True
         started = time.monotonic()
         self.last_endpoint_by_group[method_group] = ep
-        self.metric_requests += 1
+        attempted = False
+        success = False
+        error_kind = "ok"
         try:
             try:
                 interval = 0.2 if ep.private else 1.0
@@ -3291,11 +4361,35 @@ class RpcPool:
                         else self.global_sem
                     )
                     async with limiter:
-                        if BALANCE_RPC.get() and not ep.available(method_group):
+                        if BALANCE_RPC.get() and not (
+                            (probe_reserved and ep.permanent_error is None
+                             and time.time() >= ep.cooldown_until
+                             and state.permanent_error is None
+                             and time.time() >= state.cooldown_until
+                             and time.time() >= state.circuit_until)
+                            or ep.available(method_group)
+                        ):
                             raise RpcError("cooldown", "endpoint became unavailable while queued")
-                        response = await self._client.post(ep.url, json=payload)
+                        started = time.monotonic()
+                        attempted = True
+                        self.metric_requests += 1
+                        self.active_requests += 1
+                        try:
+                            read_timeout = (
+                                30.0 if isinstance(payload, list) else
+                                20.0 if method_group == "logs" else
+                                15.0 if method_group in {"code", "balance", "eth_call"} else
+                                12.0
+                            )
+                            response = await self._client.post(
+                                ep.url, json=payload,
+                                timeout=httpx.Timeout(connect=5.0, read=read_timeout,
+                                                      write=12.0, pool=30.0),
+                            )
+                        finally:
+                            self.active_requests -= 1
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-                raise RpcError("network", type(exc).__name__) from exc
+                raise RpcError(type(exc).__name__, type(exc).__name__) from exc
 
             body = response.text[:1200]
             if response.status_code >= 400:
@@ -3314,15 +4408,42 @@ class RpcPool:
             latency_ms = (time.monotonic() - started) * 1000
             ep.ok(method_group, latency_ms)
             self.metric_successes += 1
+            success = True
             return data
         except Exception as exc:
             kind = exc.kind if isinstance(exc, RpcError) else type(exc).__name__
-            self.metric_errors[kind] = self.metric_errors.get(kind, 0) + 1
+            error_kind = kind
+            if attempted:
+                self.metric_errors[kind] = self.metric_errors.get(kind, 0) + 1
             raise
         finally:
-            self.metric_latencies_ms.append((time.monotonic() - started) * 1000)
-            if len(self.metric_latencies_ms) > 5000:
-                del self.metric_latencies_ms[:-2500]
+            if probe_reserved:
+                state.probe_inflight = False
+            if attempted:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                self.metric_latencies_ms.append(elapsed_ms)
+                self.recent_attempts.append((time.monotonic(), success, elapsed_ms,
+                                             method_group, ep.fingerprint, error_kind))
+                self.pending_metric_attempts.append((
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00+00:00"),
+                    "token_logs" if method_group == "logs" else
+                    "balances" if BALANCE_RPC.get() else "discovery",
+                    method_group,
+                    f"{urlparse(ep.url).hostname or 'unknown'}#{ep.fingerprint}",
+                    error_kind, elapsed_ms,
+                ))
+                cutoff = time.monotonic() - 600
+                while self.recent_attempts and self.recent_attempts[0][0] < cutoff:
+                    self.recent_attempts.popleft()
+                if len(self.metric_latencies_ms) > 5000:
+                    del self.metric_latencies_ms[:-2500]
+
+    def pressure_snapshot(self, seconds: float = 300) -> tuple[int, int, float]:
+        cutoff = time.monotonic() - seconds
+        rows = [row for row in self.recent_attempts if row[0] >= cutoff]
+        latencies = sorted(row[2] for row in rows)
+        p95 = latencies[min(len(latencies) - 1, round((len(latencies) - 1) * .95))] if rows else 0.0
+        return len(rows), sum(not row[1] for row in rows), p95
 
     async def _post(
         self, payload: Any, method_group: str | None = None,
@@ -3347,6 +4468,8 @@ class RpcPool:
                         ep.disable(exc.kind)
                     else:
                         ep.health(method_group).permanent_error = exc.kind
+                    if self.health_store is not None:
+                        self.health_store.save_rpc_health(self.health_rows())
                     log.warning(
                         "[%s] %s disabled for %s (%s)",
                         self.chain,
@@ -3502,6 +4625,9 @@ class RpcPool:
     async def _probe_endpoint(self, ep: Endpoint) -> dict[str, Any]:
         """Verify chain identity and capabilities without logging a private URL."""
         row: dict[str, Any] = {"endpoint": _short_url(ep.url), "ok": False}
+        if ep.permanent_error == "auth":
+            row["error"] = "auth"
+            return row
         try:
             chain_data = await self._probe_request(
                 ep,
@@ -3515,6 +4641,12 @@ class RpcPool:
                 reason = f"wrong chain id {actual}, expected {self.expected_chain_id}"
                 ep.disable(reason)
                 raise RpcError("wrong_chain", reason, permanent=True)
+
+            if ep.permanent_error == "wrong_chain":
+                ep.permanent_error = None
+                for health in ep.method_health.values():
+                    if health.permanent_error == "wrong_chain":
+                        health.permanent_error = None
 
             head_data = await self._probe_request(
                 ep,
@@ -3554,6 +4686,8 @@ class RpcPool:
             ep.chain_verified = False
             if exc.permanent or exc.kind in ("auth", "wrong_chain"):
                 ep.disable(exc.kind)
+                if self.health_store is not None:
+                    self.health_store.save_rpc_health(self.health_rows())
             else:
                 ep.last_error = exc.kind
                 ep.health("head").last_error = exc.kind
@@ -3859,6 +4993,7 @@ class DiscoverySlots:
         self.active = {"live": 0, "backfill": 0}
         self.queues: dict[str, list[DiscoveryTicket]] = {"live": [], "backfill": []}
         self.sequence = 0
+        self.history_grants = 0
         self.lock = asyncio.Lock()
 
     def _next_ticket(self, role: str, now: float) -> DiscoveryTicket | None:
@@ -3867,7 +5002,10 @@ class DiscoverySlots:
         if not queue:
             return None
         if role == "backfill":
-            return min(queue, key=lambda ticket: ticket.sequence)
+            catchup = [ticket for ticket in queue if ticket.role == "catchup"]
+            original = [ticket for ticket in queue if ticket.role == "backfill"]
+            selected = (original if self.history_grants % 5 == 4 else catchup) or catchup or original
+            return min(selected, key=lambda ticket: ticket.sequence)
         starved = [
             ticket for ticket in queue
             if now - ticket.enqueued_at >= self.starvation_sec
@@ -3886,6 +5024,8 @@ class DiscoverySlots:
                 self.queues[role].remove(ticket)
                 ticket.granted = True
                 self.active[role] += 1
+                if role == "backfill":
+                    self.history_grants += 1
                 if not ticket.future.done():
                     ticket.future.set_result(None)
 
@@ -3917,8 +5057,9 @@ class DiscoverySlots:
         self, role: str, chain: str, lag: int = 0,
         work_timeout_sec: float | None = None, timeout_handler: Any = None,
     ):
-        if role not in self.capacity:
+        if role not in (*self.capacity, "catchup"):
             raise ValueError(f"unknown discovery role: {role}")
+        slot_role = "backfill" if role == "catchup" else role
         loop = asyncio.get_running_loop()
         async with self.lock:
             ticket = DiscoveryTicket(
@@ -3927,7 +5068,7 @@ class DiscoverySlots:
                 future=loop.create_future(),
             )
             self.sequence += 1
-            self.queues[role].append(ticket)
+            self.queues[slot_role].append(ticket)
             self._dispatch_locked()
         try:
             await ticket.future
@@ -3935,9 +5076,9 @@ class DiscoverySlots:
             async with self.lock:
                 if ticket.granted:
                     ticket.granted = False
-                    self.active[role] -= 1
-                elif ticket in self.queues[role]:
-                    self.queues[role].remove(ticket)
+                    self.active[slot_role] -= 1
+                elif ticket in self.queues[slot_role]:
+                    self.queues[slot_role].remove(ticket)
                 self._dispatch_locked()
             raise
         try:
@@ -3956,7 +5097,7 @@ class DiscoverySlots:
             async with self.lock:
                 if ticket.granted:
                     ticket.granted = False
-                    self.active[role] -= 1
+                    self.active[slot_role] -= 1
                 self._dispatch_locked()
 
 
@@ -3972,21 +5113,52 @@ class LoadGovernor:
         self.state = "normal"
         self.reason = "profile limits"
         self.recovery_since: float | None = None
-        self.token_recovery_since: float | None = None
-        self.token_limited = False
+        self.rpc_bad_since: float | None = None
+        self.rpc_severe_since: float | None = None
+        self.rpc_recovery_since: float | None = None
+        self.rpc_pressure = False
 
     def evaluate(
         self, pending: int, oldest_sec: float, live_wait_sec: float,
         now: float | None = None, sui_pending: int = 0,
         token_pending: int = 0,
+        rpc_attempts: int = 0, rpc_errors: int = 0,
+        rpc_p95_ms: float = 0.0,
     ) -> tuple[int, int]:
         now = time.monotonic() if now is None else now
         if not self.enabled:
             self.state, self.reason, self.recovery_since = "normal", "profile limits", None
             return self.base_live, self.base_backfill
         combined_pending = pending + sui_pending
+        error_rate = rpc_errors / rpc_attempts if rpc_attempts >= 50 else 0.0
+        bad_rpc = rpc_attempts >= 50 and (error_rate >= .20 or rpc_p95_ms >= 15_000)
+        severe_rpc = rpc_attempts >= 50 and error_rate >= .35
+        self.rpc_bad_since = now if bad_rpc and self.rpc_bad_since is None else self.rpc_bad_since
+        self.rpc_severe_since = now if severe_rpc and self.rpc_severe_since is None else self.rpc_severe_since
+        if not bad_rpc:
+            self.rpc_bad_since = None
+        if not severe_rpc:
+            self.rpc_severe_since = None
+        should_trip_rpc = bool(
+            (self.rpc_bad_since is not None and now - self.rpc_bad_since >= 120)
+            or (self.rpc_severe_since is not None and now - self.rpc_severe_since >= 60)
+        )
+        if should_trip_rpc:
+            self.rpc_pressure = True
+            self.rpc_recovery_since = None
+        elif self.rpc_pressure:
+            healthy = (rpc_attempts >= 50 and error_rate < .10
+                       and rpc_p95_ms < 8_000)
+            self.rpc_recovery_since = (
+                now if healthy and self.rpc_recovery_since is None
+                else self.rpc_recovery_since if healthy else None
+            )
+            if self.rpc_recovery_since is not None and now - self.rpc_recovery_since >= 600:
+                self.rpc_pressure = False
+                self.rpc_recovery_since = None
         critical = combined_pending >= 20_000 or oldest_sec >= 21_600
-        drain = combined_pending >= 5_000 or oldest_sec >= 3_600 or live_wait_sec >= 30
+        drain = (combined_pending >= 5_000 or oldest_sec >= 3_600
+                 or live_wait_sec >= 30 or self.rpc_pressure)
         if critical and self.allow_balance_only:
             self.state, self.recovery_since = "balance_only", None
         elif self.state == "balance_only":
@@ -4007,28 +5179,19 @@ class LoadGovernor:
                 self.state, self.recovery_since = "normal", None
         self.reason = (
             f"pending={pending}+sui:{sui_pending}, oldest={oldest_sec:.0f}s, "
-            f"live_wait={live_wait_sec:.0f}s, token_due={token_pending}"
+            f"live_wait={live_wait_sec:.0f}s, token_due={token_pending}, "
+            f"rpc={rpc_errors}/{rpc_attempts} p95={rpc_p95_ms:.0f}ms"
         )
-        if token_pending >= 10_000:
-            self.token_limited, self.token_recovery_since = True, None
-        elif self.token_limited:
-            if token_pending < 5_000:
-                self.token_recovery_since = now if self.token_recovery_since is None else self.token_recovery_since
-                if now - self.token_recovery_since >= 600:
-                    self.token_limited, self.token_recovery_since = False, None
-            else:
-                self.token_recovery_since = None
         if self.state == "balance_only":
             return 0, 0
-        if self.token_limited:
-            return min(self.base_live, 1), 0
         if self.state == "drain":
-            return min(self.base_live, 3), 0
+            history = 0 if self.allow_balance_only or self.rpc_pressure else min(self.base_backfill, 1)
+            return min(self.base_live, 3), history
         return self.base_live, self.base_backfill
 
     def snapshot(self) -> dict[str, Any]:
         return {"state": self.state, "reason": self.reason,
-                "token_limited": self.token_limited, "enabled": self.enabled}
+                "rpc_pressure": self.rpc_pressure, "enabled": self.enabled}
 
 
 async def collect_tx_to_contracts(
@@ -4156,7 +5319,7 @@ async def process_token_log_task(
     db: DB, chain: ChainCfg, rpc: RpcPool, task: sqlite3.Row, head: int,
 ) -> int:
     address = str(task["address"])
-    recent = not int(task["recent_complete"])
+    recent = task.get("_lane") == "recent" if isinstance(task, dict) and "_lane" in task else not int(task["recent_complete"])
     start = (
         max(int(task["first_block"]), head - 999)
         if task["recent_cursor"] is None and recent
@@ -4165,7 +5328,7 @@ async def process_token_log_task(
     end = min(head, start + max(1, min(1000, int(task["window_size"]),
                                      chain.logs_max_range)) - 1)
     if end < start:
-        db.defer_token_log_task(chain.key, address, 60)
+        db.defer_token_log_task(chain.key, address, 60, "recent" if recent else "history")
         return 0
     history_context = TOKEN_LOG_HISTORY.set(not recent)
     try:
@@ -4197,7 +5360,7 @@ async def process_token_log_task(
         relations[token] = (chain.key, address, token, "transfer_log", block)
     return db.commit_token_log_window(
         chain.key, address, end, head, list(tokens.values()), list(relations.values()),
-        recent=recent,
+        recent=recent, task_class=task.get("_class") if isinstance(task, dict) else None,
     )
 
 
@@ -4251,7 +5414,8 @@ async def token_log_loop(
             )
         except (RpcError, TimeoutError) as exc:
             kind = exc.kind if isinstance(exc, RpcError) else "timeout"
-            failures = db.fail_token_log_task(key, str(task["address"]), kind)
+            failures = db.fail_token_log_task(key, str(task["address"]), kind,
+                                              task.get("_lane") if isinstance(task, dict) else None)
             if failures >= 2:
                 pool.force_failover("logs", 300)
             log.warning(
@@ -4351,22 +5515,57 @@ async def latest_block(rpc: RpcPool) -> int:
     return hex_int(await rpc.call("eth_blockNumber", []))
 
 
+async def find_reorg_common_ancestor(db: DB, chain: str, rpc: RpcPool,
+                                     conflict_block: int) -> int | None:
+    """Compare stored canonical hashes backwards; missing history fails closed."""
+    hashes = db.discovery_hashes(chain, max(0, conflict_block - 64), conflict_block - 1)
+    number = conflict_block - 1
+    while number >= 0 and number in hashes:
+        block = await rpc.call("eth_getBlockByNumber", [hex(number), False])
+        if not isinstance(block, dict) or hex_int(block.get("number")) != number:
+            raise RpcError("partial", "ancestor lookup returned an invalid block")
+        block_hash = str(block.get("hash") or "").lower()
+        if not block_hash:
+            raise RpcError("partial", "ancestor lookup returned no hash")
+        if block_hash == hashes[number]:
+            return number
+        number -= 1
+    return None
+
+
 async def index_chain_cursor(
     db: DB, chain: ChainCfg, rpc: RpcPool, cfg: AppCfg, stop: asyncio.Event,
     role: str, slots: DiscoverySlots, from_block_override: int | None = None,
     to_block_override: int | None = None, monitor: MonitorStore | None = None,
+    gap_id: int | None = None,
 ) -> None:
-    if from_block_override is not None:
+    if from_block_override is not None and role != "catchup":
         db.advance_cursor_start(chain.key, role, from_block_override)
     known_contracts = db.contract_addresses(chain.key)
     known_active_calls = db.discovery_addresses(chain.key, "active_call")
     failures = 0
+    reorg_waiting = False
     while not stop.is_set():
         await wait_if_paused(monitor, stop)
-        cursor = db.cursor(chain.key, role)
+        cursor = db.discovery_gap(gap_id) if role == "catchup" and gap_id is not None else db.cursor(chain.key, role)
         if cursor is None:
             raise RuntimeError(f"{chain.key}/{role}: cursor not initialized")
-        if role == "backfill" and cursor["status"] == "complete":
+        if cursor["status"] == "reorg_alert":
+            if str(cursor["note"] or "").startswith("manual:"):
+                log.error("[%s/%s] deep reorg requires manual intervention", chain.key, role)
+                return
+            reorg_waiting = True
+            await asyncio.sleep(2)
+            continue
+        if cursor["status"] == "reorg_replay":
+            reorg_waiting = True
+            await asyncio.sleep(2)
+            continue
+        if reorg_waiting:
+            known_contracts = db.contract_addresses(chain.key)
+            known_active_calls = db.discovery_addresses(chain.key, "active_call")
+            reorg_waiting = False
+        if role in {"backfill", "catchup"} and cursor["status"] == "complete":
             log.info("[%s/%s] anchor %s complete", chain.key, role, cursor["anchor_block"])
             return
         try:
@@ -4382,6 +5581,8 @@ async def index_chain_cursor(
             continue
         start = int(cursor["next_block"])
         if start > target:
+            if role == "catchup":
+                return
             if role == "backfill":
                 # Empty migrated ranges are complete without manufacturing a block commit.
                 with db._lock, db.conn:
@@ -4397,9 +5598,23 @@ async def index_chain_cursor(
             continue
         end = min(target, start + max(1, rpc.block_batch) - 1)
         stage = "queued"
+        stage_started = time.monotonic()
+        stage_ms: dict[str, float] = {}
+        code_candidates = 0
+        code_rpc_checks = 0
 
         def update_stage(value: str, error: str | None = None) -> None:
-            nonlocal stage
+            nonlocal stage, stage_started
+            if value != stage:
+                elapsed_ms = max(0.0, (time.monotonic() - stage_started) * 1000)
+                stage_ms[stage] = stage_ms.get(stage, 0.0) + elapsed_ms
+                if monitor is not None:
+                    monitor.add_discovery_stage_sample(
+                        chain.key, role, stage, elapsed_ms,
+                        code_candidates if stage == "code" else 0,
+                        code_rpc_checks if stage == "code" else 0,
+                    )
+                stage_started = time.monotonic()
             group = value if value in {"blocks", "receipts", "code", "logs"} else stage
             endpoint = getattr(rpc, "last_endpoint_by_group", {}).get(group)
             endpoint_name = _short_url(endpoint.url) if endpoint is not None else None
@@ -4448,6 +5663,36 @@ async def index_chain_cursor(
                 for expected, block in zip(numbers, blocks):
                     if hex_int(block.get("number")) != expected:
                         raise RpcError("partial", f"wrong block returned for {expected}")
+                saved_hashes = db.discovery_hashes(chain.key, start - 1, end)
+                conflict_block = next((number for number, block in zip(numbers, blocks)
+                                       if number in saved_hashes and
+                                       str(block.get("hash") or "").lower() != saved_hashes[number]), None)
+                if conflict_block is None and start - 1 in saved_hashes:
+                    parent = str(blocks[0].get("parentHash") or "").lower()
+                    if parent != saved_hashes[start - 1]:
+                        conflict_block = start - 1
+                if conflict_block is not None:
+                    db.halt_discovery_on_reorg(chain.key, role, gap_id, conflict_block)
+                    try:
+                        ancestor = await find_reorg_common_ancestor(
+                            db, chain.key, rpc, conflict_block,
+                        )
+                        if ancestor is None:
+                            raise RuntimeError("common ancestor outside saved hash window")
+                        replay_id = db.begin_reorg_replay(chain.key, ancestor, conflict_block)
+                        log.warning("[%s/%s] reorg at %s; replay gap %s starts after %s",
+                                    chain.key, role, conflict_block, replay_id, ancestor)
+                        update_stage("reorg_replay", f"replay gap {replay_id} from {ancestor + 1}")
+                    except Exception as reorg_exc:
+                        update_stage("reorg_alert", type(reorg_exc).__name__)
+                        if monitor is not None:
+                            monitor.open_incident(
+                                f"reorg:{chain.key}:{role}", "critical", "reorg",
+                                f"Canonical ancestor unavailable for {chain.key} at {conflict_block}; cursor halted",
+                            )
+                    if role == "catchup":
+                        return  # The gap scheduler must pick the replay gap first.
+                    continue
                 deployments: list[dict[str, Any]] = []
                 candidates: dict[str, tuple[dict[str, Any], int]] = {}
                 for number, block in zip(numbers, blocks):
@@ -4456,7 +5701,7 @@ async def index_chain_cursor(
                             deployments.append(tx)
                         elif cfg.discover_tx_to_contracts:
                             address = normalize_evm_address(tx.get("to"))
-                            if address is not None and address not in known_active_calls:
+                            if address is not None and (role != "live" or address not in known_active_calls):
                                 candidates.setdefault(address, (tx, number))
                 receipts: list[dict[str, Any]] = []
                 update_stage("receipts")
@@ -4493,11 +5738,13 @@ async def index_chain_cursor(
                 code_checked = 0
                 if cfg.discover_tx_to_contracts:
                     update_stage("code")
+                    code_candidates = len(candidates)
                     (active_contracts, active_discoveries, cache_rows,
                      found_active, code_checked) = await collect_tx_to_contracts(
                         db, chain, rpc, cfg, candidates, known_contracts,
-                        known_active_calls, end, now,
+                        known_active_calls if role == "live" else set(), end, now,
                     )
+                    code_rpc_checks = code_checked
                 range_contracts = {
                     row[1] for row in [*direct_contracts, *active_contracts]
                 }
@@ -4506,6 +5753,9 @@ async def index_chain_cursor(
                     chain.key, role, end, [*direct_contracts, *active_contracts],
                     [*direct_discoveries, *active_discoveries], cache_rows,
                     [], [], enqueue_token_logs=cfg.discover_tokens_from_transfers,
+                    expected_start=start, gap_id=gap_id,
+                    block_hashes=[(number, str(block["hash"])) for number, block in zip(numbers, blocks)
+                                  if block.get("hash")],
                 )
                 known_contracts.update(range_contracts)
                 known_active_calls.update(found_active)
@@ -4513,8 +5763,11 @@ async def index_chain_cursor(
                 update_stage("idle")
                 rpc.grow_batch("block")
                 log.info(
-                    "[%s/%s] idx %s..%s head=%s new=%s sources=%s code=%s",
+                    "[%s/%s] idx %s..%s head=%s new=%s sources=%s code=%s "
+                    "code_candidates=%s cache_or_known=%s stages_ms=%s",
                     chain.key, role, start, end, head, inserted, source_inserted, code_checked,
+                    code_candidates, max(0, code_candidates - code_checked),
+                    {key: round(value) for key, value in stage_ms.items()},
                 )
             except Exception as exc:
                 failures += 1
@@ -4541,6 +5794,39 @@ async def index_chain_cursor(
                 )
             except asyncio.TimeoutError:
                 pass
+
+
+async def index_chain_gaps(
+    db: DB, chain: ChainCfg, rpc: RpcPool, cfg: AppCfg, stop: asyncio.Event,
+    slots: DiscoverySlots, monitor: MonitorStore | None = None,
+) -> None:
+    """Drain durable tip gaps without advancing the original backfill cursor."""
+    while not stop.is_set():
+        gap = db.next_discovery_gap(chain.key)
+        if gap is None:
+            conflict = db.pending_reorg_conflict(chain.key)
+            if conflict is not None:
+                try:
+                    ancestor = await find_reorg_common_ancestor(db, chain.key, rpc, conflict)
+                    if ancestor is None:
+                        db.mark_reorg_manual(chain.key, conflict)
+                        log.error("[%s] reorg exceeds saved hash window; manual intervention required",
+                                  chain.key)
+                    else:
+                        db.begin_reorg_replay(chain.key, ancestor, conflict)
+                        continue
+                except Exception as exc:
+                    log.warning("[%s] reorg ancestor lookup retry: %s", chain.key,
+                                type(exc).__name__)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=60 if conflict is not None else 30)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        await index_chain_cursor(
+            db, chain, rpc, cfg, stop, "catchup", slots,
+            monitor=monitor, gap_id=int(gap["id"]),
+        )
 
 
 async def index_chain(
@@ -4891,7 +6177,10 @@ async def _scan_address_chain(
                 }, []
 
             base_row["has_code"] = 1
-            tokens = db.tokens_for_contract(chain.key, address)
+            all_tokens = db.tokens_for_contract(chain.key, address)
+            deferred_tokens = [str(token["address"]).lower() for token in all_tokens[20:]]
+            selected_tokens = {str(token["address"]).lower() for token in all_tokens[:20]}
+            tokens = all_tokens[:20]
             for token in tokens:
                 if token["decimals"] is not None and token["symbol"] is not None:
                     continue
@@ -4924,7 +6213,8 @@ async def _scan_address_chain(
                         )
                     ]
                 )
-            tokens = db.tokens_for_contract(chain.key, address)
+            tokens = [token for token in db.tokens_for_contract(chain.key, address)
+                      if str(token["address"]).lower() in selected_tokens]
 
             price_keys = [llama_key(chain)] + [
                 llama_key(chain, token["address"]) for token in tokens
@@ -4996,12 +6286,13 @@ async def _scan_address_chain(
                 "valuation_status": valuation_status,
             })
             checked_tokens = ["native"]
-            failed_tokens: list[str] = []
+            failed_tokens: list[str] = list(deferred_tokens)
             base_row["checked_tokens"] = checked_tokens
             base_row["failed_tokens"] = failed_tokens
+            base_row["deferred_tokens"] = deferred_tokens
 
             holder_data = BALANCE_OF_SEL + pad_addr(address)
-            token_rpc_error = False
+            token_rpc_error = bool(deferred_tokens)
             unpriced_positive = native_raw > 0 and native_price is None
             tokens_usd = 0.0
             for offset in range(0, len(tokens), max(1, rpc.call_batch)):
@@ -5016,6 +6307,8 @@ async def _scan_address_chain(
                     ]
                 )
                 token_rpc_error |= len(part) != len(chunk)
+                if len(part) < len(chunk):
+                    failed_tokens.extend(token["address"] for token in chunk[len(part):])
 
 
                 for token, result in zip(chunk, part):
@@ -5087,7 +6380,9 @@ async def _scan_address_chain(
             known_total = (included_native_usd or 0.0) + tokens_usd
             if token_rpc_error:
                 chain_status = "partial"
-                note = "one or more token balance calls failed"
+                note = ("token balance slice pending" if deferred_tokens and
+                        len(failed_tokens) == len(deferred_tokens)
+                        else "one or more token balance calls failed")
             elif anomaly:
                 chain_status = "anomalous_balance"
                 note = anomaly_note
@@ -5143,7 +6438,206 @@ async def _scan_address_chain(
             base_row["note"] = exc.kind
         if base_row["total_usd"] is not None:
             base_row["status"] = "partial"
+            if "tokens" in locals():
+                accounted = set(base_row.get("checked_tokens") or []) | set(base_row.get("failed_tokens") or [])
+                base_row["failed_tokens"].extend(
+                    token["address"] for token in tokens
+                    if token["address"] not in accounted
+                )
         return base_row, token_rows
+
+
+async def retry_failed_token_balances(
+    db: DB, chain: ChainCfg, rpc: RpcPool, prices: PriceBook, cfg: AppCfg,
+    address: str, tasks: list[sqlite3.Row], chain_sem: asyncio.Semaphore,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Refresh only failed ERC-20 operations; keep other observations untouched."""
+    if hasattr(rpc, "active_endpoint") and rpc.active_endpoint("eth_call") == "none":
+        await rpc._verify_unchecked_fallback("eth_call")
+        if rpc.active_endpoint("eth_call") == "none":
+            db.defer_chain_work(address, chain.key, max(60, min(900, rpc._soonest_wait("eth_call"))))
+            return {"chain": chain.key, "_persisted": True}, []
+    assets = [str(task["asset"]).lower() for task in tasks]
+    token_map = {str(token["address"]).lower(): token
+                 for token in db.tokens_for_contract(chain.key, address)}
+    try:
+        await asyncio.wait_for(chain_sem.acquire(), timeout=30)
+    except asyncio.TimeoutError:
+        # Local contention is not an RPC failure; retry the chain shortly.
+        db.defer_chain_work(address, chain.key, 60)
+        return {"chain": chain.key, "_persisted": True}, []
+    policy = BALANCE_RPC.set(True)
+    successes: list[dict[str, Any]] = []
+    failures: list[tuple[str, str]] = []
+    try:
+        try:
+            head = hex_int(await rpc.call("eth_blockNumber", []))
+            tag = hex(max(0, head - chain.confirmations))
+        except Exception:
+            tag = "latest"  # Mixed observations remain partial until reconcile.
+        holder_data = BALANCE_OF_SEL + pad_addr(address)
+        for offset in range(0, len(assets), max(1, min(20, rpc.call_batch))):
+            chunk = assets[offset:offset + max(1, min(20, rpc.call_batch))]
+            try:
+                results = await rpc.batch_partial([
+                    ("eth_call", [{"to": asset, "data": holder_data}, tag])
+                    for asset in chunk
+                ])
+            except Exception as exc:
+                results = [exc] * len(chunk)
+            if len(results) < len(chunk):
+                results.extend([RpcError("partial", "missing token response")] *
+                               (len(chunk) - len(results)))
+            for asset, result in zip(chunk, results):
+                if isinstance(result, Exception) or result is None:
+                    failures.append((asset, getattr(result, "kind", type(result).__name__)))
+                    continue
+                try:
+                    raw = decode_abi_uint256(result)
+                except Exception:
+                    failures.append((asset, "malformed"))
+                    continue
+                token = token_map.get(asset)
+                if token is None:
+                    failures.append((asset, "unknown_token"))
+                    continue
+                decimals = token["decimals"]
+                if raw and decimals is None:
+                    try:
+                        value = decode_abi_uint256(await rpc.call(
+                            "eth_call", [{"to": asset, "data": DECIMALS_SEL}, tag],
+                        ))
+                        decimals = value if 0 <= value <= 36 else None
+                    except Exception:
+                        decimals = None
+                amount = raw / 10 ** int(decimals) if raw and decimals is not None else None
+                successes.append({
+                    "chain": chain.key, "token": asset, "symbol": token["symbol"] or asset[:10],
+                    "raw_amount": raw, "amount": amount, "price_usd": None,
+                    "usd_value": None, "priced": False, "valuation_status": "included",
+                })
+        try:
+            book = await prices.fetch([llama_key(chain, item["token"])
+                                       for item in successes if item["raw_amount"]])
+        except Exception:
+            book = {}
+        for item in successes:
+            if not item["raw_amount"]:
+                continue
+            price = book.get(llama_key(chain, item["token"]))
+            amount = item["amount"]
+            usd = amount * price if amount is not None and price is not None else None
+            if usd is not None and not math.isfinite(usd):
+                usd = None
+            item.update(price_usd=price, usd_value=usd, priced=usd is not None)
+            valuation_policy = db.valuation_policy(chain.key, address, item["token"])
+            if valuation_policy is not None and valuation_policy["policy"] in {"exclude_from_total", "quarantine"}:
+                item["valuation_status"] = str(valuation_policy["policy"])
+            elif suspicious_usd(usd, cfg.token_anomaly_usd) and not (
+                valuation_policy is not None and valuation_policy["policy"] == "include_verified"
+            ):
+                item["valuation_status"] = "anomalous_balance"
+                db.save_anomaly(chain.key, address, item["token"], item["raw_amount"],
+                                usd, None, None, "quarantined",
+                                {"threshold_usd": cfg.token_anomaly_usd,
+                                 "price_source": "DefiLlama", "retry": True})
+        saved = db.apply_token_balance_work(address, chain.key, successes, failures)
+        return {**saved, "_persisted": True}, successes
+    finally:
+        BALANCE_RPC.reset(policy)
+        chain_sem.release()
+
+
+async def retry_simple_balance_work(
+    db: DB, chain: ChainCfg, rpc: RpcPool | None, prices: PriceBook,
+    cfg: AppCfg, address: str, task: sqlite3.Row,
+    chain_sem: asyncio.Semaphore,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Retry one failed code/native/metadata operation, never a whole chain."""
+    kind = str(task["kind"])
+    asset = str(task["asset"])
+    if rpc is None:
+        db.fail_balance_work(address, chain.key, kind, asset, "no_rpc", local_wait=True)
+        return {"chain": chain.key, "_persisted": True}, []
+    method_group = {"code": "code", "native_balance": "balance",
+                    "token_metadata": "eth_call"}[kind]
+    if hasattr(rpc, "active_endpoint") and rpc.active_endpoint(method_group) == "none":
+        await rpc._verify_unchecked_fallback(method_group)
+        if rpc.active_endpoint(method_group) == "none":
+            db.fail_balance_work(address, chain.key, kind, asset, "rpc_cooldown",
+                                 local_wait=True)
+            return {"chain": chain.key, "_persisted": True}, []
+    if not db.lease_balance_work(address, chain.key, kind, asset):
+        return {"chain": chain.key, "_persisted": True}, []
+    try:
+        await asyncio.wait_for(chain_sem.acquire(), timeout=30)
+    except asyncio.TimeoutError:
+        db.fail_balance_work(address, chain.key, kind, asset, "local_slot_wait",
+                             local_wait=True)
+        return {"chain": chain.key, "_persisted": True}, []
+    policy_context = BALANCE_RPC.set(True)
+    try:
+        if kind == "code":
+            code = await rpc.call("eth_getCode", [address, "latest"])
+            if not isinstance(code, str) or not code.startswith("0x") or len(code) % 2:
+                raise RpcError("malformed", "eth_getCode missing result")
+            bytes.fromhex(code[2:])
+            db.apply_code_work(address, chain.key, bool(code[2:].lstrip("0")))
+        elif kind == "native_balance":
+            raw = decode_uint(await rpc.call("eth_getBalance", [address, "latest"]))
+            amount = raw / 10 ** chain.native_decimals
+            book = await prices.fetch([llama_key(chain)])
+            price = book.get(llama_key(chain))
+            observed = amount * price if price is not None else None
+            valuation = "included"
+            included = observed
+            explicit = db.valuation_policy(chain.key, address, "native")
+            if explicit is not None and explicit["policy"] in {"quarantine", "exclude_from_total"}:
+                valuation = str(explicit["policy"])
+                included = 0.0
+            elif suspicious_usd(observed, cfg.native_anomaly_usd) and not (
+                explicit is not None and explicit["policy"] == "include_verified"
+            ):
+                valuation = "anomalous_balance"
+                included = 0.0
+                db.save_anomaly(chain.key, address, "native", raw, observed,
+                                None, None, "quarantined", {"retry": "native_balance"})
+            db.apply_native_work(address, chain.key, raw, amount, observed,
+                                 included, valuation, price)
+        elif kind == "token_metadata":
+            token = next((t for t in db.tokens_for_contract(chain.key, address)
+                          if str(t["address"]).lower() == asset), None)
+            if token is None:
+                raise RpcError("malformed", "token relation no longer exists")
+            decimals = token["decimals"]
+            if decimals is None:
+                result = await rpc.call("eth_call", [{"to": asset, "data": DECIMALS_SEL}, "latest"])
+                decimals = decode_abi_uint256(result)
+            if not 0 <= int(decimals) <= 36:
+                raise RpcError("malformed", "invalid ERC-20 decimals")
+            symbol = token["symbol"]
+            if symbol is None:
+                try:
+                    symbol = decode_string(await rpc.call(
+                        "eth_call", [{"to": asset, "data": SYMBOL_SEL}, "latest"],
+                    ))
+                except Exception:
+                    pass  # Symbol is optional; decimals are needed for valuation.
+            db.apply_token_metadata_work(address, chain.key, asset, int(decimals), symbol)
+            book = await prices.fetch([llama_key(chain, asset)])
+            price = book.get(llama_key(chain, asset))
+            if price is not None:
+                db.apply_price_refresh(address, chain.key, {asset: price},
+                                       {chain.key: chain}, cfg)
+        else:
+            raise ValueError(f"unsupported balance work kind: {kind}")
+    except Exception as exc:
+        db.fail_balance_work(address, chain.key, kind, asset,
+                             getattr(exc, "kind", type(exc).__name__))
+    finally:
+        BALANCE_RPC.reset(policy_context)
+        chain_sem.release()
+    return {"chain": chain.key, "_persisted": True}, []
 
 
 class RabbyClient:
@@ -5405,11 +6899,34 @@ async def check_multichain_balances(
         due_keys = db.due_address_chains(address, list(chains), snapshot_at)
         if not due_keys:
             return
-        jobs = {
-            asyncio.create_task(scan_address_chain(
-                db, chain, pools.get(chain.key), prices, cfg, address, chain_sem,
+        async def chain_job(chain: ChainCfg):
+            rpc = pools.get(chain.key)
+            work = db.due_balance_work(address, chain.key, snapshot_at)
+            if work:
+                first = work[0]
+                if first["kind"] == "token_balance" and rpc is not None:
+                    selected = [task for task in work if task["kind"] == "token_balance"]
+                    return await retry_failed_token_balances(
+                        db, chain, rpc, prices, cfg, address, selected, chain_sem,
+                    )
+                if first["kind"] == "token_balance":
+                    db.defer_chain_work(address, chain.key, 60)
+                    return {"chain": chain.key, "_persisted": True}, []
+                if first["kind"] in {"code", "native_balance", "token_metadata"}:
+                    return await retry_simple_balance_work(
+                        db, chain, rpc, prices, cfg, address, first, chain_sem,
+                    )
+            if db.has_balance_work(address, chain.key):
+                db.defer_chain_work(address, chain.key, 60)
+                return {"chain": chain.key, "_persisted": True}, []
+            return await scan_address_chain(
+                db, chain, rpc, prices, cfg, address, chain_sem,
                 cfg.balance_chain_timeout_sec,
-            )): chain.key for chain in chains.values() if chain.key in due_keys
+            )
+
+        jobs = {
+            asyncio.create_task(chain_job(chain)): chain.key
+            for chain in chains.values() if chain.key in due_keys
         }
         try:
             done, unfinished = await asyncio.wait(jobs, timeout=cfg.balance_address_timeout_sec)
@@ -5431,7 +6948,8 @@ async def check_multichain_balances(
                     task.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
         for chain_row, tokens in results:
-            db.save_address_chain_state(address, chain_row, tokens, min_usd)
+            if not chain_row.get("_persisted"):
+                db.save_address_chain_state(address, chain_row, tokens, min_usd)
         chain_rows, token_rows = db.current_address_parts(address, list(chains))
         total_usd = sum(float(row.get("total_usd") or 0.0) for row in chain_rows)
         status, coverage = classify_address_scan(total_usd, chain_rows, min_usd)
@@ -5907,6 +7425,8 @@ async def heartbeat_loop(
         paused = monitor.setting("scanner_paused", "0") == "1"
         slot_stats = await discovery_slots.snapshot()
         governor_stats = governor.snapshot()
+        gap_stats = db.discovery_gap_snapshot()
+        balance_work_stats = db.balance_work_snapshot()
         token_log_stats = db.token_log_queue_snapshot() if cfg.discover_tokens_from_transfers else {}
         for key, values in token_log_stats.items():
             pool = pools.get(key)
@@ -5916,6 +7436,8 @@ async def heartbeat_loop(
             json.dumps({
                 "discovery_scheduler": slot_stats,
                 "load_governor": governor_stats,
+                "discovery_gaps": gap_stats,
+                "balance_work": balance_work_stats,
                 "rpc_budgets": rpc_limiter.snapshot(),
                 "token_logs": token_log_stats,
             }, separators=(",", ":")),
@@ -6022,6 +7544,10 @@ async def heartbeat_loop(
                 )
             log.info("heartbeat %s", line)
             db.save_rpc_health(pool.health_rows())
+            pending_attempts = list(pool.pending_metric_attempts)
+            monitor.add_rpc_attempts(c.key, pending_attempts)
+            for _ in range(len(pending_attempts)):
+                pool.pending_metric_attempts.popleft()
         aggregate = db.aggregate_counts()
         lines.append(
             "address_scans "
@@ -6049,6 +7575,7 @@ async def heartbeat_loop(
         prune_day = sampled_at.strftime("%Y%m%d")
         if prune_day != last_prune_day:
             monitor.prune(30)
+            db.prune_token_log_telemetry(30)
             last_prune_day = prune_day
         # короткий пинг в консоль, чтобы по ssh было видно что жив
         console.info(
@@ -6065,18 +7592,37 @@ async def heartbeat_loop(
 
 async def governor_loop(
     db: DB, slots: DiscoverySlots, governor: LoadGovernor, stop: asyncio.Event,
+    pools: dict[str, RpcPool] | None = None,
 ) -> None:
+    last_live_slot_change = 0.0
     while not stop.is_set():
         snapshot = db.balance_queue_snapshot()
         token_pending = sum(row["due"] for row in db.token_log_queue_snapshot().values())
         slot_stats = await slots.snapshot()
+        cutoff = time.monotonic() - 300
+        attempts = [row for pool in (pools or {}).values()
+                    for row in pool.recent_attempts if row[0] >= cutoff]
+        rpc_attempts = len(attempts)
+        rpc_errors = sum(not row[1] for row in attempts)
+        durations = sorted(row[2] for row in attempts)
+        rpc_p95_ms = durations[min(len(durations) - 1, round((len(durations) - 1) * .95))] if durations else 0.0
         live, backfill = governor.evaluate(
             int(snapshot.get("balance_pending") or 0),
             float(snapshot.get("balance_oldest_age_sec") or 0.0),
             float(slot_stats.get("live_max_wait_sec") or 0.0),
             sui_pending=db.sui_enrichment_pending(),
             token_pending=token_pending,
+            rpc_attempts=rpc_attempts, rpc_errors=rpc_errors,
+            rpc_p95_ms=rpc_p95_ms,
         )
+        current_live = int(slot_stats.get("live_slots") or 0)
+        if governor.state != "balance_only" and live != current_live:
+            now = time.monotonic()
+            if now - last_live_slot_change < 120:
+                live = current_live
+            else:
+                live = current_live + (1 if live > current_live else -1)
+                last_live_slot_change = now
         await slots.set_capacity(live, backfill)
         try:
             await asyncio.wait_for(stop.wait(), timeout=15)
@@ -6356,7 +7902,8 @@ async def run(args: argparse.Namespace) -> None:
     # flag.  There is no exporter process to resume on a fresh scanner run;
     # leave an accurate status until the next scheduled/on-demand export.
     global_rpc_sem = RoleRpcLimiter(
-        cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency
+        cfg.discovery_rpc_concurrency, cfg.balance_rpc_concurrency,
+        cfg.sui_rpc_concurrency,
     )
     prices = PriceBook(cfg.http_timeout_sec, cfg.price_batch_size)
     token_log_budget = TokenLogBudget(
@@ -6364,6 +7911,7 @@ async def run(args: argparse.Namespace) -> None:
     )
     pools: dict[str, RpcPool] = {}
     sui_client: BlockberryClient | None = None
+    sui_grpc_client: SuiGrpcClient | None = None
     should_export = False  # Continuous scanner never performs XLSX work.
     try:
         if sui_requested:
@@ -6376,6 +7924,16 @@ async def run(args: argparse.Namespace) -> None:
                 await sui_client.__aenter__()
             else:
                 log.warning("[sui] BLOCKBERRY_API_KEY is not configured; Sui is disabled")
+            grpc_key = os.getenv("SUI_GRPC_API_KEY", "").strip()
+            if grpc_key and sui_client is not None:
+                try:
+                    sui_grpc_client = SuiGrpcClient(
+                        grpc_key, sui_cfg, global_rpc_sem,
+                        endpoint=os.getenv("SUI_GRPC_HOST", "sui-mainnet.g.alchemy.com:443").strip(),
+                    )
+                except Exception as exc:
+                    log.warning("[sui/grpc] unavailable: %s; Blockberry remains best-effort",
+                                type(exc).__name__)
         needed = (
             balance_chains
             if not args.index_only or args.rpc_check
@@ -6458,13 +8016,30 @@ async def run(args: argparse.Namespace) -> None:
         await print_startup_status(discovery_ready, pools, db)
         for chain in discovery_ready:
             db.init_chain(chain.key, chain.start_block, cfg.discover_tx_to_contracts)
+            previous_tip = db.cursor(chain.key, "live")
             head = pools[chain.key].last_head
             if head is None:
                 head = await latest_block(pools[chain.key])
+            safe_head = max(0, int(head) - chain.confirmations)
             db.init_chain_cursors(
-                chain.key, chain.start_block,
-                max(0, int(head) - chain.confirmations), lookback=2,
+                chain.key, chain.start_block, safe_head, lookback=2,
             )
+            if previous_tip is not None and not args.once and not args.balances_only:
+                try:
+                    old_number = int(previous_tip["next_block"])
+                    if old_number + 2 < safe_head:
+                        old_block, head_block = await pools[chain.key].batch([
+                            ("eth_getBlockByNumber", [hex(old_number), False]),
+                            ("eth_getBlockByNumber", [hex(safe_head), False]),
+                        ])
+                        if isinstance(old_block, dict) and isinstance(head_block, dict):
+                            lag_sec = hex_int(head_block["timestamp"]) - hex_int(old_block["timestamp"])
+                            gap = db.reanchor_tip(chain.key, safe_head, lag_sec)
+                            if gap is not None:
+                                log.warning("[%s] tip reanchored with durable gap id=%s", chain.key, gap)
+                except Exception as exc:
+                    log.warning("[%s] tip lag check failed; retaining contiguous cursor: %s",
+                                chain.key, type(exc).__name__)
 
         if args.once:
             if cfg.run_indexer and not args.balances_only:
@@ -6486,7 +8061,7 @@ async def run(args: argparse.Namespace) -> None:
                     index_jobs.append(sui_discovery_loop(
                         sui_store, sui_client, sui_cfg, stop, once=True,
                         from_checkpoint=args.from_block, to_checkpoint=args.to_block,
-                        monitor=monitor, run_id=run_id,
+                        monitor=monitor, run_id=run_id, grpc_client=sui_grpc_client,
                     ))
                 await asyncio.gather(*index_jobs)
                 if cfg.discover_tokens_from_transfers:
@@ -6546,6 +8121,16 @@ async def run(args: argparse.Namespace) -> None:
                             name=f"idx-{chain.key}-{role}",
                         )
                     )
+                tasks.append(asyncio.create_task(
+                    supervised(
+                        f"idx-{chain.key}-catchup",
+                        lambda c=chain, p=pool: index_chain_gaps(
+                            db, c, p, cfg, stop, discovery_slots, monitor,
+                        ),
+                        stop, cfg.task_restart_sec, monitor,
+                    ),
+                    name=f"idx-{chain.key}-catchup",
+                ))
             if cfg.discover_tokens_from_transfers:
                 tasks.append(asyncio.create_task(
                     supervised(
@@ -6567,6 +8152,7 @@ async def run(args: argparse.Namespace) -> None:
                             from_checkpoint=args.from_block, to_checkpoint=args.to_block,
                             monitor=monitor, run_id=run_id,
                             discovery_allowed=lambda: governor.state != "balance_only",
+                            grpc_client=sui_grpc_client,
                         ),
                         stop, cfg.task_restart_sec, monitor,
                     ),
@@ -6631,7 +8217,7 @@ async def run(args: argparse.Namespace) -> None:
             )
         )
         tasks.append(asyncio.create_task(
-            governor_loop(db, discovery_slots, governor, stop), name="load-governor"
+            governor_loop(db, discovery_slots, governor, stop, pools), name="load-governor"
         ))
         tasks.append(
             asyncio.create_task(
@@ -6660,6 +8246,8 @@ async def run(args: argparse.Namespace) -> None:
             await pool.__aexit__(None, None, None)
         if sui_client is not None:
             await sui_client.__aexit__(None, None, None)
+        if sui_grpc_client is not None:
+            await sui_grpc_client.close()
         sui_store.close()
         db.close()
         if run_id is not None:

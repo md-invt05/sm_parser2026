@@ -284,6 +284,15 @@ class ReportBuilder:
                 error_row = conn.execute(
                     "SELECT value FROM sui_sync_state WHERE key='last_defi_error'"
                 ).fetchone()
+                coverage_row = conn.execute(
+                    "SELECT source_mode,verified_start_checkpoint,verified_next_checkpoint,"
+                    "grpc_last_error,grpc_tip_start_checkpoint,grpc_tip_next_checkpoint "
+                    "FROM sui_state WHERE id=1"
+                ).fetchone()
+                open_gaps = conn.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(end_checkpoint-next_checkpoint+1),0) "
+                    "FROM sui_checkpoint_gaps WHERE status='active'"
+                ).fetchone()
             return {
                 "packages": package_total, "new_packages": new_packages,
                 "objects": objects, "pending": pending,
@@ -294,6 +303,14 @@ class ReportBuilder:
                 "incomplete": int(statuses.get("incomplete", 0)),
                 "snapshot_age_sec": max(0.0, time.time() - last_sync) if last_sync else None,
                 "last_error": str(error_row[0]) if error_row and error_row[0] else None,
+                "coverage_mode": str(coverage_row[0]) if coverage_row else "coverage_unverified",
+                "verified_start": coverage_row[1] if coverage_row else None,
+                "verified_next": coverage_row[2] if coverage_row else None,
+                "grpc_error": coverage_row[3] if coverage_row else None,
+                "tip_start": coverage_row[4] if coverage_row else None,
+                "tip_next": coverage_row[5] if coverage_row else None,
+                "open_gaps": int(open_gaps[0]),
+                "gap_remaining": int(open_gaps[1]),
             }
         except sqlite3.Error:
             return None
@@ -334,6 +351,7 @@ class ReportBuilder:
             )
         governor = runtime_note.get("load_governor") or {} if isinstance(runtime_note, dict) else {}
         budgets = runtime_note.get("rpc_budgets") or {} if isinstance(runtime_note, dict) else {}
+        gaps = runtime_note.get("discovery_gaps") or {} if isinstance(runtime_note, dict) else {}
         if governor:
             lines.append(
                 f"Governor: {governor.get('state', 'unknown')} | {governor.get('reason', '')}"
@@ -343,14 +361,40 @@ class ReportBuilder:
                 f"RPC budget: discovery {budgets.get('discovery_limit', 0)}, "
                 f"balances {budgets.get('balance_limit', 0)}, total {budgets.get('total_limit', 0)}"
             )
+        if gaps:
+            lines.append(
+                f"Catch-up gaps: {sum(int(item.get('open_gaps', 0)) for item in gaps.values()):,}; "
+                f"remaining blocks {sum(int(item.get('remaining_blocks', 0)) for item in gaps.values()):,}"
+            )
+        balance_work = runtime_note.get("balance_work") or {} if isinstance(runtime_note, dict) else {}
+        if balance_work:
+            lines.append(
+                "Granular balance work: "
+                f"token due {int(balance_work.get('token_balance_due', 0)):,}/"
+                f"{int(balance_work.get('token_balance_total', 0)):,}; "
+                f"reconcile due {int(balance_work.get('chain_reconcile_due', 0)):,}/"
+                f"{int(balance_work.get('chain_reconcile_total', 0)):,}"
+            )
         token_logs = runtime_note.get("token_logs") or {} if isinstance(runtime_note, dict) else {}
         if token_logs:
+            completed_classes: dict[str, int] = {}
+            for item in token_logs.values():
+                for name, count in (item.get("completed_hour") or {}).items():
+                    completed_classes[name] = completed_classes.get(name, 0) + int(count)
             lines.append(
                 "Token logs: "
                 f"due {sum(int(item.get('due', 0)) for item in token_logs.values()):,}, "
+                f"recent {sum(int(item.get('recent_due', 0)) for item in token_logs.values()):,}, "
+                f"high-value {sum(int(item.get('high_value_due', 0)) for item in token_logs.values()):,}, "
+                f"retry {sum(int(item.get('retry_due', 0)) for item in token_logs.values()):,}, "
+                f"history {sum(int(item.get('history_due', 0)) for item in token_logs.values()):,}; "
                 f"partial {sum(int(item.get('partial', 0)) for item in token_logs.values()):,}, "
                 f"failed {sum(int(item.get('failed', 0)) for item in token_logs.values()):,}; "
-                f"oldest {human_duration(max(float(item.get('oldest_age_sec', 0)) for item in token_logs.values()))}"
+                f"oldest {human_duration(max(float(item.get('oldest_age_sec', 0)) for item in token_logs.values()))}; "
+                f"completed/h {completed_classes}, links/h "
+                f"{sum(int(item.get('links_hour', 0)) for item in token_logs.values()):,}, "
+                f"retry→success/h {sum(int(item.get('retry_success_hour', 0)) for item in token_logs.values()):,}; "
+                "history ETA unknown (window counts unavailable)"
             )
         if aggregate:
             lines.append(
@@ -374,6 +418,14 @@ class ReportBuilder:
                 f"TVL snapshot {human_duration(sui['snapshot_age_sec'])} old"
                 f"{' (stale)' if sui['snapshot_age_sec'] is None or sui['snapshot_age_sec'] > 1800 else ''}"
                 f"{'; provider error: ' + sui['last_error'] if sui['last_error'] else ''}"
+            )
+            lines.append(
+                f"Sui discovery: {sui['coverage_mode']} | verified checkpoints "
+                f"{sui['verified_start'] if sui['verified_start'] is not None else 'none'}.."
+                f"{(sui['verified_next'] - 1) if sui['verified_next'] is not None else 'none'}"
+                f" | tip {sui['tip_start'] if sui['tip_start'] is not None else 'none'}.."
+                f"{(sui['tip_next'] - 1) if sui['tip_next'] is not None else 'none'}"
+                f" | gaps {sui['open_gaps']} ({sui['gap_remaining']} checkpoints)"
             )
         return "\n".join(lines)
 
@@ -448,6 +500,9 @@ class ReportBuilder:
             runtime_note = {}
         governor = runtime_note.get("load_governor") or {} if isinstance(runtime_note, dict) else {}
         token_logs = runtime_note.get("token_logs") or {} if isinstance(runtime_note, dict) else {}
+        gaps = runtime_note.get("discovery_gaps") or {} if isinstance(runtime_note, dict) else {}
+        stage_10m = self.monitor.discovery_stage_summary(600)
+        rpc_failures_10m = self.monitor.rpc_failure_summary(600)
         paused_by_governor = governor.get("state") == "balance_only"
         rows = self.monitor.rows(
             """
@@ -474,9 +529,40 @@ class ReportBuilder:
                         f", endpoint {worker['endpoint'] or 'none'}"
                     )
             log_state = token_logs.get(row["chain"], {}) if row["role"] == "live" else {}
+            slow_stage = stage_10m.get(row["chain"]) if row["role"] == "live" else None
+            if slow_stage:
+                worker_text += (
+                    f"; slowest stage/10m {slow_stage['stage']} "
+                    f"avg {slow_stage['avg_ms']:.0f}ms n={slow_stage['attempts']}"
+                )
+            rpc_failure = rpc_failures_10m.get(row["chain"]) if row["role"] == "live" else None
+            if rpc_failure:
+                worker_text += (
+                    f"; RPC errors/10m {rpc_failure['workload']}/{rpc_failure['method']} "
+                    f"{rpc_failure['error']} n={rpc_failure['attempts']} "
+                    f"at {rpc_failure['endpoint']}"
+                )
+            gap_state = gaps.get(row["chain"], {}) if row["role"] == "live" else {}
+            if gap_state:
+                worker_text += (
+                    f"; catch-up gaps {gap_state.get('open_gaps', 0)}, "
+                    f"remaining {gap_state.get('remaining_blocks', 0)} blocks, "
+                    f"oldest next {gap_state.get('oldest_next_block', 'n/a')}"
+                )
+                catchup_worker = self.monitor.discovery_worker(row["chain"], "catchup")
+                if catchup_worker is not None:
+                    worker_text += (
+                        f", worker {catchup_worker['stage']} "
+                        f"{catchup_worker['range_start']}-{catchup_worker['range_end']}"
+                    )
             if log_state:
                 worker_text += (
                     f"; token logs due {log_state.get('due', 0)}, "
+                    f"recent/high/retry/history "
+                    f"{log_state.get('recent_due', 0)}/"
+                    f"{log_state.get('high_value_due', 0)}/"
+                    f"{log_state.get('retry_due', 0)}/"
+                    f"{log_state.get('history_due', 0)}, "
                     f"partial {log_state.get('partial', 0)}, "
                     f"failed {log_state.get('failed', 0)}, "
                     f"next {log_state.get('next_block', 'n/a')}, "

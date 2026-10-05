@@ -22,6 +22,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MonitoringStoreTests(unittest.TestCase):
+    def test_rpc_attempts_are_minute_aggregates_without_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            minute = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00+00:00")
+            rows = [(minute, "balances", "eth_call", "rpc.example#abcd", "ReadTimeout", 100.0),
+                    (minute, "balances", "eth_call", "rpc.example#abcd", "ReadTimeout", 200.0)]
+            store.add_rpc_attempts("ethereum", rows)
+            store.add_rpc_attempts("ethereum", rows[:1])
+            saved = store.rows("SELECT * FROM rpc_attempt_minute")
+            self.assertEqual(1, len(saved))
+            self.assertEqual(3, saved[0]["attempts"])
+            self.assertEqual(400.0, saved[0]["total_ms"])
+            self.assertEqual(200.0, saved[0]["max_ms"])
+            self.assertEqual("rpc.example#abcd", saved[0]["endpoint_label"])
+            self.assertEqual("eth_call", store.rpc_failure_summary(600)["ethereum"]["method"])
+            store.close()
+
     def test_discovery_worker_state_is_idempotent(self):
         with tempfile.TemporaryDirectory() as folder:
             store = MonitorStore(Path(folder) / "monitoring.db")
@@ -137,10 +154,11 @@ class MonitoringHelpersTests(unittest.TestCase):
             LOAD_PROFILES["high"]["discovery_live_slots"],
             LOAD_PROFILES["high"]["discovery_backfill_slots"],
         ))
-        self.assertEqual((10, 4, 6, 6, 10, 4, 1), (
+        self.assertEqual((10, 2, 6, 2, 6, 10, 4, 1), (
             LOAD_PROFILES["steady"]["global_rpc_concurrency"],
             LOAD_PROFILES["steady"]["discovery_rpc_concurrency"],
             LOAD_PROFILES["steady"]["balance_rpc_concurrency"],
+            LOAD_PROFILES["steady"]["sui_rpc_concurrency"],
             LOAD_PROFILES["steady"]["balance_concurrency"],
             LOAD_PROFILES["steady"]["balance_chain_concurrency"],
             LOAD_PROFILES["steady"]["discovery_live_slots"],

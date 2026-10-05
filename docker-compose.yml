@@ -55,6 +55,8 @@ services:
       METIS_RPC: ${METIS_RPC:-}
       HARMONY_RPC: ${HARMONY_RPC:-}
       BLOCKBERRY_API_KEY: ${BLOCKBERRY_API_KEY:-}
+      SUI_GRPC_API_KEY: ${SUI_GRPC_API_KEY:-}
+      SUI_GRPC_HOST: ${SUI_GRPC_HOST:-sui-mainnet.g.alchemy.com:443}
       SUI_RPC: ${SUI_RPC:-}
     volumes:
       - ./data:/app/data

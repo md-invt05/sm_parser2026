@@ -101,7 +101,7 @@ class ConfigAndDatabaseTests(unittest.TestCase):
                 "SELECT source FROM contract_discoveries WHERE chain='ethereum' AND address='0xabc'"
             ).fetchone()
             self.assertEqual("direct_deploy", source["source"])
-            self.assertEqual(8, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
+            self.assertEqual(12, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
             second.close()
 
     def test_upsert_contract_count_is_exact_for_executemany(self):
@@ -625,12 +625,13 @@ class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((4, 1), governor.evaluate(1_000, 100, 5, now=1401))
 
     async def test_role_rpc_limiter_keeps_separate_budgets(self):
-        limiter = scan_defi.RoleRpcLimiter(2, 3)
+        limiter = scan_defi.RoleRpcLimiter(2, 3, 1)
         discovery_active = balance_active = 0
         discovery_peak = balance_peak = 0
+        total_peak = 0
 
         async def work(balance):
-            nonlocal discovery_active, balance_active, discovery_peak, balance_peak
+            nonlocal discovery_active, balance_active, discovery_peak, balance_peak, total_peak
             token = scan_defi.BALANCE_RPC.set(balance)
             try:
                 async with limiter.slot():
@@ -640,6 +641,7 @@ class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         discovery_active += 1
                         discovery_peak = max(discovery_peak, discovery_active)
+                    total_peak = max(total_peak, discovery_active + balance_active)
                     await asyncio.sleep(0.01)
                     if balance:
                         balance_active -= 1
@@ -649,7 +651,9 @@ class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
                 scan_defi.BALANCE_RPC.reset(token)
 
         await asyncio.gather(*(work(False) for _ in range(6)), *(work(True) for _ in range(8)))
-        self.assertEqual((2, 3), (discovery_peak, balance_peak))
+        self.assertLessEqual(total_peak, 6)
+        self.assertGreaterEqual(discovery_peak, 2)
+        self.assertGreaterEqual(balance_peak, 3)
 
     async def test_dynamic_capacity_pauses_backfill_and_timeout_releases_slot(self):
         slots = scan_defi.DiscoverySlots(live_slots=1, backfill_slots=1)
@@ -706,7 +710,7 @@ class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_prefers_lag_but_waiting_thirty_seconds_wins(self):
         slots = scan_defi.DiscoverySlots(
-            live_slots=1, backfill_slots=1, starvation_sec=0.03,
+            live_slots=1, backfill_slots=1, starvation_sec=0.5,
         )
         release = asyncio.Event()
         holder_ready = asyncio.Event()
@@ -738,7 +742,7 @@ class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
         await holder_ready.wait()
         low = asyncio.create_task(worker("starved-low", 1))
         await self._wait_for(lambda: len(slots.queues["live"]) == 1)
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0.55)
         high = asyncio.create_task(worker("fresh-high", 1000))
         await self._wait_for(lambda: len(slots.queues["live"]) == 2)
         release.set()

@@ -12,6 +12,7 @@ import json
 import math
 import logging
 import os
+import re
 import random
 import sqlite3
 import threading
@@ -23,6 +24,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import httpx
+try:
+    import grpc
+    import sui_grpc_wire_pb2 as sui_wire
+except ImportError:  # Blockberry remains available without the optional gRPC runtime.
+    grpc = None
+    sui_wire = None
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -158,6 +165,8 @@ class SuiConfig:
     pool_limit: int = 5000
     pool_min_liquidity_usd: float = 25000.0
     tvl_anomaly_usd: float = 10_000_000_000.0
+    grpc_checkpoint_chunk: int = 10
+    grpc_stream_limit: int = 500
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any] | None) -> "SuiConfig":
@@ -181,6 +190,8 @@ class SuiConfig:
                 0.0, float(raw.get("pool_min_liquidity_usd", 25000))
             ),
             tvl_anomaly_usd=max(1.0, float(raw.get("tvl_anomaly_usd", 10_000_000_000))),
+            grpc_checkpoint_chunk=max(1, min(10, int(raw.get("grpc_checkpoint_chunk", 10)))),
+            grpc_stream_limit=max(1, min(500, int(raw.get("grpc_stream_limit", 500)))),
         )
 
 
@@ -196,17 +207,196 @@ class BlockberryError(RuntimeError):
         self.endpoint = endpoint
 
 
+class SuiGrpcError(RuntimeError):
+    """A failed stream never proves completion of a checkpoint."""
+
+
+class SuiGrpcClient:
+    """Small authenticated client for the pinned LedgerService wire subset.
+
+    The key is only sent in request metadata; neither URLs with credentials nor
+    the key are written to the database or logs.
+    """
+
+    def __init__(self, api_key: str, cfg: SuiConfig, limiter: Any = None,
+                 endpoint: str = "sui-mainnet.g.alchemy.com:443"):
+        if grpc is None or sui_wire is None:
+            raise SuiGrpcError("grpcio/protobuf is unavailable")
+        if not api_key.strip():
+            raise SuiGrpcError("SUI_GRPC_API_KEY is not configured")
+        # gRPC channel targets are host:port, never URLs containing credentials.
+        if not re.fullmatch(r"[A-Za-z0-9.-]+:[0-9]{1,5}", endpoint):
+            raise SuiGrpcError("SUI_GRPC_HOST must be a TLS host:port")
+        self.key = api_key.strip()
+        self.cfg = cfg
+        self.limiter = limiter
+        self.endpoint = endpoint
+        # Keep gRPC's documented 4 MiB receive ceiling explicit. Observed
+        # OnFinality RESOURCE_EXHAUSTED errors were rate-related, not oversized
+        # inbound messages; raising this limit would not solve them.
+        self.channel = grpc.aio.secure_channel(
+            endpoint, grpc.ssl_channel_credentials(),
+            options=(("grpc.max_receive_message_length", 4 * 1024 * 1024),),
+        )
+        self.metadata = (("api-key", self.key),) if endpoint.split(":", 1)[0].endswith(
+            ".onfinality.io") else (("authorization", f"Bearer {self.key}"),)
+        # Twenty requests per second is below OnFinality's stated 30/s and
+        # 144k per two hours is below its stated 400k/two-hour allowance.
+        self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
+        self._info = self.channel.unary_unary(
+            "/sui.rpc.v2.LedgerService/GetServiceInfo",
+            request_serializer=sui_wire.GetServiceInfoRequest.SerializeToString,
+            response_deserializer=sui_wire.GetServiceInfoResponse.FromString,
+        )
+        self._transactions = self.channel.unary_stream(
+            "/sui.rpc.v2.LedgerService/ListTransactions",
+            request_serializer=sui_wire.ListTransactionsRequest.SerializeToString,
+            response_deserializer=sui_wire.ListTransactionsResponse.FromString,
+        )
+        self._checkpoint = self.channel.unary_unary(
+            "/sui.rpc.v2.LedgerService/GetCheckpoint",
+            request_serializer=sui_wire.GetCheckpointRequest.SerializeToString,
+            response_deserializer=sui_wire.GetCheckpointResponse.FromString,
+        )
+        self._preflight_cache: tuple[float, dict[str, int | str]] | None = None
+
+    async def close(self) -> None:
+        await self.channel.close()
+
+    async def _pace_request(self) -> None:
+        async with self._request_lock:
+            wait = self._next_request_at - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._next_request_at = time.monotonic() + 0.05
+
+    async def checkpoint_timestamp(self, checkpoint: int) -> float:
+        request = sui_wire.GetCheckpointRequest(
+            sequence_number=checkpoint,
+            read_mask={"paths": ["sequence_number", "summary.timestamp"]},
+        )
+        async with _global_request_slot(self.limiter) if self.limiter else _no_request_slot():
+            await self._pace_request()
+            result = await self._checkpoint(request, timeout=self.cfg.timeout_sec,
+                                            metadata=self.metadata)
+        if (not result.HasField("checkpoint") or
+                not result.checkpoint.HasField("sequence_number") or
+                int(result.checkpoint.sequence_number) != checkpoint or
+                not result.checkpoint.HasField("summary") or
+                not result.checkpoint.summary.HasField("timestamp")):
+            raise SuiGrpcError("Sui gRPC checkpoint timestamp is unavailable")
+        stamp = result.checkpoint.summary.timestamp
+        return float(stamp.seconds) + float(stamp.nanos) / 1_000_000_000
+
+    async def preflight(self) -> dict[str, int | str]:
+        if self._preflight_cache is not None and time.monotonic() - self._preflight_cache[0] < 3600:
+            return self._preflight_cache[1]
+        async with _global_request_slot(self.limiter) if self.limiter else _no_request_slot():
+            await self._pace_request()
+            info = await self._info(sui_wire.GetServiceInfoRequest(),
+                                    timeout=self.cfg.timeout_sec, metadata=self.metadata)
+        if not info.HasField("chain") or info.chain.lower() != "mainnet":
+            raise SuiGrpcError("Sui gRPC endpoint is not mainnet")
+        if not info.HasField("checkpoint_height") or not info.HasField("lowest_available_checkpoint"):
+            raise SuiGrpcError("Sui gRPC service information is incomplete")
+        if info.lowest_available_checkpoint > info.checkpoint_height:
+            raise SuiGrpcError("Sui gRPC retention boundary is invalid")
+        # Verify ListTransactions itself, not merely the metadata method.
+        request = sui_wire.ListTransactionsRequest(
+            start_checkpoint=int(info.lowest_available_checkpoint),
+            end_checkpoint=int(info.lowest_available_checkpoint) + 1,
+            read_mask={"paths": ["digest", "checkpoint"]}, options={"limit": 1},
+        )
+        ended = False
+        async with _global_request_slot(self.limiter) if self.limiter else _no_request_slot():
+            await self._pace_request()
+            async for frame in self._transactions(request, timeout=self.cfg.timeout_sec,
+                                                  metadata=self.metadata):
+                ended = ended or frame.HasField("end")
+        if not ended:
+            raise SuiGrpcError("Sui gRPC preflight stream lacked QueryEnd")
+        # Item-limit QueryEnd is not evidence that a checkpoint can finish.
+        # Prove several recent bounded checkpoints before creating any tip/gap
+        # ledger. A provider that briefly serves one page and then throttles
+        # must leave Blockberry in the explicit coverage_unverified fallback.
+        sample_end = max(int(info.lowest_available_checkpoint) + 5,
+                         int(info.checkpoint_height) - 100)
+        for sample_checkpoint in range(sample_end - 5, sample_end):
+            after = None
+            for _ in range(32):
+                terminal = None
+                cursor = None
+                async for frame in self.list_range(sample_checkpoint,
+                                                   sample_checkpoint + 1, after):
+                    if frame.HasField("end"):
+                        terminal = int(frame.end.reason)
+                        cursor = bytes(frame.watermark.cursor)
+                if terminal == sui_wire.QUERY_END_REASON_CHECKPOINT_BOUND:
+                    break
+                if not cursor or cursor == after:
+                    raise SuiGrpcError("Sui gRPC recent stream did not advance")
+                after = cursor
+            else:
+                raise SuiGrpcError("Sui gRPC recent checkpoint exceeded preflight page cap")
+        cutoff = time.time() - self.cfg.discovery_days * 86400
+        lowest = int(info.lowest_available_checkpoint)
+        head = int(info.checkpoint_height)
+        if await self.checkpoint_timestamp(lowest) > cutoff:
+            raise SuiGrpcError("Sui gRPC history is shorter than configured discovery window")
+        if await self.checkpoint_timestamp(head) < cutoff:
+            raise SuiGrpcError("Sui gRPC head timestamp is older than discovery window")
+        left, right = lowest, head
+        while left < right:
+            middle = (left + right) // 2
+            if await self.checkpoint_timestamp(middle) < cutoff:
+                left = middle + 1
+            else:
+                right = middle
+        result = {"head": int(info.checkpoint_height),
+                  "lowest": lowest, "history_start": left, "chain": info.chain}
+        self._preflight_cache = (time.monotonic(), result)
+        return result
+
+    async def list_checkpoint(self, checkpoint: int, after: bytes | None = None):
+        async for frame in self.list_range(checkpoint, checkpoint + 1, after):
+            yield frame
+
+    async def list_range(self, start: int, end: int, after: bytes | None = None):
+        if end <= start or end - start > self.cfg.grpc_checkpoint_chunk:
+            raise SuiGrpcError("Sui gRPC checkpoint range exceeds configured chunk")
+        request = sui_wire.ListTransactionsRequest(
+            start_checkpoint=start, end_checkpoint=end,
+            read_mask={"paths": ["digest", "checkpoint"]},
+            options={"limit": self.cfg.grpc_stream_limit},
+        )
+        if after is not None:
+            request.options.after = after
+        # The slot covers the whole stream, not only creation of the iterator.
+        async with _global_request_slot(self.limiter) if self.limiter else _no_request_slot():
+            await self._pace_request()
+            stream = self._transactions(request, timeout=self.cfg.timeout_sec,
+                                        metadata=self.metadata)
+            async for frame in stream:
+                yield frame
+
+
+@asynccontextmanager
+async def _no_request_slot():
+    yield
+
+
 @asynccontextmanager
 async def _global_request_slot(limiter: Any):
     """Accept an asyncio semaphore or the scanner's role-aware limiter.
 
-    Sui requests are balance/enrichment work, so RoleRpcLimiter.slot() assigns
-    them to the balance budget. Keeping this adapter here avoids importing the
+    Sui has its own reservation in RoleRpcLimiter. Keeping this adapter here avoids importing the
     EVM scanner module and creating a circular dependency.
     """
     slot = getattr(limiter, "slot", None)
     if callable(slot):
-        async with slot():
+        context = slot(role="sui") if hasattr(limiter, "sui_limit") else slot()
+        async with context:
             yield
         return
     async with limiter:
@@ -223,7 +413,7 @@ class BlockberryClient:
         self.api_key = api_key.strip()
         self.cfg = cfg
         self.global_sem = global_sem or asyncio.Semaphore(cfg.balance_concurrency)
-        self.network_sem = asyncio.Semaphore(1)
+        self.network_sem = asyncio.Semaphore(2)
         self.client: httpx.AsyncClient | None = None
         self.fallback_urls = fallback_urls if fallback_urls is not None else [
             value.strip() for value in os.getenv("SUI_RPC", "").split(",") if value.strip()
@@ -523,9 +713,21 @@ UPDATE sui_schema_meta SET version=2 WHERE version<2;
 CREATE TABLE IF NOT EXISTS sui_state(
   id INTEGER PRIMARY KEY CHECK(id=1), last_checkpoint INTEGER NOT NULL DEFAULT 0,
   window_start_ms INTEGER, provider_window_limited INTEGER NOT NULL DEFAULT 1,
-  updated_at TEXT, note TEXT
+  updated_at TEXT, note TEXT,
+  verified_next_checkpoint INTEGER, verified_start_checkpoint INTEGER,
+  grpc_resume_watermark BLOB, source_mode TEXT NOT NULL DEFAULT 'coverage_unverified',
+  grpc_last_error TEXT, grpc_tip_start_checkpoint INTEGER,
+  grpc_tip_next_checkpoint INTEGER, grpc_schedule_turn INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO sui_state(id,last_checkpoint,provider_window_limited) VALUES(1,0,1);
+CREATE TABLE IF NOT EXISTS sui_checkpoint_gaps(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, start_checkpoint INTEGER NOT NULL,
+  end_checkpoint INTEGER NOT NULL, next_checkpoint INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active', reason TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sui_checkpoint_gaps_ready
+  ON sui_checkpoint_gaps(status,next_checkpoint);
 CREATE TABLE IF NOT EXISTS sui_packages(
   package_id TEXT PRIMARY KEY, lineage_id TEXT NOT NULL, name TEXT, publisher TEXT,
   version INTEGER, project_name TEXT, first_checkpoint INTEGER, last_checkpoint INTEGER,
@@ -636,7 +838,22 @@ class SuiStore:
                     )
                 if "last_error" not in seen_columns:
                     self.conn.execute("ALTER TABLE sui_seen_transactions ADD COLUMN last_error TEXT")
-                self.conn.execute("UPDATE sui_schema_meta SET version=3 WHERE version<3")
+                state_columns = {row["name"] for row in self.conn.execute(
+                    "PRAGMA table_info(sui_state)"
+                )}
+                for name, declaration in {
+                    "verified_next_checkpoint": "INTEGER",
+                    "verified_start_checkpoint": "INTEGER",
+                    "grpc_resume_watermark": "BLOB",
+                    "source_mode": "TEXT NOT NULL DEFAULT 'coverage_unverified'",
+                    "grpc_last_error": "TEXT",
+                    "grpc_tip_start_checkpoint": "INTEGER",
+                    "grpc_tip_next_checkpoint": "INTEGER",
+                    "grpc_schedule_turn": "INTEGER NOT NULL DEFAULT 0",
+                }.items():
+                    if name not in state_columns:
+                        self.conn.execute(f"ALTER TABLE sui_state ADD COLUMN {name} {declaration}")
+                self.conn.execute("UPDATE sui_schema_meta SET version=5 WHERE version<5")
 
     def close(self) -> None:
         self.conn.close()
@@ -779,6 +996,130 @@ class SuiStore:
             self.conn.execute(
                 "UPDATE sui_state SET last_checkpoint=MAX(last_checkpoint,?),window_start_ms=?,provider_window_limited=?,updated_at=?,note=? WHERE id=1",
                 (checkpoint, cutoff_ms, int(limited), utc_now(), note),
+            )
+
+    def grpc_next_checkpoint(self, lowest: int, head: int | None = None,
+                             bootstrap_start: int | None = None) -> int:
+        """Bootstrap a near-tip lane and persist every skipped checkpoint as a gap."""
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT verified_next_checkpoint,grpc_tip_next_checkpoint FROM sui_state WHERE id=1"
+            ).fetchone()
+            if row[0] is None:
+                start = max(lowest, bootstrap_start if bootstrap_start is not None else lowest)
+                tip_start = max(start, (head if head is not None else start) - 2)
+                if tip_start > start:
+                    now = utc_now()
+                    self.conn.execute(
+                        "INSERT INTO sui_checkpoint_gaps(start_checkpoint,end_checkpoint,"
+                        "next_checkpoint,status,reason,created_at,updated_at) "
+                        "VALUES(?,?,?,'active','initial_catchup',?,?)",
+                        (start, tip_start - 1, start, now, now),
+                    )
+                self.conn.execute(
+                    "UPDATE sui_state SET verified_next_checkpoint=?,verified_start_checkpoint=?,"
+                    "grpc_tip_start_checkpoint=?,grpc_tip_next_checkpoint=?,"
+                    "source_mode='grpc_partial',grpc_last_error=NULL WHERE id=1",
+                    (start, start, tip_start, tip_start),
+                )
+                return tip_start
+            current = int(row[0])
+            if current < lowest:
+                self.conn.execute(
+                    "UPDATE sui_state SET source_mode='coverage_unverified',grpc_last_error=? WHERE id=1",
+                    ("provider history starts after verified cursor",),
+                )
+                raise SuiGrpcError("provider retention leaves an unverified checkpoint gap")
+            tip_next = int(row[1]) if row[1] is not None else current
+            if tip_next < lowest:
+                raise SuiGrpcError("provider retention overtook the Sui tip cursor")
+            if row[1] is None:
+                self.conn.execute(
+                    "UPDATE sui_state SET grpc_tip_start_checkpoint=?,"
+                    "grpc_tip_next_checkpoint=? WHERE id=1", (current, current),
+                )
+            return tip_next
+
+    def grpc_schedule(self, lowest: int, head: int, chunk: int,
+                      bootstrap_start: int | None = None) -> tuple[str, int, int]:
+        """Four short tip slices per catch-up slice; idle tip lends its turn to gaps."""
+        tip_next = self.grpc_next_checkpoint(lowest, head, bootstrap_start)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT id,next_checkpoint,end_checkpoint FROM sui_checkpoint_gaps "
+                "WHERE status='active' ORDER BY next_checkpoint LIMIT 1"
+            ).fetchone()
+            turn = int(self.conn.execute(
+                "SELECT grpc_schedule_turn FROM sui_state WHERE id=1"
+            ).fetchone()[0])
+            self.conn.execute(
+                "UPDATE sui_state SET grpc_schedule_turn=? WHERE id=1", (turn + 1,)
+            )
+        if row is not None and (tip_next > head or turn % 5 == 4):
+            return "gap", int(row["next_checkpoint"]), min(
+                int(row["end_checkpoint"]) + 1, int(row["next_checkpoint"]) + chunk)
+        return "tip", tip_next, min(head + 1, tip_next + chunk)
+
+    def grpc_watermark(self, checkpoint: int, watermark: bytes) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE sui_state SET grpc_resume_watermark=? "
+                "WHERE id=1 AND (grpc_tip_next_checkpoint=? OR EXISTS("
+                "SELECT 1 FROM sui_checkpoint_gaps WHERE status='active' "
+                "AND next_checkpoint=?))",
+                (watermark, checkpoint, checkpoint),
+            )
+
+    def complete_grpc_checkpoint(self, checkpoint: int, lane: str = "tip") -> None:
+        with self._lock, self.conn:
+            now = utc_now()
+            if lane == "tip":
+                changed = self.conn.execute(
+                    "UPDATE sui_state SET grpc_tip_next_checkpoint=?,"
+                    "grpc_resume_watermark=NULL,grpc_last_error=NULL,updated_at=? "
+                    "WHERE id=1 AND grpc_tip_next_checkpoint=?",
+                    (checkpoint + 1, now, checkpoint),
+                )
+            elif lane == "gap":
+                changed = self.conn.execute(
+                    "UPDATE sui_checkpoint_gaps SET next_checkpoint=?,updated_at=?,"
+                    "status=CASE WHEN end_checkpoint<? THEN 'complete' ELSE 'active' END "
+                    "WHERE status='active' AND next_checkpoint=?",
+                    (checkpoint + 1, now, checkpoint + 1, checkpoint),
+                )
+                if changed.rowcount == 1:
+                    contiguous = self.conn.execute(
+                        "UPDATE sui_state SET verified_next_checkpoint=?,"
+                        "grpc_resume_watermark=NULL,grpc_last_error=NULL,updated_at=? "
+                        "WHERE id=1 AND verified_next_checkpoint=?",
+                        (checkpoint + 1, now, checkpoint),
+                    )
+                    if contiguous.rowcount != 1:
+                        raise SuiGrpcError("Sui catch-up cursor is not contiguous")
+            else:
+                raise ValueError(f"unknown Sui checkpoint lane: {lane}")
+            if changed.rowcount != 1:
+                raise SuiGrpcError("Sui checkpoint cursor changed during verification")
+            active = self.conn.execute(
+                "SELECT 1 FROM sui_checkpoint_gaps WHERE status='active' LIMIT 1"
+            ).fetchone()
+            if active is None:
+                self.conn.execute(
+                    "UPDATE sui_state SET verified_next_checkpoint=grpc_tip_next_checkpoint,"
+                    "source_mode='grpc_verified_from_start' WHERE id=1"
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE sui_state SET source_mode='grpc_partial' WHERE id=1"
+                )
+
+    def grpc_failure(self, error: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE sui_state SET grpc_last_error=?,updated_at=?,"
+                "source_mode=CASE WHEN verified_next_checkpoint IS NULL "
+                "THEN 'coverage_unverified' ELSE 'grpc_stale' END WHERE id=1",
+                (error[:120], utc_now()),
             )
 
     def state(self) -> sqlite3.Row:
@@ -1232,6 +1573,75 @@ async def discover_sui_once(
             "enriched": enriched, "window_limited": limited, "oldest_ms": oldest_ms}
 
 
+async def discover_sui_grpc_once(
+    store: SuiStore, client: SuiGrpcClient, cfg: SuiConfig,
+    *, info: dict[str, int | str] | None = None,
+) -> dict[str, Any]:
+    """Verify bounded checkpoints. A transaction or a mere stream EOF is not proof.
+
+    Each page must end in QueryEnd. Only CHECKPOINT_BOUND completes the
+    checkpoint. ITEM_LIMIT/SCAN_LIMIT continue from the *terminal* watermark;
+    restarting mid-checkpoint replays from its start, relying on digest PKs.
+    """
+    info = info or await client.preflight()
+    head = int(info["head"])
+    lane, checkpoint, stop_checkpoint = store.grpc_schedule(
+        int(info["lowest"]), head, cfg.grpc_checkpoint_chunk,
+        int(info["history_start"]) if "history_start" in info else None)
+    added = 0
+    verified = 0
+    range_loader = getattr(client, "list_range", None)
+    ranges = ([(checkpoint, stop_checkpoint)] if callable(range_loader) else
+              [(height, height + 1) for height in range(checkpoint, stop_checkpoint)])
+    for range_start, range_end in ranges:
+        after: bytes | None = None
+        seen_page_cursors: set[bytes] = set()
+        while True:
+            terminal = None
+            terminal_cursor: bytes | None = None
+            frame_count = 0
+            stream = (range_loader(range_start, range_end, after) if callable(range_loader)
+                      else client.list_checkpoint(range_start, after))
+            async for frame in stream:
+                frame_count += 1
+                if frame_count > cfg.grpc_stream_limit + 1:
+                    raise SuiGrpcError("Sui gRPC stream exceeded requested limit")
+                if terminal is not None or not frame.HasField("watermark") or not frame.watermark.HasField("cursor"):
+                    raise SuiGrpcError("Sui gRPC stream has malformed terminal/watermark")
+                if frame.HasField("transaction"):
+                    tx = frame.transaction
+                    if not tx.HasField("digest") or not tx.digest or not tx.HasField("checkpoint"):
+                        raise SuiGrpcError("Sui gRPC transaction lacks digest/checkpoint")
+                    if not range_start <= int(tx.checkpoint) < range_end:
+                        raise SuiGrpcError("Sui gRPC transaction is outside requested checkpoint")
+                    if not store.seen(tx.digest):
+                        store.add_seen(tx.digest, int(tx.checkpoint), None)
+                        added += 1
+                if frame.HasField("end"):
+                    terminal = int(frame.end.reason)
+                    terminal_cursor = bytes(frame.watermark.cursor)
+            if terminal is None:
+                raise SuiGrpcError("Sui gRPC stream ended without QueryEnd")
+            if terminal == sui_wire.QUERY_END_REASON_CHECKPOINT_BOUND:
+                for height in range(range_start, range_end):
+                    store.complete_grpc_checkpoint(height, lane)
+                    verified += 1
+                break
+            if terminal not in (sui_wire.QUERY_END_REASON_ITEM_LIMIT,
+                                sui_wire.QUERY_END_REASON_SCAN_LIMIT):
+                raise SuiGrpcError(f"Sui gRPC stopped before checkpoint bound ({terminal})")
+            if not terminal_cursor or terminal_cursor == after or terminal_cursor in seen_page_cursors:
+                raise SuiGrpcError("Sui gRPC watermark did not advance")
+            seen_page_cursors.add(terminal_cursor)
+            store.grpc_watermark(range_start, terminal_cursor)
+            after = terminal_cursor
+    if added:
+        store.mark_dirty()
+    return {"head": head, "new_transactions": added, "enriched": 0,
+            "verified_checkpoints": verified, "window_limited": stop_checkpoint <= head,
+            "oldest_ms": None}
+
+
 async def enrich_sui_once(store: SuiStore, client: BlockberryClient, cfg: SuiConfig) -> int:
     enriched = 0
     for row in store.pending_enrichment(cfg.raw_enrich_per_pass):
@@ -1372,12 +1782,24 @@ async def balance_sui_once(
     return latest
 
 
+def sui_grpc_retry_delay(error_kind: str, failures: int) -> float:
+    """Bounded jitter; RU rejections are much slower to probe than transport errors."""
+    if error_kind == "RESOURCE_EXHAUSTED":
+        base = min(7200.0, 900.0 * 2 ** min(max(failures - 1, 0), 3))
+    else:
+        base = min(900.0, 30.0 * 2 ** min(max(failures - 1, 0), 5))
+    return base * random.uniform(0.8, 1.2)
+
+
 async def sui_discovery_loop(
     store: SuiStore, client: BlockberryClient, cfg: SuiConfig, stop: asyncio.Event,
     *, once: bool = False, from_checkpoint: int | None = None,
     to_checkpoint: int | None = None, monitor: Any = None, run_id: int | None = None,
-    discovery_allowed: Any = None,
+    discovery_allowed: Any = None, grpc_client: SuiGrpcClient | None = None,
 ) -> None:
+    failures = 0
+    grpc_failures = 0
+    grpc_cooldown_until = 0.0
     while not stop.is_set():
         if discovery_allowed is not None and not discovery_allowed():
             try:
@@ -1385,10 +1807,42 @@ async def sui_discovery_loop(
             except asyncio.TimeoutError:
                 pass
             continue
-        result = await discover_sui_once(
-            store, client, cfg, from_checkpoint, to_checkpoint,
-            enrich=discovery_allowed is None,
-        )
+        try:
+            result = None
+            if grpc_client is not None and time.monotonic() >= grpc_cooldown_until:
+                try:
+                    info = await grpc_client.preflight()
+                    result = await discover_sui_grpc_once(store, grpc_client, cfg, info=info)
+                    grpc_failures = 0
+                except Exception as exc:
+                    # A partial stream is never promoted to verified coverage.
+                    # Blockberry remains best-effort while gRPC is cooling down.
+                    grpc_failures += 1
+                    code = getattr(exc, "code", None)
+                    error_kind = code().name if callable(code) else type(exc).__name__
+                    delay = sui_grpc_retry_delay(error_kind, grpc_failures)
+                    grpc_cooldown_until = time.monotonic() + delay
+                    store.grpc_failure(error_kind)
+                    log.warning("[sui/grpc] %s; best-effort Blockberry for %.0fs (verified cursor unchanged)",
+                                error_kind, delay)
+            if result is None:
+                result = await discover_sui_once(
+                    store, client, cfg, from_checkpoint, to_checkpoint,
+                    enrich=discovery_allowed is None,
+                )
+            failures = 0
+        except BlockberryError as exc:
+            if once:
+                raise
+            failures += 1
+            delay = min(900, 30 * 2 ** min(failures - 1, 5)) * random.uniform(0.8, 1.2)
+            log.warning("[sui/discovery] Blockberry %s at %s; retry in %ss (cursor unchanged)",
+                        exc.kind, exc.endpoint or "indexed API", delay)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            continue
         summary = store.summary()
         metrics = client.take_metrics()
         if monitor is not None:
@@ -1403,9 +1857,10 @@ async def sui_discovery_loop(
                 rpc_errors=metrics["errors"], latency_p50_ms=metrics["latency_p50_ms"],
                 latency_p95_ms=metrics["latency_p95_ms"], errors_json=metrics["errors_by_type"],
             )
-        log.info("[sui] head=%s new_tx=%s enriched=%s packages=%s limited=%s",
+        log.info("[sui] head=%s new_tx=%s enriched=%s packages=%s limited=%s source=%s verified_next=%s",
                  result["head"], result["new_transactions"], result["enriched"],
-                 summary["packages"], result["window_limited"])
+                 summary["packages"], result["window_limited"],
+                 store.state()["source_mode"], store.state()["verified_next_checkpoint"])
         if once or to_checkpoint is not None:
             return
         try:
