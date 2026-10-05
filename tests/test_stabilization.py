@@ -166,7 +166,7 @@ def test_balance_oldest_includes_due_rechecks(tmp_path):
 
 def test_governor_balance_only_and_zero_slots():
     async def run():
-        governor = scanner.LoadGovernor(True, 4, 1)
+        governor = scanner.LoadGovernor(True, 4, 1, allow_balance_only=True)
         assert governor.evaluate(25_000, 20, 0, now=0, sui_pending=100) == (0, 0)
         slots = scanner.DiscoverySlots(1, 1)
         await slots.set_capacity(0, 0)

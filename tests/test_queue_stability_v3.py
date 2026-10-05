@@ -117,11 +117,31 @@ def test_token_budget_balance_only_and_governor_hysteresis():
             scanner.TOKEN_LOG_HISTORY.reset(marker)
         assert not await budget.history_available()
     asyncio.run(check_budget())
-    governor = scanner.LoadGovernor(True, 6, 1)
+    governor = scanner.LoadGovernor(True, 6, 1, allow_balance_only=True)
     assert governor.evaluate(0, 0, 0, now=0, token_pending=10_000) == (1, 0)
     assert governor.evaluate(0, 0, 0, now=100, token_pending=4_000) == (1, 0)
     assert governor.evaluate(0, 0, 0, now=701, token_pending=4_000) == (6, 1)
     assert governor.evaluate(21_000, 0, 0, now=800) == (0, 0)
+
+
+@pytest.mark.parametrize("profile", scanner.LOAD_PROFILES)
+def test_only_steady_enters_automatic_balance_only(profile):
+    limits = scanner.LOAD_PROFILES[profile]
+    governor = scanner.LoadGovernor(
+        True, limits["discovery_live_slots"], limits["discovery_backfill_slots"],
+        allow_balance_only=profile == "steady",
+    )
+    slots = governor.evaluate(25_000, 7 * 3600, 0, now=0)
+    if profile == "steady":
+        assert governor.state == "balance_only"
+        assert slots == (0, 0)
+    else:
+        assert governor.state == "drain"
+        assert slots == (min(limits["discovery_live_slots"], 3), 0)
+        assert governor.evaluate(0, 0, 0, now=1) == slots
+        assert governor.evaluate(0, 0, 0, now=602) == (
+            limits["discovery_live_slots"], limits["discovery_backfill_slots"]
+        )
 
 
 def test_deferred_low_value_history_is_not_reported_as_runnable(tmp_path):

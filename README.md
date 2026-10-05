@@ -191,12 +191,14 @@ FIFO starvation guard; backfill uses its own FIFO queue. Current queue/slot data
 is visible in `/status` and `logs/status.txt`.
 
 For continuous server operation use `/load steady`. It splits the ten-request RPC
-budget into discovery `4` and balances `6`. At 20,000 pending EVM+Sui jobs, or
-when the oldest EVM balance job is six hours old, `balance_only` lets in-flight
+budget into discovery `4` and balances `6`. Only this profile enters automatic
+`balance_only`: at 20,000 pending EVM+Sui jobs, or when the oldest EVM balance
+job is six hours old, it lets in-flight
 discovery ranges finish and then pauses new EVM and Sui discovery. EVM balance,
 Sui enrichment and Sui TVL synchronization continue. Discovery resumes after
 ten stable minutes below 5,000 jobs and one hour oldest age. `/status` shows the
-governor state; manual `--balances-only` remains available. Discovery ranges
+governor state. Other profiles retain `drain` and token-backlog limits but keep
+some live discovery running; manual `--balances-only` remains available. Discovery ranges
 retain their cursor on timeout.
 
 ERC-20 valuations of at least $100M and Sui project TVL of at least $10B are

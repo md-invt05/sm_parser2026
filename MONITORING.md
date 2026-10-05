@@ -43,9 +43,12 @@ Available commands: `/status`, `/report`, `/networks`, `/resources`, `/errors`,
 The scanner reads the persisted `conservative`, `low`, `steady`, `normal` or `high` profile on startup.
 `steady` is the recommended 24/7 server profile: it reserves four RPC requests for
 discovery and six for balances. The protective governor applies to every profile,
-including `normal` and `high`: a large executable EVM/Sui queue pauses new
-discovery, and a large token backlog limits live discovery to one slot. Capacity
-returns only after ten stable minutes below the lower thresholds.
+including `normal` and `high`. Only `steady` enters automatic `balance_only`
+when the executable EVM/Sui queue is critical; the other profiles stay in
+`drain` with up to three live slots and no backfill. A large token backlog can
+still limit any profile to one live slot. Capacity returns only after ten stable
+minutes below the lower thresholds. Switching away from `steady` can increase
+the balance backlog because discovery continues.
 Discovery uses separate fair live/backfill queues. Profile capacities are `4/1` for
 `conservative` and `low`, `6/1` for `normal`, and `10/2` for `high`. Live waiters
 older than 30 seconds take FIFO priority; otherwise the largest lag is served first.

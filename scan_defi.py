@@ -3961,12 +3961,14 @@ class DiscoverySlots:
 
 
 class LoadGovernor:
-    """Hysteretic backpressure shared by every throughput profile."""
+    """Hysteretic backpressure, with balance-only reserved for steady."""
 
-    def __init__(self, enabled: bool, base_live: int, base_backfill: int):
+    def __init__(self, enabled: bool, base_live: int, base_backfill: int,
+                 *, allow_balance_only: bool = False):
         self.enabled = enabled
         self.base_live = base_live
         self.base_backfill = base_backfill
+        self.allow_balance_only = allow_balance_only
         self.state = "normal"
         self.reason = "profile limits"
         self.recovery_since: float | None = None
@@ -3985,7 +3987,7 @@ class LoadGovernor:
         combined_pending = pending + sui_pending
         critical = combined_pending >= 20_000 or oldest_sec >= 21_600
         drain = combined_pending >= 5_000 or oldest_sec >= 3_600 or live_wait_sec >= 30
-        if critical:
+        if critical and self.allow_balance_only:
             self.state, self.recovery_since = "balance_only", None
         elif self.state == "balance_only":
             recovered = combined_pending < 5_000 and oldest_sec < 3_600
@@ -6516,6 +6518,7 @@ async def run(args: argparse.Namespace) -> None:
             enabled=True,
             base_live=cfg.discovery_live_slots,
             base_backfill=cfg.discovery_backfill_slots,
+            allow_balance_only=profile == "steady",
         )
         initial_queue = db.monitoring_snapshot(cfg.min_usd)
         initial_live, initial_backfill = governor.evaluate(

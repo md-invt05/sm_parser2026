@@ -616,7 +616,7 @@ class MultichainBalanceTests(unittest.IsolatedAsyncioTestCase):
 
 class DiscoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
     def test_steady_governor_hysteresis(self):
-        governor = scan_defi.LoadGovernor(True, 4, 1)
+        governor = scan_defi.LoadGovernor(True, 4, 1, allow_balance_only=True)
         self.assertEqual((0, 0), governor.evaluate(25_000, 30_000, 5, now=0))
         self.assertEqual("balance_only", governor.state)
         self.assertEqual((0, 0), governor.evaluate(4_000, 3_000, 5, now=100))
