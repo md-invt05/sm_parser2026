@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -15,6 +16,24 @@ TOKEN = "0x" + "34" * 20
 
 def config():
     return scanner.load_config(ROOT / "config.yaml")
+
+
+def test_prune_token_log_telemetry_keeps_recent_minutes(tmp_path):
+    db = scanner.DB(tmp_path / "contracts.db")
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(days=31)).isoformat()
+    recent = (now - timedelta(days=1)).isoformat()
+    with db.conn:
+        db.conn.executemany(
+            "INSERT INTO token_log_minute(minute,chain,class,completed,links,retry_success) "
+            "VALUES(?,'ethereum','recent',1,0,0)",
+            [(old,), (recent,)],
+        )
+    db.prune_token_log_telemetry(30)
+    assert [row[0] for row in db.conn.execute(
+        "SELECT minute FROM token_log_minute ORDER BY minute"
+    )] == [recent]
+    db.close()
 
 
 def queue_task(db, address=ADDRESS, first=100, limited=0):

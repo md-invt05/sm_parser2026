@@ -32,7 +32,7 @@ import traceback
 from contextvars import ContextVar
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -7574,9 +7574,15 @@ async def heartbeat_loop(
         )
         prune_day = sampled_at.strftime("%Y%m%d")
         if prune_day != last_prune_day:
-            monitor.prune(30)
-            db.prune_token_log_telemetry(30)
-            last_prune_day = prune_day
+            try:
+                monitor.prune(30)
+                db.prune_token_log_telemetry(30)
+            except Exception:
+                # Housekeeping is not part of the scanner's correctness path.
+                # A transient SQLite error must not terminate all workers.
+                log.exception("heartbeat telemetry pruning failed")
+            else:
+                last_prune_day = prune_day
         # короткий пинг в консоль, чтобы по ssh было видно что жив
         console.info(
             "heartbeat  slots live=%s/%s wait=%s backfill=%s/%s wait=%s | %s",
