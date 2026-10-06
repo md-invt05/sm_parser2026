@@ -211,6 +211,24 @@ def test_governor_skips_retry_breakdown_and_status_uses_read_only_view(tmp_path)
     db.close()
 
 
+def test_event_loop_lag_monitor_reports_a_real_pause():
+    async def scenario():
+        stop = asyncio.Event()
+        with patch.object(scanner.log, "warning") as warning:
+            task = asyncio.create_task(scanner.event_loop_lag_loop(
+                stop, interval_sec=0.005, warning_sec=0.01, report_sec=0.05,
+            ))
+            await asyncio.sleep(0.02)
+            time.sleep(0.04)
+            await asyncio.sleep(0.02)
+            stop.set()
+            await task
+            assert any(call.args[0] == "[runtime] event_loop_lag %.2fs"
+                       for call in warning.call_args_list)
+
+    asyncio.run(scenario())
+
+
 def test_rpc_failure_preserves_independent_token_coverage(tmp_path):
     db = scanner.DB(tmp_path / "db.sqlite")
     db.save_address_chain_state(ADDRESS, {

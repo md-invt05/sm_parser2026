@@ -7493,6 +7493,7 @@ async def heartbeat_loop(
             break
         except asyncio.TimeoutError:
             pass
+        heartbeat_started = time.monotonic()
         sampled_at = datetime.now(timezone.utc)
         paused = monitor.setting("scanner_paused", "0") == "1"
         slot_stats = await discovery_slots.snapshot()
@@ -7501,6 +7502,7 @@ async def heartbeat_loop(
             _read_heartbeat_snapshots, db.path, cfg.min_usd,
             cfg.discover_tokens_from_transfers,
         )
+        snapshots_done = time.monotonic()
         for key, values in token_log_stats.items():
             pool = pools.get(key)
             values["endpoint"] = pool.active_endpoint("logs") if pool is not None else "none"
@@ -7515,6 +7517,7 @@ async def heartbeat_loop(
                 "token_logs": token_log_stats,
             }, separators=(",", ":")),
         )
+        runtime_done = time.monotonic()
         lines = [
             f"updated_utc {sampled_at.isoformat()}",
             (
@@ -7621,6 +7624,7 @@ async def heartbeat_loop(
             monitor.add_rpc_attempts(c.key, pending_attempts)
             for _ in range(len(pending_attempts)):
                 pool.pending_metric_attempts.popleft()
+        chains_done = time.monotonic()
         aggregate = db.aggregate_counts()
         lines.append(
             "address_scans "
@@ -7644,6 +7648,14 @@ async def heartbeat_loop(
             reports_json=reports,
             last_export_at=max(export_times) if export_times else None,
         )
+        aggregate_done = time.monotonic()
+        log.info(
+            "[runtime] heartbeat_ms snapshots=%d runtime=%d chains=%d aggregate=%d",
+            round((snapshots_done - heartbeat_started) * 1000),
+            round((runtime_done - snapshots_done) * 1000),
+            round((chains_done - runtime_done) * 1000),
+            round((aggregate_done - chains_done) * 1000),
+        )
         prune_day = sampled_at.strftime("%Y%m%d")
         if prune_day != last_prune_day:
             try:
@@ -7666,6 +7678,34 @@ async def heartbeat_loop(
             for c in selected
             ),
         )
+
+
+async def event_loop_lag_loop(
+    stop: asyncio.Event, *, interval_sec: float = 1.0,
+    warning_sec: float = 5.0, report_sec: float = 60.0,
+) -> None:
+    """Report scheduler stalls without any database or network work."""
+    clock = asyncio.get_running_loop().time
+    next_tick = clock() + interval_sec
+    last_warning = float("-inf")
+    last_report = clock()
+    samples: list[float] = []
+    while not stop.is_set():
+        await asyncio.sleep(max(0.0, next_tick - clock()))
+        now = clock()
+        lag = max(0.0, now - next_tick)
+        samples.append(lag)
+        if lag >= warning_sec and now - last_warning >= 30:
+            log.warning("[runtime] event_loop_lag %.2fs", lag)
+            last_warning = now
+        if now - last_report >= report_sec:
+            ordered = sorted(samples)
+            p95 = ordered[min(len(ordered) - 1, round((len(ordered) - 1) * .95))]
+            log.info("[runtime] event_loop_lag p95=%.2fs max=%.2fs samples=%d",
+                     p95, ordered[-1], len(ordered))
+            samples.clear()
+            last_report = now
+        next_tick = now + interval_sec
 
 
 async def governor_loop(
@@ -8406,6 +8446,9 @@ async def run(args: argparse.Namespace) -> None:
                 name="heartbeat",
             )
         )
+        tasks.append(asyncio.create_task(
+            event_loop_lag_loop(stop), name="event-loop-lag",
+        ))
         tasks.append(asyncio.create_task(
             governor_loop(db, discovery_slots, governor, stop, pools), name="load-governor"
         ))
