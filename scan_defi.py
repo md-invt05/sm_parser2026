@@ -3727,8 +3727,10 @@ class DB:
             except sqlite3.Error:
                 return 0
 
-    def balance_queue_snapshot(self, *, include_coverage: bool = False) -> dict[str, Any]:
-        """Only due work; cheap enough for the 15-second load governor."""
+    def balance_queue_snapshot(
+        self, *, include_coverage: bool = False, include_breakdown: bool = True,
+    ) -> dict[str, Any]:
+        """Count due work, optionally omitting expensive monitoring-only details."""
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         with self._lock:
@@ -3745,7 +3747,7 @@ class DB:
                 """SELECT COUNT(DISTINCT address) FROM address_chain_state
                    WHERE next_retry_at<=? AND status IN ('rpc_error','partial','timeout')""",
                 (now_iso,),
-            ).fetchone()[0])
+            ).fetchone()[0]) if include_breakdown else 0
             coverage_wait = int(self.conn.execute(
                 """SELECT COUNT(DISTINCT address) FROM address_chain_state
                    WHERE coverage_state!='verified'"""
@@ -3764,7 +3766,7 @@ class DB:
         return {
             "balance_new_pending": new_count,
             "balance_retry_pending": retry_count,
-            "balance_planned_pending": max(0, retry_count - rpc_retry),
+            "balance_planned_pending": max(0, retry_count - rpc_retry) if include_breakdown else 0,
             "balance_rpc_retry_pending": rpc_retry,
             "balance_token_coverage_waiting": coverage_wait,
             "balance_pending": new_count + retry_count,
@@ -7439,6 +7441,36 @@ async def print_startup_status(
     console.info("")
 
 
+def _read_heartbeat_snapshots(
+    path: Path, min_usd: float, include_token_logs: bool,
+) -> tuple[dict[str, Any], dict[str, int], dict[str, dict[str, Any]], dict[str, Any]]:
+    """Run expensive status reads on a separate read-only SQLite connection.
+
+    The main event loop must remain free to service active RPC sockets while
+    large aggregate queries read the production WAL.
+    """
+    view = DB(path, read_only=True)
+    try:
+        gaps = view.discovery_gap_snapshot()
+        balance_work = view.balance_work_snapshot()
+        token_logs = view.token_log_queue_snapshot() if include_token_logs else {}
+        aggregate = view.monitoring_snapshot(min_usd)
+        return gaps, balance_work, token_logs, aggregate
+    finally:
+        view.close()
+
+
+def _read_governor_inputs(path: Path) -> tuple[dict[str, Any], int, int]:
+    """Read only the fields needed to choose slots, without blocking asyncio."""
+    view = DB(path, read_only=True)
+    try:
+        queue = view.balance_queue_snapshot(include_breakdown=False)
+        token_due = sum(row["due"] for row in view.token_log_queue_snapshot().values())
+        return queue, token_due, view.sui_enrichment_pending()
+    finally:
+        view.close()
+
+
 async def heartbeat_loop(
     db: DB,
     cfg: AppCfg,
@@ -7465,9 +7497,10 @@ async def heartbeat_loop(
         paused = monitor.setting("scanner_paused", "0") == "1"
         slot_stats = await discovery_slots.snapshot()
         governor_stats = governor.snapshot()
-        gap_stats = db.discovery_gap_snapshot()
-        balance_work_stats = db.balance_work_snapshot()
-        token_log_stats = db.token_log_queue_snapshot() if cfg.discover_tokens_from_transfers else {}
+        gap_stats, balance_work_stats, token_log_stats, snapshot = await asyncio.to_thread(
+            _read_heartbeat_snapshots, db.path, cfg.min_usd,
+            cfg.discover_tokens_from_transfers,
+        )
         for key, values in token_log_stats.items():
             pool = pools.get(key)
             values["endpoint"] = pool.active_endpoint("logs") if pool is not None else "none"
@@ -7594,7 +7627,6 @@ async def heartbeat_loop(
             + " ".join(f"{status}={count}" for status, count in sorted(aggregate.items()))
         )
         write_status(status_path, lines)
-        snapshot = db.monitoring_snapshot(cfg.min_usd)
         reports: dict[str, dict[str, Any]] = {}
         export_times: list[str] = []
         for name in ("qualifying.xlsx", "below_threshold.xlsx", "incomplete.xlsx"):
@@ -7642,8 +7674,9 @@ async def governor_loop(
 ) -> None:
     last_live_slot_change = 0.0
     while not stop.is_set():
-        snapshot = db.balance_queue_snapshot()
-        token_pending = sum(row["due"] for row in db.token_log_queue_snapshot().values())
+        snapshot, token_pending, sui_pending = await asyncio.to_thread(
+            _read_governor_inputs, db.path,
+        )
         slot_stats = await slots.snapshot()
         cutoff = time.monotonic() - 300
         attempts = [row for pool in (pools or {}).values()
@@ -7656,7 +7689,7 @@ async def governor_loop(
             int(snapshot.get("balance_pending") or 0),
             float(snapshot.get("balance_oldest_age_sec") or 0.0),
             float(slot_stats.get("live_max_wait_sec") or 0.0),
-            sui_pending=db.sui_enrichment_pending(),
+            sui_pending=sui_pending,
             token_pending=token_pending,
             rpc_attempts=rpc_attempts, rpc_errors=rpc_errors,
             rpc_p95_ms=rpc_p95_ms,
@@ -8154,7 +8187,7 @@ async def run(args: argparse.Namespace) -> None:
         ]
         if not discovery_ready and sui_client is None and not args.balances_only:
             raise RuntimeError("none of the selected discovery networks has an RPC")
-        startup_queue = db.balance_queue_snapshot()
+        startup_queue = db.balance_queue_snapshot(include_breakdown=False)
         startup_balance_only = should_defer_startup_reanchor(
             profile, args.once, int(startup_queue["balance_pending"]),
             db.sui_enrichment_pending(), float(startup_queue["balance_oldest_age_sec"]),

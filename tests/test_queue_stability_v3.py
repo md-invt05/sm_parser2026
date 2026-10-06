@@ -179,6 +179,38 @@ def test_fast_governor_snapshot_skips_coverage_count(tmp_path):
     db.close()
 
 
+def test_governor_skips_retry_breakdown_and_status_uses_read_only_view(tmp_path):
+    db = scanner.DB(tmp_path / "db.sqlite")
+    db.upsert_contracts([("ethereum", ADDRESS, 1, "0x1", None, "2026-01-01")])
+    db.save_address_chain_state(ADDRESS, {
+        "chain": "ethereum", "status": "rpc_error", "has_code": 1,
+        "total_usd": 0,
+    }, [], 500_000)
+    with db.conn:
+        db.conn.execute(
+            "UPDATE address_chain_state SET next_retry_at='2020-01-01T00:00:00+00:00'"
+        )
+
+    detailed = db.balance_queue_snapshot()
+    fast = db.balance_queue_snapshot(include_breakdown=False)
+    assert detailed["balance_rpc_retry_pending"] == 1
+    assert fast["balance_pending"] == detailed["balance_pending"]
+    assert fast["balance_oldest_age_sec"] > 0
+    assert fast["balance_rpc_retry_pending"] == 0
+
+    queue, token_due, sui_pending = scanner._read_governor_inputs(db.path)
+    assert queue["balance_pending"] == fast["balance_pending"]
+    assert token_due == sui_pending == 0
+    gaps, balance_work, token_logs, aggregate = scanner._read_heartbeat_snapshots(
+        db.path, 500_000, True,
+    )
+    assert gaps == {}
+    assert balance_work == {}
+    assert token_logs == {}
+    assert aggregate["balance_rpc_retry_pending"] == 1
+    db.close()
+
+
 def test_rpc_failure_preserves_independent_token_coverage(tmp_path):
     db = scanner.DB(tmp_path / "db.sqlite")
     db.save_address_chain_state(ADDRESS, {
