@@ -240,8 +240,13 @@ class SuiGrpcClient:
             endpoint, grpc.ssl_channel_credentials(),
             options=(("grpc.max_receive_message_length", 4 * 1024 * 1024),),
         )
-        self.metadata = (("api-key", self.key),) if endpoint.split(":", 1)[0].endswith(
-            ".onfinality.io") else (("authorization", f"Bearer {self.key}"),)
+        hostname = endpoint.split(":", 1)[0]
+        if hostname.endswith(".onfinality.io"):
+            self.metadata = (("api-key", self.key),)
+        elif hostname.endswith(".chainstack.com"):
+            self.metadata = (("x-token", self.key),)
+        else:
+            self.metadata = (("authorization", f"Bearer {self.key}"),)
         # Twenty requests per second is below OnFinality's stated 30/s and
         # 144k per two hours is below its stated 400k/two-hour allowance.
         self._request_lock = asyncio.Lock()
@@ -381,6 +386,106 @@ class SuiGrpcClient:
                                         metadata=self.metadata)
             async for frame in stream:
                 yield frame
+
+
+class SuiGrpcFailover:
+    """Two providers, one external checkpoint ledger; never continue a failed stream."""
+
+    def __init__(self, primary: SuiGrpcClient, fallback: SuiGrpcClient):
+        self.clients = (primary, fallback)
+        self.active = 0
+        self.failures = [0, 0]
+        self.disabled = [False, False]
+        self.cooldown_until = [0.0, 0.0]
+        self.primary_probe_successes = 0
+
+    @property
+    def provider(self) -> str:
+        return self.clients[self.active].endpoint.split(":", 1)[0]
+
+    async def close(self) -> None:
+        for client in self.clients:
+            await client.close()
+
+    @staticmethod
+    def _error_kind(exc: Exception) -> str:
+        code = getattr(exc, "code", None)
+        if callable(code):
+            value = code()
+            return getattr(value, "name", type(exc).__name__)
+        if isinstance(exc, SuiGrpcError) and "not mainnet" in str(exc):
+            return "WRONG_CHAIN"
+        return type(exc).__name__
+
+    def _failed(self, index: int, exc: Exception) -> None:
+        kind = self._error_kind(exc)
+        self.failures[index] += 1
+        if index == 0:
+            self.primary_probe_successes = 0
+        if kind in {"UNAUTHENTICATED", "PERMISSION_DENIED", "WRONG_CHAIN"}:
+            self.disabled[index] = True
+        elif kind == "RESOURCE_EXHAUSTED":
+            self.cooldown_until[index] = time.monotonic() + sui_grpc_retry_delay(kind, self.failures[index])
+        elif self.failures[index] >= 2:
+            self.cooldown_until[index] = time.monotonic() + sui_grpc_retry_delay(kind, self.failures[index])
+        if index == self.active and (self.disabled[index] or
+                                     kind == "RESOURCE_EXHAUSTED" or
+                                     self.failures[index] >= 2):
+            other = 1 - index
+            if not self.disabled[other] and time.monotonic() >= self.cooldown_until[other]:
+                self.active = other
+
+    async def _probe_primary(self) -> None:
+        if self.active != 1 or self.disabled[0] or time.monotonic() < self.cooldown_until[0]:
+            return
+        primary = self.clients[0]
+        # A cached preflight is not one of the two independent recovery probes.
+        primary._preflight_cache = None
+        try:
+            await primary.preflight()
+        except Exception as exc:
+            self._failed(0, exc)
+            self.primary_probe_successes = 0
+            return
+        self.primary_probe_successes += 1
+        if self.primary_probe_successes >= 2:
+            self.active = 0
+            self.failures[0] = 0
+            self.primary_probe_successes = 0
+        else:
+            self.cooldown_until[0] = time.monotonic() + 60
+
+    async def preflight(self) -> dict[str, int | str]:
+        await self._probe_primary()
+        index = self.active
+        if self.disabled[index] or time.monotonic() < self.cooldown_until[index]:
+            other = 1 - index
+            if self.disabled[other] or time.monotonic() < self.cooldown_until[other]:
+                raise SuiGrpcError("both Sui gRPC providers are cooling down")
+            self.active = index = other
+        try:
+            return await self.clients[index].preflight()
+        except Exception as exc:
+            self._failed(index, exc)
+            if self.active != index:
+                try:
+                    return await self.clients[self.active].preflight()
+                except Exception as fallback_exc:
+                    self._failed(self.active, fallback_exc)
+                    raise
+            raise
+
+    async def list_range(self, start: int, end: int, after: bytes | None = None):
+        index = self.active
+        try:
+            async for frame in self.clients[index].list_range(start, end, after):
+                yield frame
+        except Exception as exc:
+            self._failed(index, exc)
+            # Caller restarts the entire checkpoint on the selected provider.
+            raise
+        else:
+            self.failures[index] = 0
 
 
 @asynccontextmanager
@@ -1881,13 +1986,26 @@ async def sui_discovery_loop(
     store: SuiStore, client: BlockberryClient, cfg: SuiConfig, stop: asyncio.Event,
     *, once: bool = False, from_checkpoint: int | None = None,
     to_checkpoint: int | None = None, monitor: Any = None, run_id: int | None = None,
-    discovery_allowed: Any = None, grpc_client: SuiGrpcClient | None = None,
+    discovery_allowed: Any = None,
+    grpc_client: SuiGrpcClient | SuiGrpcFailover | None = None,
 ) -> None:
     failures = 0
     grpc_failures = 0
     grpc_cooldown_until = 0.0
+    paused_preflight_until = 0.0
     while not stop.is_set():
         if discovery_allowed is not None and not discovery_allowed():
+            if grpc_client is not None and time.monotonic() >= paused_preflight_until:
+                try:
+                    await grpc_client.preflight()
+                    paused_preflight_until = time.monotonic() + 3600
+                    log.info("[sui/grpc] grpc_ready discovery_paused; coverage remains %s",
+                             store.state()["source_mode"])
+                except Exception as exc:
+                    paused_preflight_until = time.monotonic() + 300
+                    code = getattr(exc, "code", None)
+                    kind = code().name if callable(code) else type(exc).__name__
+                    log.warning("[sui/grpc] paused preflight %s; retry in 300s", kind)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=5)
             except asyncio.TimeoutError:
@@ -1896,6 +2014,7 @@ async def sui_discovery_loop(
         try:
             result = None
             if grpc_client is not None and time.monotonic() >= grpc_cooldown_until:
+                provider_before = getattr(grpc_client, "provider", None)
                 try:
                     info = await grpc_client.preflight()
                     result = await discover_sui_grpc_once(store, grpc_client, cfg, info=info)
@@ -1906,9 +2025,16 @@ async def sui_discovery_loop(
                     grpc_failures += 1
                     code = getattr(exc, "code", None)
                     error_kind = code().name if callable(code) else type(exc).__name__
-                    delay = sui_grpc_retry_delay(error_kind, grpc_failures)
+                    switched = provider_before != getattr(grpc_client, "provider", None)
+                    delay = 0.0 if switched else sui_grpc_retry_delay(error_kind, grpc_failures)
                     grpc_cooldown_until = time.monotonic() + delay
                     store.grpc_failure(error_kind)
+                    if switched:
+                        # The next pass replays the same uncommitted checkpoint
+                        # from its start on the alternate provider.
+                        log.warning("[sui/grpc] %s; switching provider and replaying checkpoint",
+                                    error_kind)
+                        continue
                     log.warning("[sui/grpc] %s; best-effort Blockberry for %.0fs (verified cursor unchanged)",
                                 error_kind, delay)
             if result is None:

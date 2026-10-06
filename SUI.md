@@ -15,14 +15,20 @@ is reached. If neither is reached, the scanner records an explicit coverage gap.
 Optional `SUI_GRPC_HOST` and `SUI_GRPC_API_KEY` enable an authenticated Sui
 mainnet gRPC `LedgerService/ListTransactions` endpoint. For OnFinality use its
 TLS `host:port` and API key in the ignored `.env`; the client sends `api-key`
-metadata (other configured hosts use Bearer metadata). It paces its own calls
-at no more than 20/s, below the supplied 30/s and 400,000/two-hour request
-limits. Provider response-unit and stream-size limits can still be tighter.
+metadata. Chainstack uses `x-token` metadata, while other configured hosts use
+Bearer metadata. `SUI_GRPC_FALLBACK_HOST` and `SUI_GRPC_FALLBACK_API_KEY` can
+configure a second provider. Each client paces its own calls at no more than
+20/s, below the supplied 25/s Chainstack and 30/s OnFinality request limits.
+Provider response-unit and stream-size limits can still be tighter.
 Run `python scripts/check_sui_grpc.py` for a read-only mainnet and method
 preflight; it verifies that the configured page size works near head and that
 the retention floor predates the 30-day cutoff. `RESOURCE_EXHAUSTED` keeps
 Blockberry in `coverage_unverified` instead of creating a false verified gap.
-The credential is never logged. A checkpoint becomes verified only after a terminal
+The credential is never logged. A failed stream is replayed from its checkpoint
+start on the fallback; a quota rejection switches immediately, while transport
+errors require two consecutive failures. Primary recovery requires two separate
+successful preflights and happens only between checkpoint attempts. A checkpoint
+becomes verified only after a terminal
 `CHECKPOINT_BOUND` frame; transaction records or an interrupted stream are not
 enough. Partial records stay deduplicated by digest, and the entire unfinished
 checkpoint is replayed after a restart. A separate tip cursor discovers recent
@@ -31,6 +37,8 @@ tip slices alternate with one catch-up slice. `/status` displays both ranges and
 the remaining gap. The old Blockberry `last_checkpoint` is never treated as
 proof of continuous coverage. If gRPC preflight fails, Blockberry discovery
 continues as best-effort with `coverage_unverified`.
+During `balance_only`, gRPC preflight can report `grpc_ready discovery_paused`,
+but it does not advance or promote verified coverage.
 
 Sui runs as a separate Move-package subsystem and does not change EVM coverage
 (`N/20`). Set `BLOCKBERRY_API_KEY` in `.env`; Blockberry is the primary indexed

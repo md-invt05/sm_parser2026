@@ -7,7 +7,8 @@ from sui_grpc_wire_pb2 import (
     QUERY_END_REASON_ITEM_LIMIT, QUERY_END_REASON_SCAN_LIMIT,
 )
 from sui_support import (
-    SuiConfig, SuiGrpcClient, SuiGrpcError, SuiStore, discover_sui_grpc_once,
+    SuiConfig, SuiGrpcClient, SuiGrpcError, SuiGrpcFailover, SuiStore,
+    discover_sui_grpc_once,
     sui_discovery_loop, sui_grpc_retry_delay,
 )
 
@@ -26,6 +27,146 @@ def test_onfinality_host_uses_api_key_metadata_and_safe_pacing():
             await client.close()
         with pytest.raises(SuiGrpcError, match="host:port"):
             SuiGrpcClient("key", SuiConfig(), endpoint="https://example.com/key")
+    asyncio.run(run())
+
+
+def test_chainstack_uses_x_token_and_own_twenty_per_second_pacing():
+    async def run():
+        client = SuiGrpcClient("test-chainstack-token", SuiConfig(),
+                               endpoint="sui-mainnet.core.chainstack.com:443")
+        try:
+            assert client.metadata == (("x-token", "test-chainstack-token"),)
+            start = asyncio.get_running_loop().time()
+            await client._pace_request()
+            await client._pace_request()
+            assert asyncio.get_running_loop().time() - start >= 0.045
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
+def test_failover_restarts_failed_checkpoint_on_backup_without_advancing_cursor(tmp_path):
+    class Exhausted(Exception):
+        def code(self):
+            return type("Code", (), {"name": "RESOURCE_EXHAUSTED"})()
+
+    class Provider:
+        def __init__(self, endpoint, fail=False):
+            self.endpoint = endpoint
+            self.fail = fail
+            self.calls = []
+            self._preflight_cache = None
+
+        async def preflight(self):
+            return {"head": 10, "lowest": 10, "history_start": 10, "chain": "mainnet"}
+
+        async def list_range(self, start, end, after=None):
+            self.calls.append((start, end, after))
+            yield frame(b"seen", "tx-10", 10)
+            if self.fail:
+                raise Exhausted()
+            yield frame(b"done", end=QUERY_END_REASON_CHECKPOINT_BOUND)
+
+        async def close(self):
+            pass
+
+    async def run():
+        store = SuiStore(tmp_path / "sui.db")
+        primary = Provider("primary:443", fail=True)
+        backup = Provider("backup:443")
+        client = SuiGrpcFailover(primary, backup)
+        try:
+            with pytest.raises(Exhausted):
+                await discover_sui_grpc_once(store, client, SuiConfig(grpc_checkpoint_chunk=1))
+            assert client.active == 1
+            assert store.state()["verified_next_checkpoint"] == 10
+            result = await discover_sui_grpc_once(store, client, SuiConfig(grpc_checkpoint_chunk=1))
+            assert result["verified_checkpoints"] == 1
+            assert store.state()["verified_next_checkpoint"] == 11
+            assert backup.calls == [(10, 11, None)]
+            assert store.conn.execute("SELECT COUNT(*) FROM sui_seen_transactions").fetchone()[0] == 1
+        finally:
+            await client.close()
+            store.close()
+    asyncio.run(run())
+
+
+def test_primary_recovers_only_after_two_separate_preflight_probes(monkeypatch):
+    class Provider:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+            self._preflight_cache = None
+            self.calls = 0
+
+        async def preflight(self):
+            self.calls += 1
+            return {"chain": "mainnet"}
+
+        async def close(self):
+            pass
+
+    async def run():
+        primary = Provider("primary:443")
+        backup = Provider("backup:443")
+        client = SuiGrpcFailover(primary, backup)
+        client.active = 1
+        assert await client.preflight() == {"chain": "mainnet"}
+        assert client.active == 1
+        assert primary.calls == 1
+        client.cooldown_until[0] = 0
+        assert await client.preflight() == {"chain": "mainnet"}
+        assert client.active == 0
+        assert primary.calls >= 2
+    asyncio.run(run())
+
+
+def test_quota_preflight_uses_backup_and_transport_needs_two_failures():
+    class Problem(Exception):
+        def __init__(self, name):
+            self.name = name
+
+        def code(self):
+            return type("Code", (), {"name": self.name})()
+
+    class Provider:
+        def __init__(self, endpoint, errors=()):
+            self.endpoint = endpoint
+            self.errors = list(errors)
+            self._preflight_cache = None
+            self.calls = 0
+
+        async def preflight(self):
+            self.calls += 1
+            if self.errors:
+                raise self.errors.pop(0)
+            return {"chain": "mainnet"}
+
+        async def close(self):
+            pass
+
+    async def run():
+        primary = Provider("primary:443", [Problem("RESOURCE_EXHAUSTED")])
+        backup = Provider("backup:443")
+        client = SuiGrpcFailover(primary, backup)
+        assert await client.preflight() == {"chain": "mainnet"}
+        assert client.active == 1
+        assert backup.calls == 1
+
+        primary = Provider("primary:443", [Problem("UNAVAILABLE"), Problem("UNAVAILABLE")])
+        backup = Provider("backup:443")
+        client = SuiGrpcFailover(primary, backup)
+        with pytest.raises(Problem):
+            await client.preflight()
+        assert client.active == 0
+        assert await client.preflight() == {"chain": "mainnet"}
+        assert client.active == 1
+        assert backup.calls == 1
+
+        primary = Provider("primary:443", [Problem("UNAUTHENTICATED")])
+        client = SuiGrpcFailover(primary, Provider("backup:443"))
+        assert await client.preflight() == {"chain": "mainnet"}
+        assert client.disabled[0]
+        assert client.active == 1
     asyncio.run(run())
 
 
@@ -305,6 +446,38 @@ def test_failed_preflight_keeps_blockberry_best_effort_unverified(tmp_path):
         assert store.state()["verified_next_checkpoint"] is None
         assert store.state()["source_mode"] == "coverage_unverified"
         store.close()
+    asyncio.run(run())
+
+
+def test_paused_discovery_probes_grpc_without_promoting_coverage(tmp_path):
+    class ReadyGrpc:
+        def __init__(self):
+            self.probed = asyncio.Event()
+
+        async def preflight(self):
+            self.probed.set()
+            return {"head": 20, "lowest": 10, "chain": "mainnet"}
+
+    class UnusedBerry:
+        async def transactions(self, *_args):
+            raise AssertionError("paused Sui discovery must not fetch transactions")
+
+    async def run():
+        store = SuiStore(tmp_path / "sui.db")
+        stop = asyncio.Event()
+        grpc_client = ReadyGrpc()
+        task = asyncio.create_task(sui_discovery_loop(
+            store, UnusedBerry(), SuiConfig(), stop,
+            discovery_allowed=lambda: False, grpc_client=grpc_client,
+        ))
+        try:
+            await asyncio.wait_for(grpc_client.probed.wait(), timeout=1)
+            assert store.state()["source_mode"] == "coverage_unverified"
+            assert store.state()["verified_next_checkpoint"] is None
+        finally:
+            stop.set()
+            await task
+            store.close()
     asyncio.run(run())
 
 

@@ -52,6 +52,7 @@ from sui_support import (
     BlockberryClient,
     SuiConfig,
     SuiGrpcClient,
+    SuiGrpcFailover,
     SuiStore,
     export_sui_xlsx,
     sui_balance_loop,
@@ -7964,7 +7965,7 @@ async def run(args: argparse.Namespace) -> None:
     )
     pools: dict[str, RpcPool] = {}
     sui_client: BlockberryClient | None = None
-    sui_grpc_client: SuiGrpcClient | None = None
+    sui_grpc_client: SuiGrpcClient | SuiGrpcFailover | None = None
     should_export = False  # Continuous scanner never performs XLSX work.
     tasks: list[asyncio.Task[Any]] = []
     discovery_slots: DiscoverySlots | None = None
@@ -7982,13 +7983,29 @@ async def run(args: argparse.Namespace) -> None:
             else:
                 log.warning("[sui] BLOCKBERRY_API_KEY is not configured; Sui is disabled")
             grpc_key = os.getenv("SUI_GRPC_API_KEY", "").strip()
-            if grpc_key and sui_client is not None:
+            fallback_key = os.getenv("SUI_GRPC_FALLBACK_API_KEY", "").strip()
+            if (grpc_key or fallback_key) and sui_client is not None:
+                primary = None
+                fallback = None
                 try:
-                    sui_grpc_client = SuiGrpcClient(
-                        grpc_key, sui_cfg, global_rpc_sem,
-                        endpoint=os.getenv("SUI_GRPC_HOST", "sui-mainnet.g.alchemy.com:443").strip(),
-                    )
+                    if grpc_key:
+                        primary = SuiGrpcClient(
+                            grpc_key, sui_cfg, global_rpc_sem,
+                            endpoint=os.getenv("SUI_GRPC_HOST", "sui-mainnet.g.alchemy.com:443").strip(),
+                        )
+                    if fallback_key:
+                        fallback = SuiGrpcClient(
+                            fallback_key, sui_cfg, global_rpc_sem,
+                            endpoint=os.getenv("SUI_GRPC_FALLBACK_HOST", "").strip(),
+                        )
+                    sui_grpc_client = (SuiGrpcFailover(primary, fallback)
+                                       if primary is not None and fallback is not None
+                                       else primary or fallback)
                 except Exception as exc:
+                    if primary is not None:
+                        await primary.close()
+                    if fallback is not None:
+                        await fallback.close()
                     log.warning("[sui/grpc] unavailable: %s; Blockberry remains best-effort",
                                 type(exc).__name__)
         needed = (
