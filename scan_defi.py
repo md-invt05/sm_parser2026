@@ -70,6 +70,7 @@ ZERO = "0x0000000000000000000000000000000000000000"
 LLAMA_PRICES = "https://coins.llama.fi/prices/current/"
 # Task-local policy: balance probes must not inherit the indexer's long retries.
 BALANCE_RPC = ContextVar("balance_rpc", default=False)
+RPC_WORKLOAD = ContextVar("rpc_workload", default=None)
 TOKEN_LOG_HISTORY = ContextVar("token_log_history", default=False)
 BALANCE_SCHEDULE_REVISION = "3"
 TOKEN_LOG_QUEUE_REVISION = "3"
@@ -4426,8 +4427,10 @@ class RpcPool:
                                              method_group, ep.fingerprint, error_kind))
                 self.pending_metric_attempts.append((
                     datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00+00:00"),
-                    "token_logs" if method_group == "logs" else
-                    "balances" if BALANCE_RPC.get() else "discovery",
+                    RPC_WORKLOAD.get() or (
+                        "token_logs" if method_group == "logs" else
+                        "balances" if BALANCE_RPC.get() else "discovery"
+                    ),
                     method_group,
                     f"{urlparse(ep.url).hostname or 'unknown'}#{ep.fingerprint}",
                     error_kind, elapsed_ms,
@@ -4995,6 +4998,7 @@ class DiscoverySlots:
         self.sequence = 0
         self.history_grants = 0
         self.lock = asyncio.Lock()
+        self.closed = False
 
     def _next_ticket(self, role: str, now: float) -> DiscoveryTicket | None:
         queue = [ticket for ticket in self.queues[role] if not ticket.future.cancelled()]
@@ -5052,6 +5056,15 @@ class DiscoverySlots:
             self.capacity["backfill"] = max(0, int(backfill))
             self._dispatch_locked()
 
+    async def close(self) -> None:
+        """Wake queued indexers during shutdown without interrupting active ranges."""
+        async with self.lock:
+            self.closed = True
+            for queue in self.queues.values():
+                for ticket in queue:
+                    if not ticket.future.done():
+                        ticket.future.cancel()
+
     @asynccontextmanager
     async def slot(
         self, role: str, chain: str, lag: int = 0,
@@ -5062,6 +5075,8 @@ class DiscoverySlots:
         slot_role = "backfill" if role == "catchup" else role
         loop = asyncio.get_running_loop()
         async with self.lock:
+            if self.closed:
+                raise asyncio.CancelledError
             ticket = DiscoveryTicket(
                 role=role, chain=chain, lag=max(0, int(lag)),
                 sequence=self.sequence, enqueued_at=time.monotonic(),
@@ -5395,6 +5410,7 @@ async def token_log_loop(
             continue
         key = str(task["chain"])
         pool = pools[key]
+        workload_token = RPC_WORKLOAD.set("token_logs")
         try:
             cached = head_cache.get(key)
             if cached is None or time.monotonic() - cached[0] >= 30:
@@ -5423,6 +5439,8 @@ async def token_log_loop(
                 key, task["address"], task["next_block"], kind,
                 pool.active_endpoint("logs"),
             )
+        finally:
+            RPC_WORKLOAD.reset(workload_token)
         done += 1
         if once and done >= cfg.token_log_global_per_minute:
             return
@@ -5569,10 +5587,18 @@ async def index_chain_cursor(
             log.info("[%s/%s] anchor %s complete", chain.key, role, cursor["anchor_block"])
             return
         try:
-            head = max(0, await latest_block(rpc) - chain.confirmations)
-            target = head if role == "live" else min(head, int(cursor["anchor_block"]))
-            if to_block_override is not None:
-                target = min(target, to_block_override)
+            # Even a head probe is discovery work: a zero-capacity governor must
+            # not let twenty queued indexers keep opening RPC connections.
+            cached_head = getattr(rpc, "last_head", None)
+            lag_hint = max(0, int(cached_head or cursor["next_block"]) -
+                           int(cursor["next_block"]))
+            async with slots.slot(role, chain.key, lag_hint):
+                if stop.is_set():
+                    return
+                head = max(0, await latest_block(rpc) - chain.confirmations)
+                target = head if role == "live" else min(head, int(cursor["anchor_block"]))
+                if to_block_override is not None:
+                    target = min(target, to_block_override)
         except Exception as exc:
             if stop.is_set():
                 return
@@ -5807,7 +5833,12 @@ async def index_chain_gaps(
             conflict = db.pending_reorg_conflict(chain.key)
             if conflict is not None:
                 try:
-                    ancestor = await find_reorg_common_ancestor(db, chain.key, rpc, conflict)
+                    async with slots.slot("catchup", chain.key):
+                        if stop.is_set():
+                            return
+                        ancestor = await find_reorg_common_ancestor(
+                            db, chain.key, rpc, conflict,
+                        )
                     if ancestor is None:
                         db.mark_reorg_manual(chain.key, conflict)
                         log.error("[%s] reorg exceeds saved hash window; manual intervention required",
@@ -7790,6 +7821,22 @@ async def supervised(
                 continue
 
 
+async def stop_background_workers(
+    stop: asyncio.Event, slots: DiscoverySlots | None,
+    tasks: list[asyncio.Task[Any]], timeout_sec: float = 240,
+) -> None:
+    """Finish active work and queued tickets before their clients are closed."""
+    stop.set()
+    if slots is not None:
+        await slots.close()
+    if not tasks:
+        return
+    _finished, pending = await asyncio.wait(tasks, timeout=timeout_sec)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def run(args: argparse.Namespace) -> None:
     cfg = load_config(ROOT / "config.yaml")
     setup_logging(cfg.log_dir)
@@ -7919,6 +7966,10 @@ async def run(args: argparse.Namespace) -> None:
     sui_client: BlockberryClient | None = None
     sui_grpc_client: SuiGrpcClient | None = None
     should_export = False  # Continuous scanner never performs XLSX work.
+    tasks: list[asyncio.Task[Any]] = []
+    discovery_slots: DiscoverySlots | None = None
+    workers_done: asyncio.Future[Any] | None = None
+    stop_waiter: asyncio.Task[Any] | None = None
     try:
         if sui_requested:
             blockberry_key = os.getenv("BLOCKBERRY_API_KEY", "").strip()
@@ -7961,6 +8012,7 @@ async def run(args: argparse.Namespace) -> None:
             await pool.__aenter__()
             pools[chain.key] = pool
 
+        RPC_WORKLOAD.set("startup")
         reports = await asyncio.gather(
             *(pool.preflight() for pool in pools.values()),
             return_exceptions=True,
@@ -8047,6 +8099,7 @@ async def run(args: argparse.Namespace) -> None:
                     log.warning("[%s] tip lag check failed; retaining contiguous cursor: %s",
                                 chain.key, type(exc).__name__)
 
+        RPC_WORKLOAD.set(None)
         if args.once:
             if cfg.run_indexer and not args.balances_only:
                 index_jobs = [
@@ -8090,7 +8143,6 @@ async def run(args: argparse.Namespace) -> None:
             should_export = False
             return
 
-        tasks: list[asyncio.Task[Any]] = []
         discovery_slots = DiscoverySlots(
             live_slots=cfg.discovery_live_slots,
             backfill_slots=cfg.discovery_backfill_slots,
@@ -8234,13 +8286,20 @@ async def run(args: argparse.Namespace) -> None:
         tasks.append(
             asyncio.create_task(daily_backup_loop(db, monitor, stop), name="daily-backup")
         )
-        await asyncio.gather(*tasks)
+        workers_done = asyncio.gather(*tasks, return_exceptions=True)
+        stop_waiter = asyncio.create_task(stop.wait(), name="shutdown-waiter")
+        await asyncio.wait((workers_done, stop_waiter), return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         pass
     finally:
         if run_id is not None:
             monitor.heartbeat(run_id, "stopping")
-        stop.set()
+        await stop_background_workers(stop, discovery_slots, tasks)
+        if workers_done is not None:
+            await workers_done
+        if stop_waiter is not None:
+            stop_waiter.cancel()
+            await asyncio.gather(stop_waiter, return_exceptions=True)
         if should_export:
             try:
                 await run_export_process(

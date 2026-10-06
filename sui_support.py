@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,7 @@ from openpyxl.utils import get_column_letter
 log = logging.getLogger("scanner.sui")
 UTC = timezone.utc
 BLOCKBERRY_BASE = "https://api.blockberry.one/sui/v1"
+RAW_TRANSACTION_TIMING = ContextVar("sui_raw_transaction_timing", default=None)
 SYSTEM_PACKAGES = {f"0x{value:064x}" for value in (0, 1, 2, 3)}
 
 
@@ -420,6 +422,8 @@ class BlockberryClient:
         ]
         self.fallback_client: httpx.AsyncClient | None = None
         self._metrics: list[tuple[bool, float, str]] = []
+        self._raw_timings: list[dict[str, float | bool]] = []
+        self._enrichment_timings: list[dict[str, float | bool]] = []
         self._rate_lock = asyncio.Lock()
         self._next_request_at = 0.0
 
@@ -448,13 +452,25 @@ class BlockberryClient:
             started = time.perf_counter()
             kind = "ok"
             try:
+                timing = RAW_TRANSACTION_TIMING.get()
+                quota_started = time.perf_counter()
                 async with self._rate_lock:
                     delay = max(0.0, self._next_request_at - time.monotonic())
                     if delay:
                         await asyncio.sleep(delay)
                     self._next_request_at = time.monotonic() + 1.0 / self.cfg.requests_per_second
+                if timing is not None:
+                    timing["quota_ms"] += (time.perf_counter() - quota_started) * 1000
+                slot_started = time.perf_counter()
                 async with _global_request_slot(self.global_sem), self.network_sem:
-                    response = await self.client.request(method, path, **kwargs)
+                    if timing is not None:
+                        timing["slot_ms"] += (time.perf_counter() - slot_started) * 1000
+                    http_started = time.perf_counter()
+                    try:
+                        response = await self.client.request(method, path, **kwargs)
+                    finally:
+                        if timing is not None:
+                            timing["http_ms"] += (time.perf_counter() - http_started) * 1000
                 latency = (time.perf_counter() - started) * 1000
                 if response.status_code in (401, 403):
                     kind = "auth"
@@ -527,10 +543,51 @@ class BlockberryClient:
         return data
 
     async def raw_transaction(self, digest: str) -> dict[str, Any]:
-        data = await self.request("GET", f"/raw-transactions/{digest}")
+        timing: dict[str, float | bool] = {
+            "quota_ms": 0.0, "slot_ms": 0.0, "http_ms": 0.0, "ok": False,
+        }
+        started = time.perf_counter()
+        context = RAW_TRANSACTION_TIMING.set(timing)
+        try:
+            data = await self.request("GET", f"/raw-transactions/{digest}")
+            timing["ok"] = True
+        finally:
+            RAW_TRANSACTION_TIMING.reset(context)
+            timing["total_ms"] = (time.perf_counter() - started) * 1000
+            self._raw_timings.append(timing)
         if not isinstance(data, dict) or not isinstance(data.get("result"), dict):
             raise BlockberryError("partial", "raw transaction has no result")
         return data
+
+    def record_enrichment_timing(self, parse_ms: float, db_ms: float,
+                                 total_ms: float, ok: bool) -> None:
+        self._enrichment_timings.append({
+            "parse_ms": parse_ms, "db_ms": db_ms, "total_ms": total_ms, "ok": ok,
+        })
+
+    def take_enrichment_timings(self) -> dict[str, Any]:
+        raw, self._raw_timings = self._raw_timings, []
+        processed, self._enrichment_timings = self._enrichment_timings, []
+
+        def percentiles(rows: list[dict[str, float | bool]], key: str) -> tuple[int, int]:
+            values = sorted(float(row[key]) for row in rows)
+            if not values:
+                return 0, 0
+            return (round(values[min(len(values) - 1, round((len(values) - 1) * .5))]),
+                    round(values[min(len(values) - 1, round((len(values) - 1) * .95))]))
+
+        return {
+            "raw_attempted": len(raw), "raw_ok": sum(bool(row["ok"]) for row in raw),
+            "processed": len(processed),
+            "completed": sum(bool(row["ok"]) for row in processed),
+            "quota_ms": percentiles(raw, "quota_ms"),
+            "slot_ms": percentiles(raw, "slot_ms"),
+            "http_ms": percentiles(raw, "http_ms"),
+            "raw_total_ms": percentiles(raw, "total_ms"),
+            "parse_ms": percentiles(processed, "parse_ms"),
+            "db_ms": percentiles(processed, "db_ms"),
+            "total_ms": percentiles(processed, "total_ms"),
+        }
 
     async def account_balance(self, owner: str) -> list[dict[str, Any]]:
         normalized = normalize_sui_id(owner)
@@ -1645,11 +1702,18 @@ async def discover_sui_grpc_once(
 async def enrich_sui_once(store: SuiStore, client: BlockberryClient, cfg: SuiConfig) -> int:
     enriched = 0
     for row in store.pending_enrichment(cfg.raw_enrich_per_pass):
+        started = time.perf_counter()
+        parse_ms = 0.0
+        db_started: float | None = None
+        succeeded = False
         try:
             raw = await client.raw_transaction(row["digest"])
+            parse_started = time.perf_counter()
             parsed = parse_raw_transaction(raw)
+            parse_ms = (time.perf_counter() - parse_started) * 1000
             result = raw["result"]
             actor = (((result.get("transaction") or {}).get("data") or {}).get("sender"))
+            db_started = time.perf_counter()
             for package_id in parsed["calls"]:
                 store.upsert_package(package_id, "active_call", row["checkpoint"], row["digest"], actor)
             for package_id in parsed["published"]:
@@ -1657,10 +1721,20 @@ async def enrich_sui_once(store: SuiStore, client: BlockberryClient, cfg: SuiCon
             store.add_objects(parsed["objects"], int(row["checkpoint"]))
             store.finish_enrichment(row["digest"])
             enriched += 1
+            succeeded = True
         except (BlockberryError, ValueError, TypeError, KeyError) as exc:
             store.defer_enrichment(row["digest"], type(exc).__name__)
             log.warning("[sui/enrichment] deferred %s: %s: %s", row["digest"][:12],
                         type(exc).__name__, str(exc)[:160])
+        finally:
+            record_timing = getattr(client, "record_enrichment_timing", None)
+            if record_timing is not None:
+                record_timing(
+                    parse_ms,
+                    (time.perf_counter() - db_started) * 1000 if db_started is not None else 0.0,
+                    (time.perf_counter() - started) * 1000,
+                    succeeded,
+                )
     if enriched:
         store.mark_dirty()
     return enriched
@@ -1671,6 +1745,18 @@ async def sui_enrichment_loop(
 ) -> None:
     while not stop.is_set():
         enriched = await enrich_sui_once(store, client, cfg)
+        take_timing = getattr(client, "take_enrichment_timings", None)
+        timing = take_timing() if take_timing is not None else None
+        if timing is not None and timing["processed"]:
+            log.info(
+                "[sui/enrichment-metrics] processed=%s completed=%s raw=%s/%s "
+                "quota_p50_p95=%s slot_p50_p95=%s http_p50_p95=%s "
+                "parse_p50_p95=%s sqlite_p50_p95=%s total_p50_p95=%s",
+                timing["processed"], timing["completed"], timing["raw_ok"],
+                timing["raw_attempted"], timing["quota_ms"], timing["slot_ms"],
+                timing["http_ms"], timing["parse_ms"], timing["db_ms"],
+                timing["total_ms"],
+            )
         if enriched:
             log.info("[sui/enrichment] enriched=%s pending=%s", enriched,
                      store.summary()["enrichment_pending"])
