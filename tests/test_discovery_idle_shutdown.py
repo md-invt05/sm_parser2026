@@ -9,6 +9,62 @@ from sui_support import BlockberryClient, SuiConfig
 
 
 class IdleDiscoveryAndShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_reanchor_deferred_only_for_steady_balance_only(self):
+        self.assertTrue(scanner.should_defer_startup_reanchor(
+            "steady", False, 18_000, 2_000, 0,
+        ))
+        self.assertTrue(scanner.should_defer_startup_reanchor(
+            "steady", False, 0, 0, 21_600,
+        ))
+        self.assertFalse(scanner.should_defer_startup_reanchor(
+            "normal", False, 18_000, 2_000, 21_600,
+        ))
+        self.assertFalse(scanner.should_defer_startup_reanchor(
+            "steady", True, 18_000, 2_000, 21_600,
+        ))
+
+    async def test_deferred_reanchor_waits_for_discovery_slot(self):
+        completed = asyncio.Event()
+
+        class CursorDB:
+            def cursor(self, _chain, _role):
+                return {"next_block": 100}
+
+            def reanchor_tip(self, _chain, head, lag_sec):
+                self.head, self.lag_sec = head, lag_sec
+                completed.set()
+                return 1
+
+        class Rpc:
+            calls = 0
+
+            async def call(self, _method, _params):
+                self.calls += 1
+                return "0xc8"
+
+            async def batch(self, _calls):
+                self.calls += 1
+                return [{"timestamp": "0x1"}, {"timestamp": "0x1000"}]
+
+        stop = asyncio.Event()
+        slots = scanner.DiscoverySlots(0, 0)
+        governor = SimpleNamespace(state="balance_only")
+        db, rpc = CursorDB(), Rpc()
+        task = asyncio.create_task(scanner.deferred_tip_reanchor_loop(
+            db, [SimpleNamespace(key="ethereum", confirmations=0)],
+            {"ethereum": rpc}, slots, governor, stop,
+        ))
+        await asyncio.sleep(0.03)
+        self.assertEqual(0, rpc.calls)
+        governor.state = "normal"
+        await asyncio.sleep(0.03)
+        self.assertEqual(0, rpc.calls)
+        await slots.set_capacity(1, 0)
+        await asyncio.wait_for(completed.wait(), timeout=3)
+        await task
+        self.assertEqual(200, db.head)
+        self.assertEqual(2, rpc.calls)
+
     async def test_zero_capacity_indexer_never_probes_head(self):
         class CursorDB:
             def contract_addresses(self, _chain):
@@ -118,6 +174,38 @@ class IdleDiscoveryAndShutdownTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 scanner.RPC_WORKLOAD.reset(workload)
         self.assertEqual("token_logs", pool.pending_metric_attempts[-1][1])
+
+    async def test_balance_fallback_probes_keep_balance_role(self):
+        class Rpc:
+            def active_endpoint(self, _group):
+                return "none"
+
+            async def _verify_unchecked_fallback(self, _group):
+                self.assert_balance_role()
+
+            def assert_balance_role(self):
+                assert scanner.BALANCE_RPC.get() is True
+
+            def _soonest_wait(self, _group):
+                return 60
+
+        class DB:
+            def defer_chain_work(self, *_args):
+                pass
+
+            def fail_balance_work(self, *_args, **_kwargs):
+                pass
+
+        rpc = Rpc()
+        chain = SimpleNamespace(key="ethereum")
+        await scanner.retry_failed_token_balances(
+            DB(), chain, rpc, None, None, "0x1", [], asyncio.Semaphore(1),
+        )
+        await scanner.retry_simple_balance_work(
+            DB(), chain, rpc, None, None, "0x1",
+            {"kind": "code", "asset": "native"}, asyncio.Semaphore(1),
+        )
+        self.assertFalse(scanner.BALANCE_RPC.get())
 
     async def test_sui_raw_timing_aggregates_without_secret_or_digest(self):
         client = BlockberryClient("private-test-key", SuiConfig(max_retries=1))

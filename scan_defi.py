@@ -6485,7 +6485,11 @@ async def retry_failed_token_balances(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Refresh only failed ERC-20 operations; keep other observations untouched."""
     if hasattr(rpc, "active_endpoint") and rpc.active_endpoint("eth_call") == "none":
-        await rpc._verify_unchecked_fallback("eth_call")
+        policy = BALANCE_RPC.set(True)
+        try:
+            await rpc._verify_unchecked_fallback("eth_call")
+        finally:
+            BALANCE_RPC.reset(policy)
         if rpc.active_endpoint("eth_call") == "none":
             db.defer_chain_work(address, chain.key, max(60, min(900, rpc._soonest_wait("eth_call"))))
             return {"chain": chain.key, "_persisted": True}, []
@@ -6594,7 +6598,11 @@ async def retry_simple_balance_work(
     method_group = {"code": "code", "native_balance": "balance",
                     "token_metadata": "eth_call"}[kind]
     if hasattr(rpc, "active_endpoint") and rpc.active_endpoint(method_group) == "none":
-        await rpc._verify_unchecked_fallback(method_group)
+        policy = BALANCE_RPC.set(True)
+        try:
+            await rpc._verify_unchecked_fallback(method_group)
+        finally:
+            BALANCE_RPC.reset(policy)
         if rpc.active_endpoint(method_group) == "none":
             db.fail_balance_work(address, chain.key, kind, asset, "rpc_cooldown",
                                  local_wait=True)
@@ -7838,6 +7846,64 @@ async def stop_background_workers(
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def should_defer_startup_reanchor(
+    profile: str, once: bool, pending: int, sui_pending: int, oldest_sec: float,
+) -> bool:
+    return (profile == "steady" and not once and
+            (pending + sui_pending >= 20_000 or oldest_sec >= 21_600))
+
+
+async def deferred_tip_reanchor_loop(
+    db: DB, chains: list[ChainCfg], pools: dict[str, RpcPool],
+    slots: DiscoverySlots, governor: LoadGovernor, stop: asyncio.Event,
+) -> None:
+    """Resume the skipped startup tip check only after discovery has a slot."""
+    pending = {chain.key: chain for chain in chains}
+    while pending and not stop.is_set():
+        if governor.state == "balance_only":
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        for key, chain in list(pending.items()):
+            if stop.is_set():
+                return
+            pool = pools[key]
+            try:
+                async with slots.slot("live", key):
+                    if stop.is_set():
+                        return
+                    cursor = db.cursor(key, "live")
+                    if cursor is None:
+                        pending.pop(key)
+                        continue
+                    old_number = int(cursor["next_block"])
+                    head = max(0, await asyncio.wait_for(latest_block(pool), timeout=30)
+                               - chain.confirmations)
+                    if old_number + 2 < head:
+                        old_block, head_block = await asyncio.wait_for(pool.batch([
+                            ("eth_getBlockByNumber", [hex(old_number), False]),
+                            ("eth_getBlockByNumber", [hex(head), False]),
+                        ]), timeout=30)
+                        if not isinstance(old_block, dict) or not isinstance(head_block, dict):
+                            raise RpcError("partial", "tip reanchor block response incomplete")
+                        lag_sec = hex_int(head_block["timestamp"]) - hex_int(old_block["timestamp"])
+                        gap = db.reanchor_tip(key, head, lag_sec)
+                        if gap is not None:
+                            log.warning("[%s] deferred tip reanchored with durable gap id=%s", key, gap)
+                    pending.pop(key)
+            except Exception as exc:
+                if stop.is_set():
+                    return
+                log.warning("[%s] deferred tip reanchor retry: %s", key, type(exc).__name__)
+        if pending:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+
+
 async def run(args: argparse.Namespace) -> None:
     cfg = load_config(ROOT / "config.yaml")
     setup_logging(cfg.log_dir)
@@ -8088,6 +8154,11 @@ async def run(args: argparse.Namespace) -> None:
         ]
         if not discovery_ready and sui_client is None and not args.balances_only:
             raise RuntimeError("none of the selected discovery networks has an RPC")
+        startup_queue = db.balance_queue_snapshot()
+        startup_balance_only = should_defer_startup_reanchor(
+            profile, args.once, int(startup_queue["balance_pending"]),
+            db.sui_enrichment_pending(), float(startup_queue["balance_oldest_age_sec"]),
+        )
         await print_startup_status(discovery_ready, pools, db)
         for chain in discovery_ready:
             db.init_chain(chain.key, chain.start_block, cfg.discover_tx_to_contracts)
@@ -8099,14 +8170,17 @@ async def run(args: argparse.Namespace) -> None:
             db.init_chain_cursors(
                 chain.key, chain.start_block, safe_head, lookback=2,
             )
-            if previous_tip is not None and not args.once and not args.balances_only:
+            if (previous_tip is not None and not args.once and
+                    not args.balances_only and not startup_balance_only):
                 try:
                     old_number = int(previous_tip["next_block"])
                     if old_number + 2 < safe_head:
-                        old_block, head_block = await pools[chain.key].batch([
-                            ("eth_getBlockByNumber", [hex(old_number), False]),
-                            ("eth_getBlockByNumber", [hex(safe_head), False]),
-                        ])
+                        old_block, head_block = await asyncio.wait_for(
+                            pools[chain.key].batch([
+                                ("eth_getBlockByNumber", [hex(old_number), False]),
+                                ("eth_getBlockByNumber", [hex(safe_head), False]),
+                            ]), timeout=30,
+                        )
                         if isinstance(old_block, dict) and isinstance(head_block, dict):
                             lag_sec = hex_int(head_block["timestamp"]) - hex_int(old_block["timestamp"])
                             gap = db.reanchor_tip(chain.key, safe_head, lag_sec)
@@ -8115,6 +8189,8 @@ async def run(args: argparse.Namespace) -> None:
                 except Exception as exc:
                     log.warning("[%s] tip lag check failed; retaining contiguous cursor: %s",
                                 chain.key, type(exc).__name__)
+        if startup_balance_only:
+            log.info("[discovery] startup tip reanchor deferred by steady balance_only")
 
         RPC_WORKLOAD.set(None)
         if args.once:
@@ -8180,6 +8256,12 @@ async def run(args: argparse.Namespace) -> None:
         )
         await discovery_slots.set_capacity(initial_live, initial_backfill)
         if cfg.run_indexer and not args.balances_only:
+            if startup_balance_only:
+                tasks.append(asyncio.create_task(
+                    deferred_tip_reanchor_loop(
+                        db, discovery_ready, pools, discovery_slots, governor, stop,
+                    ), name="deferred-tip-reanchor",
+                ))
             for chain in discovery_ready:
                 pool = pools[chain.key]
                 for role in ("live", "backfill"):
