@@ -230,6 +230,30 @@ def test_monitoring_snapshot_counts_only_latest_committed_scan(tmp_path):
     db.close()
 
 
+def test_balance_queue_new_addresses_are_distinct_and_indexes_are_idempotent(tmp_path):
+    path = tmp_path / "db.sqlite"
+    db = scanner.DB(path)
+    other = "0x" + "ef" * 20
+    db.upsert_contracts([
+        ("ethereum", ADDRESS, 1, "0x1", None, "2026-01-01"),
+        ("base", ADDRESS, 2, "0x2", None, "2026-01-01"),
+        ("ethereum", other, 3, "0x3", None, "2026-01-01"),
+    ])
+    db.save_address_chain_state(ADDRESS, {
+        "chain": "ethereum", "status": "complete", "has_code": 1,
+        "total_usd": 0,
+    }, [], 500_000)
+    assert db.balance_queue_snapshot(include_coverage=True)["balance_new_pending"] == 1
+    indexes = {row[1] for row in db.conn.execute("PRAGMA index_list(address_chain_state)")}
+    assert {"idx_address_chain_error_due", "idx_address_chain_nonverified_address"} <= indexes
+    db.close()
+
+    reopened = scanner.DB(path)
+    assert reopened.balance_queue_snapshot()["balance_new_pending"] == 1
+    assert reopened.conn.execute("SELECT version FROM schema_meta").fetchone()[0] == 13
+    reopened.close()
+
+
 def test_event_loop_lag_monitor_reports_a_real_pause():
     async def scenario():
         stop = asyncio.Event()

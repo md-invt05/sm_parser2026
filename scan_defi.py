@@ -804,6 +804,17 @@ class DB:
             "CREATE INDEX IF NOT EXISTS idx_address_chain_coverage "
             "ON address_chain_state(coverage_state)"
         )
+        # Monitoring needs distinct addresses, not random reads of millions of
+        # chain rows. Both partial indexes stay small on the production data.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_address_chain_error_due "
+            "ON address_chain_state(next_retry_at,address) "
+            "WHERE status IN ('rpc_error','partial','timeout')"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_address_chain_nonverified_address "
+            "ON address_chain_state(address) WHERE coverage_state!='verified'"
+        )
         token_task_columns = {row["name"] for row in self.conn.execute(
             "PRAGMA table_info(token_log_tasks)"
         )}
@@ -888,9 +899,9 @@ class DB:
             """
         )
         self.conn.execute(
-            "INSERT INTO schema_meta(version) SELECT 12 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
+            "INSERT INTO schema_meta(version) SELECT 13 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
         )
-        self.conn.execute("UPDATE schema_meta SET version=12 WHERE version < 12")
+        self.conn.execute("UPDATE schema_meta SET version=13 WHERE version < 13")
         self.conn.execute(
             "INSERT OR IGNORE INTO runtime_meta(key,value,updated_at) VALUES('data_revision','0',?)",
             (datetime.now(timezone.utc).isoformat(),),
@@ -3728,12 +3739,11 @@ class DB:
         with self._lock:
             rows = self.conn.execute(
                 """
+                WITH latest AS (
+                    SELECT MAX(id) AS id FROM address_scans GROUP BY address
+                )
                 SELECT status, COUNT(*) AS n FROM address_scans a
-                WHERE a.id=(
-                    SELECT a2.id FROM address_scans a2
-                    WHERE a2.address=a.address
-                    ORDER BY a2.scanned_at DESC, a2.id DESC LIMIT 1
-                ) GROUP BY status
+                JOIN latest ON latest.id=a.id GROUP BY status
                 """
             ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
@@ -3756,9 +3766,15 @@ class DB:
         now_iso = now.isoformat()
         with self._lock:
             new = self.conn.execute(
-                """SELECT COUNT(DISTINCT lower(c.address)) n,MIN(c.first_seen_at) oldest
-                   FROM contracts c WHERE NOT EXISTS(
-                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))"""
+                """WITH known AS MATERIALIZED (
+                     SELECT DISTINCT address FROM address_chain_state
+                   ), unique_contracts AS (
+                     SELECT address,MIN(first_seen_at) first_seen_at
+                     FROM contracts GROUP BY address
+                   )
+                   SELECT COUNT(*) n,MIN(c.first_seen_at) oldest
+                   FROM unique_contracts c LEFT JOIN known k ON k.address=c.address
+                   WHERE k.address IS NULL"""
             ).fetchone()
             retry = self.conn.execute(
                 """SELECT COUNT(DISTINCT address) n,MIN(next_retry_at) oldest
