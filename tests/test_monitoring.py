@@ -70,6 +70,23 @@ class MonitoringStoreTests(unittest.TestCase):
             self.assertEqual(1, second.rows("SELECT COUNT(*) n FROM schema_meta")[0]["n"])
             second.close()
 
+    def test_lightweight_heartbeat_preserves_detailed_status_note(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            run_id = store.begin_run("full", 500000, "steady", {})
+            note = json.dumps({"load_governor": {"state": "balance_only"}})
+            store.heartbeat(run_id, note=note)
+            with store.conn:
+                store.conn.execute(
+                    "UPDATE runtime_state SET heartbeat_at='2020-01-01T00:00:00+00:00'"
+                )
+            store.touch_heartbeat(run_id)
+            runtime = store.runtime()
+            self.assertEqual(note, runtime["note"])
+            self.assertEqual("running", runtime["state"])
+            self.assertGreater(datetime.fromisoformat(runtime["heartbeat_at"]).year, 2020)
+            store.close()
+
     def test_incident_deduplication_and_single_recovery(self):
         with tempfile.TemporaryDirectory() as folder:
             store = MonitorStore(Path(folder) / "monitoring.db")
@@ -243,6 +260,27 @@ class MonitoringHelpersTests(unittest.TestCase):
 
 
 class MonitoringAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_pulse_updates_liveness_during_slow_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = MonitorStore(Path(folder) / "monitoring.db")
+            run_id = store.begin_run("full", 500000, "steady", {})
+            store.heartbeat(run_id, note='{"load_governor":{"state":"balance_only"}}')
+            with store.conn:
+                store.conn.execute(
+                    "UPDATE runtime_state SET heartbeat_at='2020-01-01T00:00:00+00:00'"
+                )
+            stop = asyncio.Event()
+            task = asyncio.create_task(scan_defi.runtime_pulse_loop(
+                store, run_id, stop, interval_sec=0.01,
+            ))
+            await asyncio.sleep(0.03)
+            stop.set()
+            await task
+            runtime = store.runtime()
+            self.assertGreater(datetime.fromisoformat(runtime["heartbeat_at"]).year, 2020)
+            self.assertIn("balance_only", runtime["note"])
+            store.close()
+
     def _bot_with_store(self, store):
         service = BotService.__new__(BotService)
         service.monitor = store

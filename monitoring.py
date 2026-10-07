@@ -395,6 +395,14 @@ class MonitorStore:
                 (state, utc_now(), note, run_id),
             )
 
+    def touch_heartbeat(self, run_id: str, state: str = "running") -> None:
+        """Keep liveness current while a detailed status snapshot is still running."""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE runtime_state SET state=?,heartbeat_at=? WHERE id=1 AND run_id=?",
+                (state, utc_now(), run_id),
+            )
+
     def set_runtime_state(self, state: str, note: str | None = None) -> None:
         with self._lock, self.conn:
             self.conn.execute(

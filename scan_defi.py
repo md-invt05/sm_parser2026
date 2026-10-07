@@ -7498,10 +7498,21 @@ def _read_heartbeat_snapshots(
     """
     view = DB(path, read_only=True)
     try:
+        started = time.monotonic()
         gaps = view.discovery_gap_snapshot()
+        gaps_done = time.monotonic()
         balance_work = view.balance_work_snapshot()
+        balance_done = time.monotonic()
         token_logs = view.token_log_queue_snapshot() if include_token_logs else {}
+        token_done = time.monotonic()
         aggregate = view.monitoring_snapshot(min_usd)
+        log.info(
+            "[runtime] heartbeat_snapshot_ms gaps=%d balance_work=%d token_logs=%d aggregate=%d",
+            round((gaps_done - started) * 1000),
+            round((balance_done - gaps_done) * 1000),
+            round((token_done - balance_done) * 1000),
+            round((time.monotonic() - token_done) * 1000),
+        )
         return gaps, balance_work, token_logs, aggregate
     finally:
         view.close()
@@ -7760,6 +7771,23 @@ async def heartbeat_loop(
             for c in selected
             ),
         )
+
+
+async def runtime_pulse_loop(
+    monitor: MonitorStore, run_id: str, stop: asyncio.Event,
+    interval_sec: float = 30.0,
+) -> None:
+    """Report liveness independently of slow, read-only status aggregates."""
+    while not stop.is_set():
+        try:
+            state = "paused" if monitor.setting("scanner_paused", "0") == "1" else "running"
+            monitor.touch_heartbeat(run_id, state)
+        except sqlite3.Error:
+            log.exception("[runtime] heartbeat pulse failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_sec)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def event_loop_lag_loop(
@@ -8561,6 +8589,9 @@ async def run(args: argparse.Namespace) -> None:
                 name="heartbeat",
             )
         )
+        tasks.append(asyncio.create_task(
+            runtime_pulse_loop(monitor, run_id, stop), name="runtime-pulse",
+        ))
         tasks.append(asyncio.create_task(
             event_loop_lag_loop(stop), name="event-loop-lag",
         ))
