@@ -67,10 +67,14 @@ class IdleDiscoveryAndShutdownTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_zero_capacity_indexer_never_probes_head(self):
         class CursorDB:
+            cache_reads = 0
+
             def contract_addresses(self, _chain):
+                self.cache_reads += 1
                 return set()
 
             def discovery_addresses(self, _chain, _source):
+                self.cache_reads += 1
                 return set()
 
             def cursor(self, _chain, _role):
@@ -89,15 +93,18 @@ class IdleDiscoveryAndShutdownTests(unittest.IsolatedAsyncioTestCase):
         slots = scanner.DiscoverySlots(0, 1)
         await slots.set_capacity(0, 0)
         rpc = Rpc()
+        db = CursorDB()
         task = asyncio.create_task(scanner.index_chain_cursor(
-            CursorDB(), SimpleNamespace(key="ethereum", confirmations=0), rpc,
+            db, SimpleNamespace(key="ethereum", confirmations=0), rpc,
             SimpleNamespace(all_down_sleep_sec=1), stop, "live", slots,
         ))
         await asyncio.sleep(0.03)
         self.assertEqual(0, rpc.calls)
+        self.assertEqual(0, db.cache_reads)
         self.assertEqual(1, (await slots.snapshot())["live_waiting"])
         await scanner.stop_background_workers(stop, slots, [task], timeout_sec=0.1)
         self.assertEqual(0, rpc.calls)
+        self.assertEqual(0, db.cache_reads)
         self.assertEqual(0, (await slots.snapshot())["live_active"])
         self.assertEqual(0, (await slots.snapshot())["live_waiting"])
 

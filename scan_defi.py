@@ -2508,17 +2508,37 @@ class DB:
             addresses = [str(row["address"]) for row in new_rows]
             if len(addresses) >= limit:
                 return addresses
-            due_rows = self.conn.execute(
-                """SELECT s.address,MIN(s.next_retry_at) due_at,
-                          EXISTS(SELECT 1 FROM contracts c WHERE c.address=s.address
-                                 AND c.last_total_usd>=?) priority
-                   FROM address_chain_state s
-                   WHERE s.next_retry_at<=?
-                   GROUP BY s.address
-                   ORDER BY priority DESC,due_at,s.address LIMIT ?""",
-                (min_usd, now_iso, limit - len(addresses)),
+            # Grouping every due chain and probing contracts for each row made
+            # this poll take tens of seconds on a large database. Scan the much
+            # smaller high-value contract set first, then walk the due-time
+            # index only until enough distinct low-priority addresses appear.
+            chosen = set(addresses)
+            priority_rows = self.conn.execute(
+                """SELECT lower(c.address) address,MIN(s.next_retry_at) due_at
+                   FROM contracts c JOIN address_chain_state s
+                     ON s.address=lower(c.address) AND s.next_retry_at<=?
+                   WHERE c.last_total_usd>=?
+                   GROUP BY lower(c.address)
+                   ORDER BY due_at,address LIMIT ?""",
+                (now_iso, min_usd, limit - len(addresses)),
             ).fetchall()
-            addresses.extend(str(row["address"]) for row in due_rows)
+            for row in priority_rows:
+                address = str(row["address"])
+                if address not in chosen:
+                    addresses.append(address)
+                    chosen.add(address)
+            if len(addresses) < limit:
+                for row in self.conn.execute(
+                    """SELECT address FROM address_chain_state INDEXED BY idx_address_chain_retry
+                       WHERE next_retry_at<=? ORDER BY next_retry_at,address""",
+                    (now_iso,),
+                ):
+                    address = str(row["address"])
+                    if address not in chosen:
+                        addresses.append(address)
+                        chosen.add(address)
+                        if len(addresses) >= limit:
+                            break
             return addresses
 
     def due_address_chains(
@@ -5563,8 +5583,9 @@ async def index_chain_cursor(
 ) -> None:
     if from_block_override is not None and role != "catchup":
         db.advance_cursor_start(chain.key, role, from_block_override)
-    known_contracts = db.contract_addresses(chain.key)
-    known_active_calls = db.discovery_addresses(chain.key, "active_call")
+    known_contracts: set[str] = set()
+    known_active_calls: set[str] = set()
+    known_cache_loaded = False
     failures = 0
     reorg_waiting = False
     while not stop.is_set():
@@ -5584,8 +5605,7 @@ async def index_chain_cursor(
             await asyncio.sleep(2)
             continue
         if reorg_waiting:
-            known_contracts = db.contract_addresses(chain.key)
-            known_active_calls = db.discovery_addresses(chain.key, "active_call")
+            known_cache_loaded = False
             reorg_waiting = False
         if role in {"backfill", "catchup"} and cursor["status"] == "complete":
             log.info("[%s/%s] anchor %s complete", chain.key, role, cursor["anchor_block"])
@@ -5683,6 +5703,18 @@ async def index_chain_cursor(
             if monitor is not None and monitor.setting("scanner_paused", "0") == "1":
                 continue
             try:
+                if not known_cache_loaded:
+                    if str(db.path) == ":memory:":
+                        known_contracts = db.contract_addresses(chain.key)
+                        known_active_calls = (
+                            db.discovery_addresses(chain.key, "active_call")
+                            if role == "live" else set()
+                        )
+                    else:
+                        known_contracts, known_active_calls = await asyncio.to_thread(
+                            _read_discovery_sets, db.path, chain.key, role,
+                        )
+                    known_cache_loaded = True
                 update_stage("blocks")
                 numbers = list(range(start, end + 1))
                 blocks = await rpc.batch([
@@ -7024,10 +7056,17 @@ async def check_multichain_balances(
             await wait_if_paused(monitor, stop)
             if stop.is_set():
                 break
-            pending = db.pending_addresses(
-                cfg.recheck_interval_sec, limit=max(80, cfg.balance_concurrency * 2),
-                retry_sec=cfg.balance_retry_sec, as_of=snapshot_at, min_usd=min_usd,
-            )
+            batch_limit = max(80, cfg.balance_concurrency * 2)
+            if str(db.path) == ":memory:":
+                pending = db.pending_addresses(
+                    cfg.recheck_interval_sec, batch_limit, cfg.balance_retry_sec,
+                    snapshot_at, min_usd,
+                )
+            else:
+                pending = await asyncio.to_thread(
+                    _read_pending_addresses, db.path, cfg.recheck_interval_sec,
+                    batch_limit, cfg.balance_retry_sec, snapshot_at, min_usd,
+                )
             in_flight = set(active.values())
             for address in pending:
                 if len(active) >= cfg.balance_concurrency:
@@ -7487,6 +7526,29 @@ def _read_pending_rabby_scan(
     try:
         row = view.pending_rabby_scan(retry_sec, as_of, minimum_age_sec)
         return dict(row) if row is not None else None
+    finally:
+        view.close()
+
+
+def _read_pending_addresses(
+    path: Path, recheck_sec: int, limit: int, retry_sec: int,
+    as_of: float | None, min_usd: float,
+) -> list[str]:
+    """Select ready addresses on a separate read-only SQLite connection."""
+    view = DB(path, read_only=True)
+    try:
+        return view.pending_addresses(recheck_sec, limit, retry_sec, as_of, min_usd)
+    finally:
+        view.close()
+
+
+def _read_discovery_sets(path: Path, chain: str, role: str) -> tuple[set[str], set[str]]:
+    """Load large address caches only for an indexer that obtained a slot."""
+    view = DB(path, read_only=True)
+    try:
+        contracts = view.contract_addresses(chain)
+        active_calls = view.discovery_addresses(chain, "active_call") if role == "live" else set()
+        return contracts, active_calls
     finally:
         view.close()
 
@@ -8370,13 +8432,15 @@ async def run(args: argparse.Namespace) -> None:
             base_backfill=cfg.discovery_backfill_slots,
             allow_balance_only=profile == "steady",
         )
-        initial_queue = db.monitoring_snapshot(cfg.min_usd)
+        initial_queue, initial_token_due, initial_sui_pending = await asyncio.to_thread(
+            _read_governor_inputs, db.path,
+        )
         initial_live, initial_backfill = governor.evaluate(
             int(initial_queue.get("balance_pending") or 0),
             float(initial_queue.get("balance_oldest_age_sec") or 0),
             0.0,
-            sui_pending=db.sui_enrichment_pending(),
-            token_pending=sum(row["due"] for row in db.token_log_queue_snapshot().values()),
+            sui_pending=initial_sui_pending,
+            token_pending=initial_token_due,
         )
         await discovery_slots.set_capacity(initial_live, initial_backfill)
         if cfg.run_indexer and not args.balances_only:

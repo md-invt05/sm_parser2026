@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -197,6 +198,59 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             [ADDRESS],
             self.db.pending_addresses(86400, retry_sec=600, as_of=time.time() + 1801),
         )
+
+    async def test_pending_addresses_new_then_high_value_then_oldest_due(self):
+        high, old, later, new = [f"0x{i:040x}" for i in range(1, 5)]
+        self.db.upsert_contracts([
+            ("ethereum", high, 1, "0x1", None, "2026-01-01"),
+            ("ethereum", old, 2, "0x2", None, "2026-01-01"),
+            ("base", old, 3, "0x3", None, "2026-01-01"),
+            ("ethereum", later, 4, "0x4", None, "2026-01-01"),
+            ("ethereum", new, 5, "0x5", None, "2026-01-01"),
+        ])
+        for address, chain in ((high, "ethereum"), (old, "ethereum"),
+                               (old, "base"), (later, "ethereum")):
+            self.db.save_address_chain_state(address, {
+                "chain": chain, "has_code": 1, "status": "complete", "total_usd": 0,
+            }, [], 500_000)
+        with self.db.conn:
+            self.db.conn.execute(
+                "UPDATE contracts SET last_total_usd=600000 WHERE address=?", (high,),
+            )
+            for address, chain, day in ((high, "ethereum", 3), (old, "ethereum", 1),
+                                        (old, "base", 4), (later, "ethereum", 2)):
+                self.db.conn.execute(
+                    "UPDATE address_chain_state SET next_retry_at=? WHERE address=? AND chain=?",
+                    (f"2026-01-0{day}T00:00:00+00:00", address, chain),
+                )
+        due = self.db.pending_addresses(
+            86400, limit=4, as_of=datetime(2026, 1, 5, tzinfo=timezone.utc).timestamp(),
+        )
+        self.assertEqual([new, high, old, later], due)
+
+    async def test_file_backed_balance_selection_runs_outside_event_loop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = s.DB(Path(folder) / "contracts.db")
+            main_thread = threading.get_ident()
+            reader_threads = []
+
+            def slow_reader(*_args):
+                reader_threads.append(threading.get_ident())
+                time.sleep(0.05)
+                return []
+
+            try:
+                with patch.object(s, "_read_pending_addresses", side_effect=slow_reader):
+                    task = asyncio.create_task(s.check_multichain_balances(
+                        db, {}, {}, None, self.cfg, 500_000, asyncio.Event(), once=True,
+                    ))
+                    await asyncio.sleep(0.01)
+                    self.assertFalse(task.done())
+                    await task
+                self.assertEqual(1, len(reader_threads))
+                self.assertNotEqual(main_thread, reader_threads[0])
+            finally:
+                db.close()
 
 
 class RabbyTests(unittest.IsolatedAsyncioTestCase):
