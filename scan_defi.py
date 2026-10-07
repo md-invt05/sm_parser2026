@@ -26,6 +26,7 @@ import random
 import shutil
 import signal
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -6839,10 +6840,17 @@ async def rabby_fallback_loop(
         while not stop.is_set():
             if client.disabled:
                 return
-            row = db.pending_rabby_scan(
-                max(cfg.balance_retry_sec, 86400), snapshot_at,
-                cfg.rabby_token_discovery_after_sec,
-            )
+            retry_sec = max(cfg.balance_retry_sec, 86400)
+            if str(db.path) == ":memory:":
+                # Unit-test databases cannot be reopened by a separate reader.
+                row = db.pending_rabby_scan(
+                    retry_sec, snapshot_at, cfg.rabby_token_discovery_after_sec,
+                )
+            else:
+                row = await asyncio.to_thread(
+                    _read_pending_rabby_scan, db.path, retry_sec, snapshot_at,
+                    cfg.rabby_token_discovery_after_sec,
+                )
             if row is None or time.monotonic() < client.cooldown_until:
                 if once and rpc_finished.is_set() and row is None:
                     return
@@ -7471,6 +7479,18 @@ def _read_governor_inputs(path: Path) -> tuple[dict[str, Any], int, int]:
         view.close()
 
 
+def _read_pending_rabby_scan(
+    path: Path, retry_sec: int, as_of: float | None, minimum_age_sec: int,
+) -> dict[str, Any] | None:
+    """Keep the costly latest-scan lookup off the RPC event loop and writer DB."""
+    view = DB(path, read_only=True)
+    try:
+        row = view.pending_rabby_scan(retry_sec, as_of, minimum_age_sec)
+        return dict(row) if row is not None else None
+    finally:
+        view.close()
+
+
 async def heartbeat_loop(
     db: DB,
     cfg: AppCfg,
@@ -7684,28 +7704,59 @@ async def event_loop_lag_loop(
     stop: asyncio.Event, *, interval_sec: float = 1.0,
     warning_sec: float = 5.0, report_sec: float = 60.0,
 ) -> None:
-    """Report scheduler stalls without any database or network work."""
+    """Report scheduler stalls and the blocked stack without DB/network work."""
     clock = asyncio.get_running_loop().time
     next_tick = clock() + interval_sec
     last_warning = float("-inf")
     last_report = clock()
     samples: list[float] = []
-    while not stop.is_set():
-        await asyncio.sleep(max(0.0, next_tick - clock()))
-        now = clock()
-        lag = max(0.0, now - next_tick)
-        samples.append(lag)
-        if lag >= warning_sec and now - last_warning >= 30:
-            log.warning("[runtime] event_loop_lag %.2fs", lag)
-            last_warning = now
-        if now - last_report >= report_sec:
-            ordered = sorted(samples)
-            p95 = ordered[min(len(ordered) - 1, round((len(ordered) - 1) * .95))]
-            log.info("[runtime] event_loop_lag p95=%.2fs max=%.2fs samples=%d",
-                     p95, ordered[-1], len(ordered))
-            samples.clear()
-            last_report = now
-        next_tick = now + interval_sec
+    last_tick = [clock()]
+    thread_stop = threading.Event()
+    loop_thread_id = threading.get_ident()
+
+    def blocked_stack_watchdog() -> None:
+        last_dump = float("-inf")
+        while not thread_stop.wait(1.0):
+            now = time.monotonic()
+            stale = now - last_tick[0]
+            if stale < max(5.0, warning_sec) or now - last_dump < 30.0:
+                continue
+            frame = sys._current_frames().get(loop_thread_id)
+            if frame is None:
+                continue
+            # Function names and line numbers only: no RPC URLs, keys or locals.
+            stack = traceback.extract_stack(frame, limit=10)
+            callers = " > ".join(
+                f"{Path(item.filename).name}:{item.name}:{item.lineno}"
+                for item in stack[-8:]
+            )
+            log.warning("[runtime] event_loop_stall %.2fs stack=%s", stale, callers)
+            last_dump = now
+
+    watchdog = threading.Thread(
+        target=blocked_stack_watchdog, name="event-loop-stack-watchdog", daemon=True,
+    )
+    watchdog.start()
+    try:
+        while not stop.is_set():
+            await asyncio.sleep(max(0.0, next_tick - clock()))
+            now = clock()
+            lag = max(0.0, now - next_tick)
+            last_tick[0] = now
+            samples.append(lag)
+            if lag >= warning_sec and now - last_warning >= 30:
+                log.warning("[runtime] event_loop_lag %.2fs", lag)
+                last_warning = now
+            if now - last_report >= report_sec:
+                ordered = sorted(samples)
+                p95 = ordered[min(len(ordered) - 1, round((len(ordered) - 1) * .95))]
+                log.info("[runtime] event_loop_lag p95=%.2fs max=%.2fs samples=%d",
+                         p95, ordered[-1], len(ordered))
+                samples.clear()
+                last_report = now
+            next_tick = now + interval_sec
+    finally:
+        thread_stop.set()
 
 
 async def governor_loop(

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -307,6 +308,32 @@ class RabbyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(qualifying_only[2].exists())
         finally:
             db.close()
+
+    async def test_file_backed_rabby_selection_runs_outside_event_loop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = s.DB(Path(folder) / "contracts.db")
+            finished = asyncio.Event()
+            finished.set()
+            main_thread = threading.get_ident()
+            reader_threads = []
+
+            def slow_reader(*_args):
+                reader_threads.append(threading.get_ident())
+                time.sleep(0.05)
+                return None
+
+            try:
+                with patch.object(s, "_read_pending_rabby_scan", side_effect=slow_reader):
+                    task = asyncio.create_task(s.rabby_fallback_loop(
+                        db, self.chains, self.cfg, asyncio.Event(), finished, True,
+                    ))
+                    await asyncio.sleep(0.01)
+                    self.assertFalse(task.done())
+                    await task
+                self.assertEqual(1, len(reader_threads))
+                self.assertNotEqual(main_thread, reader_threads[0])
+            finally:
+                db.close()
 
     async def test_existing_intermediate_rabby_table_migrates_without_data_loss(self):
         with tempfile.TemporaryDirectory() as folder:
