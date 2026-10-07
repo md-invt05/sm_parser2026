@@ -755,6 +755,11 @@ CREATE TABLE IF NOT EXISTS runtime_meta (
     value            TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS address_recheck_caps (
+    address         TEXT PRIMARY KEY,
+    capped_at       TEXT NOT NULL,
+    scan_count      INTEGER NOT NULL
+);
 """
 
 
@@ -899,9 +904,9 @@ class DB:
             """
         )
         self.conn.execute(
-            "INSERT INTO schema_meta(version) SELECT 13 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
+            "INSERT INTO schema_meta(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
         )
-        self.conn.execute("UPDATE schema_meta SET version=13 WHERE version < 13")
+        self.conn.execute("UPDATE schema_meta SET version=14 WHERE version < 14")
         self.conn.execute(
             "INSERT OR IGNORE INTO runtime_meta(key,value,updated_at) VALUES('data_revision','0',?)",
             (datetime.now(timezone.utc).isoformat(),),
@@ -2461,7 +2466,9 @@ class DB:
                     # other cross-chain schedules.
                     self.conn.execute(
                         "UPDATE address_chain_state SET next_retry_at=? "
-                        "WHERE address=? AND chain=? AND next_retry_at>?",
+                        "WHERE address=? AND chain=? AND next_retry_at>? "
+                        "AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x "
+                        "WHERE x.address=address_chain_state.address)",
                         (now, contract, chain, now),
                     )
                 else:
@@ -2513,6 +2520,8 @@ class DB:
                 """SELECT lower(c.address) address,MIN(c.first_seen_at) due_at
                    FROM contracts c WHERE c.canonical=1 AND NOT EXISTS(
                      SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
+                   AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
+                                  WHERE x.address=lower(c.address))
                    GROUP BY lower(c.address) ORDER BY due_at,address LIMIT ?""",
                 (limit,),
             ).fetchall()
@@ -2529,6 +2538,8 @@ class DB:
                    FROM contracts c JOIN address_chain_state s
                      ON s.address=lower(c.address) AND s.next_retry_at<=?
                    WHERE c.last_total_usd>=?
+                     AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
+                                    WHERE x.address=s.address)
                    GROUP BY lower(c.address)
                    ORDER BY due_at,address LIMIT ?""",
                 (now_iso, min_usd, limit - len(addresses)),
@@ -2541,7 +2552,10 @@ class DB:
             if len(addresses) < limit:
                 for row in self.conn.execute(
                     """SELECT address FROM address_chain_state INDEXED BY idx_address_chain_retry
-                       WHERE next_retry_at<=? ORDER BY next_retry_at,address""",
+                       WHERE next_retry_at<=? AND NOT EXISTS(
+                         SELECT 1 FROM address_recheck_caps x
+                         WHERE x.address=address_chain_state.address)
+                       ORDER BY next_retry_at,address""",
                     (now_iso,),
                 ):
                     address = str(row["address"])
@@ -2559,6 +2573,8 @@ class DB:
             time.time() if as_of is None else as_of, timezone.utc
         ).isoformat()
         with self._lock:
+            if self._rechecks_capped_locked(address):
+                return []
             rows = {
                 str(row["chain"]): row
                 for row in self.conn.execute(
@@ -2576,6 +2592,8 @@ class DB:
         with self._lock:
             return list(self.conn.execute(
                 "SELECT * FROM address_chain_state WHERE status IN ('price_missing','partial') "
+                "AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x "
+                "WHERE x.address=address_chain_state.address) "
                 "AND price_retry_at<=? ORDER BY price_retry_at LIMIT ?", (now, limit),
             ))
 
@@ -2905,6 +2923,8 @@ class DB:
         address = address.lower()
         now = datetime.fromtimestamp(as_of or time.time(), timezone.utc).isoformat()
         with self._lock, self.conn:
+            if self._rechecks_capped_locked(address):
+                return []
             state = self.conn.execute(
                 "SELECT * FROM address_chain_state WHERE address=? AND chain=?",
                 (address, chain),
@@ -2945,6 +2965,8 @@ class DB:
         now = datetime.fromtimestamp(time.time() if as_of is None else as_of,
                                      timezone.utc).isoformat()
         with self._lock:
+            if self._rechecks_capped_locked(address):
+                return []
             return list(self.conn.execute(
                 """SELECT * FROM balance_work_items WHERE chain=? AND address=?
                    AND status='pending' AND due_at<=?
@@ -2955,6 +2977,8 @@ class DB:
 
     def has_balance_work(self, address: str, chain: str) -> bool:
         with self._lock:
+            if self._rechecks_capped_locked(address):
+                return False
             return self.conn.execute(
                 """SELECT 1 FROM balance_work_items
                    WHERE chain=? AND address=? AND status='pending' LIMIT 1""",
@@ -2968,6 +2992,8 @@ class DB:
         until = datetime.fromtimestamp(now.timestamp() + seconds,
                                        timezone.utc).isoformat()
         with self._lock, self.conn:
+            if self._rechecks_capped_locked(address):
+                return False
             result = self.conn.execute(
                 """UPDATE balance_work_items SET lease_until=?,updated_at=?
                    WHERE chain=? AND address=? AND kind=? AND asset=?
@@ -3353,6 +3379,8 @@ class DB:
                                     aggregate_usd=total_usd)
         target = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat()
         with self._lock, self.conn:
+            if self._rechecks_capped_locked(address):
+                return
             if total_usd >= 150_000:
                 self.conn.execute(
                     """UPDATE token_log_tasks SET priority=MAX(priority,50),
@@ -3367,6 +3395,67 @@ class DB:
                    WHERE address=? AND has_code=1 AND status='complete' AND total_usd>0""",
                 (target, target, address.lower()),
             )
+
+    def _rechecks_capped_locked(self, address: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM address_recheck_caps WHERE address=?",
+            (address.lower(),),
+        ).fetchone() is not None
+
+    def _cap_address_rechecks_locked(self, address: str, scan_count: int) -> None:
+        """Stop all future balance/price retries after the third recorded scan."""
+        now = datetime.now(timezone.utc).isoformat()
+        never = "9999-12-31T23:59:59+00:00"
+        self.conn.execute(
+            "INSERT OR IGNORE INTO address_recheck_caps(address,capped_at,scan_count) "
+            "VALUES(?,?,?)", (address.lower(), now, scan_count),
+        )
+        self.conn.execute(
+            "UPDATE address_chain_state SET next_retry_at=?,price_retry_at=NULL "
+            "WHERE address=?", (never, address.lower()),
+        )
+        self.conn.execute(
+            "UPDATE balance_work_items SET status='capped',lease_until=NULL,updated_at=? "
+            "WHERE address=? AND status='pending'", (now, address.lower()),
+        )
+
+    def needs_recheck_cap_migration(self) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='balance_recheck_cap_revision'"
+            ).fetchone()
+            return row is None or row[0] != "1"
+
+    def cap_existing_address_rechecks(self) -> int:
+        """Idempotently cap addresses with an initial scan plus two rechecks."""
+        if not self.needs_recheck_cap_migration():
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        never = "9999-12-31T23:59:59+00:00"
+        with self._lock, self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO address_recheck_caps(address,capped_at,scan_count) "
+                "SELECT address,?,COUNT(*) FROM address_scans GROUP BY address "
+                "HAVING COUNT(*)>=3", (now,),
+            )
+            count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM address_recheck_caps"
+            ).fetchone()[0])
+            self.conn.execute(
+                "UPDATE address_chain_state SET next_retry_at=?,price_retry_at=NULL "
+                "WHERE address IN (SELECT address FROM address_recheck_caps)", (never,),
+            )
+            self.conn.execute(
+                "UPDATE balance_work_items SET status='capped',lease_until=NULL,updated_at=? "
+                "WHERE status='pending' AND address IN "
+                "(SELECT address FROM address_recheck_caps)", (now,)
+            )
+            self.conn.execute(
+                "INSERT INTO runtime_meta(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                ("balance_recheck_cap_revision", "1", now),
+            )
+            return count
 
     def needs_balance_schedule_rephase(self) -> bool:
         with self._lock:
@@ -3495,6 +3584,8 @@ class DB:
                 """SELECT a.* FROM address_scans a
                    LEFT JOIN rabby_estimates r ON r.address=a.address
                    WHERE a.id=(SELECT MAX(a2.id) FROM address_scans a2 WHERE a2.address=a.address)
+                     AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
+                                    WHERE x.address=a.address)
                      AND EXISTS (SELECT 1 FROM address_chain_scans c WHERE c.scan_id=a.id
                                  AND (c.status NOT IN ('complete','absent')
                                       OR c.note LIKE '%token_coverage_partial%'))
@@ -3591,6 +3682,12 @@ class DB:
                 """,
                 (now, float(total_usd), status, address),
             )
+            scan_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM address_scans "
+                "WHERE address=? LIMIT 3)", (address,),
+            ).fetchone()[0])
+            if scan_count >= 3:
+                self._cap_address_rechecks_locked(address, scan_count)
             self._bump_revision_locked()
             self.conn.commit()
             return scan_id
@@ -3774,15 +3871,20 @@ class DB:
                    )
                    SELECT COUNT(*) n,MIN(c.first_seen_at) oldest
                    FROM unique_contracts c LEFT JOIN known k ON k.address=c.address
-                   WHERE k.address IS NULL"""
+                   WHERE k.address IS NULL AND NOT EXISTS(
+                     SELECT 1 FROM address_recheck_caps x WHERE x.address=c.address)"""
             ).fetchone()
             retry = self.conn.execute(
                 """SELECT COUNT(DISTINCT address) n,MIN(next_retry_at) oldest
-                   FROM address_chain_state WHERE next_retry_at<=?""", (now_iso,)
+                   FROM address_chain_state WHERE next_retry_at<=? AND NOT EXISTS(
+                     SELECT 1 FROM address_recheck_caps x
+                     WHERE x.address=address_chain_state.address)""", (now_iso,)
             ).fetchone()
             rpc_retry = int(self.conn.execute(
                 """SELECT COUNT(DISTINCT address) FROM address_chain_state
-                   WHERE next_retry_at<=? AND status IN ('rpc_error','partial','timeout')""",
+                   WHERE next_retry_at<=? AND status IN ('rpc_error','partial','timeout')
+                     AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
+                                    WHERE x.address=address_chain_state.address)""",
                 (now_iso,),
             ).fetchone()[0]) if include_breakdown else 0
             coverage_wait = int(self.conn.execute(
@@ -8196,6 +8298,24 @@ async def run(args: argparse.Namespace) -> None:
                 continue
         if changed:
             log.info("rephased %s existing chain balance schedules", changed)
+    if not args.rpc_check and not args.export_only and db.needs_recheck_cap_migration():
+        def migrate_recheck_cap() -> int:
+            if db.conn.execute("SELECT COUNT(*) FROM address_scans").fetchone()[0]:
+                backup_path = backup_database(
+                    db, ROOT / "backups" / "pre_balance_recheck_cap_v1", keep=1,
+                )
+                log.info("balance recheck cap backup: %s", backup_path.name)
+            return db.cap_existing_address_rechecks()
+
+        migration = asyncio.create_task(asyncio.to_thread(migrate_recheck_cap))
+        while True:
+            monitor.set_runtime_state("migrating", "capping EVM balance rechecks")
+            try:
+                capped = await asyncio.wait_for(asyncio.shield(migration), timeout=30)
+                break
+            except asyncio.TimeoutError:
+                continue
+        log.info("capped balance rechecks for %s existing addresses", capped)
     db.seed_valuation_policies(cfg.valuation_policies)
     sui_store.seed_tvl_policies(list(cfg.sui.get("valuation_policies") or []))
     revalued = db.revalue_system_balances(cfg.min_usd)

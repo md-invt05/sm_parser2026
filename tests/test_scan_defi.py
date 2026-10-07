@@ -101,7 +101,7 @@ class ConfigAndDatabaseTests(unittest.TestCase):
                 "SELECT source FROM contract_discoveries WHERE chain='ethereum' AND address='0xabc'"
             ).fetchone()
             self.assertEqual("direct_deploy", source["source"])
-            self.assertEqual(13, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
+            self.assertEqual(14, second.conn.execute("SELECT version FROM schema_meta").fetchone()[0])
             second.close()
 
     def test_upsert_contract_count_is_exact_for_executemany(self):

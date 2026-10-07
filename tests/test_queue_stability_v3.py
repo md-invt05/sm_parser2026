@@ -250,7 +250,7 @@ def test_balance_queue_new_addresses_are_distinct_and_indexes_are_idempotent(tmp
 
     reopened = scanner.DB(path)
     assert reopened.balance_queue_snapshot()["balance_new_pending"] == 1
-    assert reopened.conn.execute("SELECT version FROM schema_meta").fetchone()[0] == 13
+    assert reopened.conn.execute("SELECT version FROM schema_meta").fetchone()[0] == 14
     reopened.close()
 
 
