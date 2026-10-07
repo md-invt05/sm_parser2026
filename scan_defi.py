@@ -3816,15 +3816,19 @@ class DB:
             scans_total = int(self.conn.execute(
                 "SELECT COALESCE(MAX(id),0) FROM address_scans"
             ).fetchone()[0])
+            # save_address_scan appends a new row for every completed scan, so
+            # the greatest id is the latest committed observation per address.
+            # Filtering every scan through a correlated ORDER BY lookup took
+            # minutes once the scan history grew beyond 100k rows.
             status_row = self.conn.execute(
-                """SELECT
+                """WITH latest AS (
+                     SELECT MAX(id) AS id FROM address_scans GROUP BY address
+                   ) SELECT
                      COUNT(*) FILTER (WHERE a.total_usd>=?) qualifying,
                      COUNT(*) FILTER (WHERE a.status='below' AND a.total_usd>0
                                       AND a.total_usd<?) below,
                      COUNT(*) FILTER (WHERE a.status='incomplete' AND a.total_usd<?) incomplete
-                   FROM address_scans a WHERE a.id=(
-                     SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
-                     ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)""",
+                   FROM latest JOIN address_scans a ON a.id=latest.id""",
                 (min_usd, min_usd, min_usd),
             ).fetchone()
             statuses = {key: int(status_row[key] or 0) for key in (
@@ -3834,9 +3838,11 @@ class DB:
                 f"{int(row['coverage'])}/{int(row['total_networks'])}": int(row["n"])
                 for row in self.conn.execute(
                     """
+                    WITH latest AS (
+                        SELECT MAX(id) AS id FROM address_scans GROUP BY address
+                    )
                     SELECT coverage,total_networks,COUNT(*) AS n FROM address_scans a
-                    WHERE a.id=(SELECT a2.id FROM address_scans a2 WHERE a2.address=a.address
-                                ORDER BY a2.scanned_at DESC,a2.id DESC LIMIT 1)
+                    JOIN latest ON latest.id=a.id
                     GROUP BY coverage,total_networks
                     """
                 )

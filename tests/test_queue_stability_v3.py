@@ -211,6 +211,25 @@ def test_governor_skips_retry_breakdown_and_status_uses_read_only_view(tmp_path)
     db.close()
 
 
+def test_monitoring_snapshot_counts_only_latest_committed_scan(tmp_path):
+    db = scanner.DB(tmp_path / "db.sqlite")
+    other = "0x" + "ef" * 20
+    db.upsert_contracts([
+        ("ethereum", ADDRESS, 1, "0x1", None, "2026-01-01"),
+        ("ethereum", other, 2, "0x2", None, "2026-01-01"),
+    ])
+    db.save_address_scan(ADDRESS, "below", 10, 1, 2, [], [])
+    db.save_address_scan(ADDRESS, "qualifying", 600_000, 2, 2, [], [])
+    db.save_address_scan(other, "incomplete", 0, 1, 2, [], [])
+
+    snapshot = db.monitoring_snapshot(500_000)
+    assert snapshot["balance_scans_total"] == 3
+    assert snapshot["balance_completed"] == 2
+    assert (snapshot["qualifying"], snapshot["below_count"], snapshot["incomplete"]) == (1, 0, 1)
+    assert snapshot["coverage_json"] == {"2/2": 1, "1/2": 1}
+    db.close()
+
+
 def test_event_loop_lag_monitor_reports_a_real_pause():
     async def scenario():
         stop = asyncio.Event()
