@@ -69,6 +69,7 @@ def test_discovery_commit_enqueues_log_task_atomically(tmp_path):
             enqueue_token_logs=True,
         )
     assert db.conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 0
+    assert db.conn.execute("SELECT COUNT(*) FROM new_balance_addresses").fetchone()[0] == 0
     assert db.cursor("ethereum", "live")["last_committed"] == 99
     db.conn.execute("DROP TRIGGER reject_task")
     assert db.commit_index_range(
@@ -78,6 +79,7 @@ def test_discovery_commit_enqueues_log_task_atomically(tmp_path):
     task = db.token_log_task("ethereum", ADDRESS)
     assert (task["first_block"], task["next_block"], task["history_limited"]) == (100, 100, 0)
     assert db.cursor("ethereum", "live")["last_committed"] == 100
+    assert db.pending_addresses(0) == [ADDRESS]
     assert db.commit_index_range(
         "ethereum", "live", 100, [contract], [source], [], [], [],
         enqueue_token_logs=True,

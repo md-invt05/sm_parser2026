@@ -760,6 +760,12 @@ CREATE TABLE IF NOT EXISTS address_recheck_caps (
     capped_at       TEXT NOT NULL,
     scan_count      INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS new_balance_addresses (
+    address TEXT PRIMARY KEY,
+    first_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_new_balance_addresses_due
+    ON new_balance_addresses(first_seen_at,address);
 """
 
 
@@ -797,6 +803,10 @@ class DB:
             columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
             if "canonical" not in columns:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN canonical INTEGER NOT NULL DEFAULT 1")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contracts_canonical_lower_address "
+            "ON contracts(lower(address)) WHERE canonical=1"
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_discoveries_canonical_block "
             "ON contract_discoveries(chain,canonical,observed_block)"
@@ -904,14 +914,56 @@ class DB:
             """
         )
         self.conn.execute(
-            "INSERT INTO schema_meta(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
+            "INSERT INTO schema_meta(version) SELECT 15 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"
         )
-        self.conn.execute("UPDATE schema_meta SET version=14 WHERE version < 14")
+        self.conn.execute("UPDATE schema_meta SET version=15 WHERE version < 15")
         self.conn.execute(
             "INSERT OR IGNORE INTO runtime_meta(key,value,updated_at) VALUES('data_revision','0',?)",
             (datetime.now(timezone.utc).isoformat(),),
         )
         self.conn.commit()
+        self.reconcile_new_balance_addresses()
+
+    def reconcile_new_balance_addresses(self) -> None:
+        """Repair the first-scan queue after upgrades or an interrupted write."""
+        if self.read_only:
+            return
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO new_balance_addresses(address,first_seen_at)
+                   SELECT lower(c.address),MIN(c.first_seen_at) FROM contracts c
+                   WHERE c.canonical=1 AND NOT EXISTS(
+                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
+                     AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
+                                    WHERE x.address=lower(c.address))
+                   GROUP BY lower(c.address)
+                   ON CONFLICT(address) DO UPDATE SET first_seen_at=excluded.first_seen_at
+                   WHERE excluded.first_seen_at!=new_balance_addresses.first_seen_at"""
+            )
+            self.conn.execute(
+                """DELETE FROM new_balance_addresses WHERE EXISTS(
+                     SELECT 1 FROM address_chain_state s
+                     WHERE s.address=new_balance_addresses.address)
+                   OR EXISTS(SELECT 1 FROM address_recheck_caps x
+                             WHERE x.address=new_balance_addresses.address)
+                   OR NOT EXISTS(SELECT 1 FROM contracts c
+                                 WHERE lower(c.address)=new_balance_addresses.address
+                                   AND c.canonical=1)"""
+            )
+
+    def _enqueue_new_addresses_locked(self, rows: list[tuple[Any, ...]]) -> None:
+        if not rows:
+            return
+        self.conn.executemany(
+            """INSERT INTO new_balance_addresses(address,first_seen_at)
+               SELECT lower(?),? WHERE EXISTS(
+                 SELECT 1 FROM contracts c WHERE lower(c.address)=lower(?) AND c.canonical=1)
+                 AND NOT EXISTS(SELECT 1 FROM address_chain_state s WHERE s.address=lower(?))
+                 AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x WHERE x.address=lower(?))
+               ON CONFLICT(address) DO UPDATE SET
+                 first_seen_at=MIN(new_balance_addresses.first_seen_at,excluded.first_seen_at)""",
+            [(row[1], row[5], row[1], row[1], row[1]) for row in rows],
+        )
 
     def close(self) -> None:
         self.conn.close()
@@ -1442,6 +1494,11 @@ class DB:
                 (ancestor, ancestor, ancestor, chain),
             )
             self.conn.execute(
+                """DELETE FROM new_balance_addresses WHERE NOT EXISTS(
+                      SELECT 1 FROM contracts c WHERE lower(c.address)=new_balance_addresses.address
+                       AND c.canonical=1)"""
+            )
+            self.conn.execute(
                 "DELETE FROM discovery_block_hashes WHERE chain=? AND block_number>?",
                 (chain, ancestor),
             )
@@ -1615,6 +1672,7 @@ class DB:
                 discovery_rows,
             )
             sources_inserted = self.conn.total_changes - before_sources
+            self._enqueue_new_addresses_locked(contract_rows)
             self.conn.executemany(
                 """UPDATE contract_discoveries SET observed_block=?,observed_tx=?,actor=?,canonical=1
                    WHERE chain=? AND address=? AND source=?
@@ -1762,6 +1820,7 @@ class DB:
                 discoveries,
             )
             sources = self.conn.total_changes - before
+            self._enqueue_new_addresses_locked(contracts)
             self.conn.executemany(
                 """INSERT INTO contract_code_cache(chain,address,has_code,checked_at,checked_block)
                    VALUES(?,?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET
@@ -1958,6 +2017,20 @@ class DB:
                 "history_eta_sec": None,  # Window count is not yet measured reliably.
             }
         return result
+
+    def token_log_due_count(self) -> int:
+        """Exact governor input without status-only grouping and error summaries."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            return int(self.conn.execute(
+                """SELECT COUNT(*) FROM token_log_tasks t
+                   WHERE (t.recent_due_at<=? OR
+                          (t.history_due_at<=? AND t.completed_at IS NULL))
+                     AND NOT EXISTS(SELECT 1 FROM contracts c
+                                    WHERE c.chain=t.chain AND c.address=t.address
+                                      AND c.canonical=0)""",
+                (now, now),
+            ).fetchone()[0])
 
     def commit_token_log_window(
         self, chain: str, address: str, end: int, head: int,
@@ -2197,7 +2270,7 @@ class DB:
     def upsert_contracts(self, rows: list[tuple]) -> int:
         if not rows:
             return 0
-        with self._lock:
+        with self._lock, self.conn:
             before = self.conn.total_changes
             self.conn.executemany(
                 """
@@ -2208,6 +2281,7 @@ class DB:
                 rows,
             )
             inserted = self.conn.total_changes - before
+            self._enqueue_new_addresses_locked(rows)
             self.conn.executemany(
                 """
                 UPDATE contracts SET
@@ -2221,7 +2295,6 @@ class DB:
                     for row in rows
                 ],
             )
-            self.conn.commit()
             return inserted
 
     def upsert_contract_discoveries(self, rows: list[tuple]) -> int:
@@ -2517,12 +2590,14 @@ class DB:
             # New addresses first.  Existing work comes directly from the
             # next_retry_at index, not a GROUP BY over every contract on each poll.
             new_rows = self.conn.execute(
-                """SELECT lower(c.address) address,MIN(c.first_seen_at) due_at
-                   FROM contracts c WHERE c.canonical=1 AND NOT EXISTS(
-                     SELECT 1 FROM address_chain_state s WHERE s.address=lower(c.address))
-                   AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
-                                  WHERE x.address=lower(c.address))
-                   GROUP BY lower(c.address) ORDER BY due_at,address LIMIT ?""",
+                """SELECT q.address,q.first_seen_at due_at FROM new_balance_addresses q
+                   WHERE EXISTS(SELECT 1 FROM contracts c
+                                 WHERE lower(c.address)=q.address AND c.canonical=1)
+                     AND NOT EXISTS(SELECT 1 FROM address_chain_state s
+                                    WHERE s.address=q.address)
+                     AND NOT EXISTS(SELECT 1 FROM address_recheck_caps x
+                                    WHERE x.address=q.address)
+                   ORDER BY q.first_seen_at,q.address LIMIT ?""",
                 (limit,),
             ).fetchall()
             addresses = [str(row["address"]) for row in new_rows]
@@ -2787,7 +2862,8 @@ class DB:
                     observed("valuation_status"), failure_streak, next_retry, row.get("note"), coverage_state,
                     price_retry,
                 ),
-            )
+                 )
+            self.conn.execute("DELETE FROM new_balance_addresses WHERE address=?", (address,))
             if has_observation:
                 self.conn.execute(
                     "DELETE FROM balance_work_items WHERE chain=? AND address=? AND kind='chain_reconcile'",
@@ -3410,6 +3486,7 @@ class DB:
             "INSERT OR IGNORE INTO address_recheck_caps(address,capped_at,scan_count) "
             "VALUES(?,?,?)", (address.lower(), now, scan_count),
         )
+        self.conn.execute("DELETE FROM new_balance_addresses WHERE address=?", (address.lower(),))
         self.conn.execute(
             "UPDATE address_chain_state SET next_retry_at=?,price_retry_at=NULL "
             "WHERE address=?", (never, address.lower()),
@@ -3437,6 +3514,10 @@ class DB:
                 "INSERT OR IGNORE INTO address_recheck_caps(address,capped_at,scan_count) "
                 "SELECT address,?,COUNT(*) FROM address_scans GROUP BY address "
                 "HAVING COUNT(*)>=3", (now,),
+            )
+            self.conn.execute(
+                "DELETE FROM new_balance_addresses WHERE address IN "
+                "(SELECT address FROM address_recheck_caps)"
             )
             count = int(self.conn.execute(
                 "SELECT COUNT(*) FROM address_recheck_caps"
@@ -3682,6 +3763,7 @@ class DB:
                 """,
                 (now, float(total_usd), status, address),
             )
+            self.conn.execute("DELETE FROM new_balance_addresses WHERE address=?", (address,))
             scan_count = int(self.conn.execute(
                 "SELECT COUNT(*) FROM (SELECT 1 FROM address_scans "
                 "WHERE address=? LIMIT 3)", (address,),
@@ -3863,16 +3945,7 @@ class DB:
         now_iso = now.isoformat()
         with self._lock:
             new = self.conn.execute(
-                """WITH known AS MATERIALIZED (
-                     SELECT DISTINCT address FROM address_chain_state
-                   ), unique_contracts AS (
-                     SELECT address,MIN(first_seen_at) first_seen_at
-                     FROM contracts GROUP BY address
-                   )
-                   SELECT COUNT(*) n,MIN(c.first_seen_at) oldest
-                   FROM unique_contracts c LEFT JOIN known k ON k.address=c.address
-                   WHERE k.address IS NULL AND NOT EXISTS(
-                     SELECT 1 FROM address_recheck_caps x WHERE x.address=c.address)"""
+                "SELECT COUNT(*) n,MIN(first_seen_at) oldest FROM new_balance_addresses"
             ).fetchone()
             retry = self.conn.execute(
                 """SELECT COUNT(DISTINCT address) n,MIN(next_retry_at) oldest
@@ -7647,7 +7720,7 @@ def _read_governor_inputs(path: Path) -> tuple[dict[str, Any], int, int]:
     view = DB(path, read_only=True)
     try:
         queue = view.balance_queue_snapshot(include_breakdown=False)
-        token_due = sum(row["due"] for row in view.token_log_queue_snapshot().values())
+        token_due = view.token_log_due_count()
         return queue, token_due, view.sui_enrichment_pending()
     finally:
         view.close()

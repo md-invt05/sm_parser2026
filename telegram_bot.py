@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -1028,10 +1029,7 @@ class BotService:
             runtime_note = {}
         governor_note = runtime_note.get("load_governor")
         discovery_held = isinstance(governor_note, dict) and governor_note.get("state") == "balance_only"
-        latest_chains = self.monitor.rows(
-            "SELECT chain,run_id,active_rpc,cooldown_sec,cursor,safe_head,ts FROM chain_samples WHERE id IN "
-            "(SELECT MAX(id) FROM chain_samples WHERE role IN ('live','balance','discovery+balance') GROUP BY chain)"
-        )
+        latest_chains = self.monitor.latest_incident_chain_samples()
         for row in latest_chains:
             down_samples = self.monitor.rows(
                 "SELECT COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM chain_samples "
@@ -1249,13 +1247,49 @@ class BotService:
             self._condition(active, fingerprint, severity, "system_load", message)
         rows = self.monitor.rows("SELECT * FROM resource_samples WHERE ts>=? ORDER BY ts", ((now - timedelta(minutes=10)).isoformat(),))
         if rows:
-            span = timestamp_span(rows[0]["ts"], rows[-1]["ts"])
-            load_active = span >= 580 and all(float(row["load1"] or 0) > 1.5 * float(row["cpu_cores"] or 1) for row in rows)
-            self._condition(load_active, "system:load:warning", "warning", "system_load", "Load average above 1.5 × CPU cores for 10 minutes")
             recent = [row for row in rows if iso_to_dt(row["ts"]) and iso_to_dt(row["ts"]) >= now - timedelta(minutes=5)]
             recent_span = timestamp_span(recent[0]["ts"], recent[-1]["ts"]) if recent else 0
-            load_critical = recent_span >= 280 and all(float(row["load1"] or 0) > 2 * float(row["cpu_cores"] or 1) for row in recent)
-            self._condition(load_critical, "system:load:critical", "critical", "system_load", "Load average above 2 × CPU cores for 5 minutes")
+            def load_state(fingerprint: str, open_ratio: float, open_span: int,
+                           close_ratio: float, severity: str, message: str,
+                           samples: list[sqlite3.Row], allow_open: bool = True) -> bool:
+                opened = self.monitor.active_incident(fingerprint)
+                if opened is None:
+                    if not allow_open:
+                        return False
+                    span = timestamp_span(samples[0]["ts"], samples[-1]["ts"]) if samples else 0
+                    if span >= open_span and all(
+                        float(sample["load1"] or 0) > open_ratio * float(sample["cpu_cores"] or 1)
+                        for sample in samples
+                    ):
+                        self.monitor.open_incident(fingerprint, severity, "system_load", message)
+                        return True
+                    return False
+                recovery = [sample for sample in rows if iso_to_dt(sample["ts"])
+                            and iso_to_dt(sample["ts"]) >= now - timedelta(minutes=2)]
+                span = timestamp_span(recovery[0]["ts"], recovery[-1]["ts"]) if recovery else 0
+                if span >= 100 and all(
+                    float(sample["load1"] or 0) < close_ratio * float(sample["cpu_cores"] or 1)
+                    for sample in recovery
+                ):
+                    self.monitor.resolve_incident(fingerprint)
+                    return False
+                return True
+
+            critical_load = load_state(
+                "system:load:critical", 2.0, 280, 1.8, "critical",
+                "Load average above 2 × CPU cores for 5 minutes", recent,
+            )
+            if critical_load:
+                load_state(
+                    "system:load:warning", 1.5, 580, 1.3, "warning",
+                    "Load average above 1.5 × CPU cores for 10 minutes", rows,
+                    allow_open=False,
+                )
+            else:
+                load_state(
+                    "system:load:warning", 1.5, 580, 1.3, "warning",
+                    "Load average above 1.5 × CPU cores for 10 minutes", rows,
+                )
             cmem = [100 * float(row["container_mem_bytes"] or 0) / float(row["container_mem_limit"] or 1) for row in recent]
             self._condition(recent_span >= 280 and all(value > 85 for value in cmem), "container:memory", "warning", "container_load", "Scanner container memory above 85% for 5 minutes")
 
@@ -1345,8 +1379,26 @@ class BotService:
         return app
 
 
+class TokenRedactingFormatter(logging.Formatter):
+    def __init__(self, fmt: str, token: str):
+        super().__init__(fmt)
+        self.token = token
+
+    def format(self, record: logging.LogRecord) -> str:
+        output = super().format(record)
+        if self.token:
+            output = output.replace(self.token, "[redacted]")
+        return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[redacted]", output)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(TokenRedactingFormatter(
+            "%(asctime)s %(levelname)s %(message)s", os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        ))
     service = BotService()
     if not service.allowed_chats:
         raise SystemExit("TELEGRAM_CHAT_IDS is empty; refusing to start without a whitelist")

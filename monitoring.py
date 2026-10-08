@@ -137,6 +137,12 @@ CREATE TABLE IF NOT EXISTS chain_samples(
     errors_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_chain_samples_time ON chain_samples(chain, ts);
+CREATE TABLE IF NOT EXISTS latest_chain_sample_ids (
+    chain TEXT NOT NULL,
+    role TEXT NOT NULL,
+    sample_id INTEGER NOT NULL,
+    PRIMARY KEY(chain,role)
+);
 
 CREATE TABLE IF NOT EXISTS aggregate_samples(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -342,6 +348,13 @@ class MonitorStore:
                 self.conn.execute("UPDATE schema_meta SET version=2 WHERE version<2")
             self.conn.execute("UPDATE schema_meta SET version=3 WHERE version<3")
             self.conn.execute("UPDATE schema_meta SET version=4 WHERE version<4")
+            if previous_version < 5:
+                self.conn.execute(
+                    """INSERT INTO latest_chain_sample_ids(chain,role,sample_id)
+                       SELECT chain,role,MAX(id) FROM chain_samples GROUP BY chain,role
+                       ON CONFLICT(chain,role) DO UPDATE SET sample_id=excluded.sample_id"""
+                )
+                self.conn.execute("UPDATE schema_meta SET version=5 WHERE version<5")
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",
                 ("scanner_paused", "0", utc_now()),
@@ -433,10 +446,26 @@ class MonitorStore:
         values.setdefault("ts", utc_now())
         values["errors_json"] = json.dumps(values.get("errors_json", {}), ensure_ascii=False)
         with self._lock, self.conn:
-            self.conn.execute(
+            cur = self.conn.execute(
                 f"INSERT INTO chain_samples({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
                 tuple(values.get(column) for column in columns),
             )
+            self.conn.execute(
+                """INSERT INTO latest_chain_sample_ids(chain,role,sample_id) VALUES(?,?,?)
+                   ON CONFLICT(chain,role) DO UPDATE SET sample_id=excluded.sample_id""",
+                (values["chain"], values["role"], int(cur.lastrowid)),
+            )
+
+    def latest_incident_chain_samples(self) -> list[sqlite3.Row]:
+        """Equivalent to the former MAX(id) per chain across incident roles."""
+        with self._lock:
+            return list(self.conn.execute(
+                """SELECT s.chain,s.run_id,s.active_rpc,s.cooldown_sec,s.cursor,s.safe_head,s.ts
+                   FROM chain_samples s JOIN (
+                     SELECT chain,MAX(sample_id) sample_id FROM latest_chain_sample_ids
+                     WHERE role IN ('live','balance','discovery+balance') GROUP BY chain
+                   ) latest ON latest.sample_id=s.id"""
+            ))
 
     def add_aggregate_sample(self, **values: Any) -> None:
         columns = [
@@ -740,6 +769,10 @@ class MonitorStore:
         with self._lock, self.conn:
             for table in ("chain_samples", "aggregate_samples", "resource_samples"):
                 self.conn.execute(f"DELETE FROM {table} WHERE ts<?", (cutoff,))
+            self.conn.execute(
+                """DELETE FROM latest_chain_sample_ids WHERE NOT EXISTS(
+                     SELECT 1 FROM chain_samples s WHERE s.id=latest_chain_sample_ids.sample_id)"""
+            )
             self.conn.execute("DELETE FROM discovery_stage_minute WHERE minute<?", (cutoff,))
             self.conn.execute("DELETE FROM rpc_attempt_minute WHERE minute<?", (cutoff,))
 

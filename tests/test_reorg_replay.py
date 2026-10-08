@@ -39,6 +39,7 @@ def test_one_and_multiblock_reorg_quarantine_and_replay(tmp_path, ancestor, conf
     assert db.conn.execute(
         "SELECT canonical FROM contracts WHERE address=?", (ORPHAN,)
     ).fetchone()[0] == (1 if ancestor >= 103 else 0)
+    assert (ORPHAN in db.pending_addresses(0)) == (ancestor >= 103)
     assert db.conn.execute(
         "SELECT COUNT(*) FROM token_log_tasks WHERE address=?", (ORPHAN,)
     ).fetchone()[0] == 1  # Audit task retained.
@@ -64,6 +65,7 @@ def test_one_and_multiblock_reorg_quarantine_and_replay(tmp_path, ancestor, conf
         ).fetchone()[0] == 0
         assert ORPHAN not in db.contract_addresses(CHAIN)
         assert SURVIVOR in db.contract_addresses(CHAIN)
+        assert db.pending_addresses(0) == [SURVIVOR]
     db.close()
 
 
