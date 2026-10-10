@@ -946,9 +946,10 @@ class DB:
                      WHERE s.address=new_balance_addresses.address)
                    OR EXISTS(SELECT 1 FROM address_recheck_caps x
                              WHERE x.address=new_balance_addresses.address)
-                   OR NOT EXISTS(SELECT 1 FROM contracts c
-                                 WHERE lower(c.address)=new_balance_addresses.address
-                                   AND c.canonical=1)"""
+                   -- Materialize canonical addresses once; a correlated NOT EXISTS
+                   -- scans contracts again for every queued address on SQLite.
+                   OR address NOT IN (
+                     SELECT lower(c.address) FROM contracts c WHERE c.canonical=1)"""
             )
 
     def _enqueue_new_addresses_locked(self, rows: list[tuple[Any, ...]]) -> None:
@@ -1494,9 +1495,8 @@ class DB:
                 (ancestor, ancestor, ancestor, chain),
             )
             self.conn.execute(
-                """DELETE FROM new_balance_addresses WHERE NOT EXISTS(
-                      SELECT 1 FROM contracts c WHERE lower(c.address)=new_balance_addresses.address
-                       AND c.canonical=1)"""
+                """DELETE FROM new_balance_addresses WHERE address NOT IN (
+                      SELECT lower(c.address) FROM contracts c WHERE c.canonical=1)"""
             )
             self.conn.execute(
                 "DELETE FROM discovery_block_hashes WHERE chain=? AND block_number>?",

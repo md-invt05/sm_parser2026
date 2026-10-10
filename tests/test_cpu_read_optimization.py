@@ -64,6 +64,44 @@ def test_new_queue_respects_canonical_and_cap_and_transaction_rollback(tmp_path)
     db.close()
 
 
+def test_startup_queue_repair_has_bounded_work_for_many_pending_addresses(tmp_path):
+    db = DB(tmp_path / "contracts.db")
+    addresses = [f"0x{index:040x}" for index in range(1, 1801)]
+    with db.conn:
+        db.conn.executemany(
+            "INSERT INTO contracts(chain,address,first_seen_at) VALUES('ethereum',?,?)",
+            [(address, "2026-01-01") for address in addresses],
+        )
+        db.conn.executemany(
+            "INSERT INTO new_balance_addresses(address,first_seen_at) VALUES(?,?)",
+            [(address, "2026-01-01") for address in addresses],
+        )
+        db.conn.execute(
+            "INSERT INTO new_balance_addresses(address,first_seen_at) VALUES(?,?)",
+            ("0x" + "ff" * 20, "2026-01-01"),
+        )
+
+    # The old correlated contract scan exceeded this budget on this small
+    # fixture; production has tens of thousands of queued addresses.
+    progress_calls = 0
+
+    def abort_excessive_work():
+        nonlocal progress_calls
+        progress_calls += 1
+        return progress_calls > 5_000
+
+    db.conn.set_progress_handler(abort_excessive_work, 1_000)
+    try:
+        db.reconcile_new_balance_addresses()
+    finally:
+        db.conn.set_progress_handler(None, 0)
+    assert db.conn.execute("SELECT COUNT(*) FROM new_balance_addresses").fetchone()[0] == 1_800
+    assert db.conn.execute(
+        "SELECT 1 FROM new_balance_addresses WHERE address=?", ("0x" + "ff" * 20,)
+    ).fetchone() is None
+    db.close()
+
+
 def test_token_governor_count_equals_detailed_snapshot(tmp_path):
     db = DB(tmp_path / "contracts.db")
     now = datetime.now(timezone.utc)
